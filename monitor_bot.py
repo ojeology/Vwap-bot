@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-VWAP Reversal Monitor Bot – Professional Edition (Error‑Free)
-Clean heartbeat with scores, professional signals, auto‑track, logging.
+VWAP Reversal Monitor Bot – Professional Edition (Clean Heartbeat)
 """
 import time, asyncio, logging, threading, itertools, os
 from datetime import datetime, timezone
@@ -18,7 +17,7 @@ from flask import Flask
 # ═════════════════ CREDENTIALS ═════════════════
 BOT_TOKEN = "8835542017:AAFDRUJjrXv2pgDdVpbxQlMAxILDlIBrL8g"
 CHAT_ID   = 6400145232
-SIGNAL_LOG_CHANNEL = os.environ.get("SIGNAL_LOG_CHANNEL", None)   # optional
+SIGNAL_LOG_CHANNEL = os.environ.get("SIGNAL_LOG_CHANNEL", None)
 
 # ═════════════════ HEALTH SERVER ═════════════════
 health_app = Flask(__name__)
@@ -52,7 +51,6 @@ VOL_MULT = 1.2
 RANGE_CAP = True
 MAX_RANGE_ATR = 3.0
 
-# Optimized TP/SL from E16 backtest (extracted 2026-06-23)
 OPTIMIZED_TP_SL = {
     "PEPEUSDT":  (0.020, 0.015),
     "BONKUSDT":  (0.030, 0.012),
@@ -219,13 +217,14 @@ def optimize_tp_sl(symbol):
     return 0.025, 0.012
 
 # ═════════════════ TRADE LOGGING & SIGNAL COUNTER ═════════════════
-trade_log = []          # closed trades
-signal_log = []         # generated signals, with outcome
+trade_log = []
+signal_log = []
 signal_counter = 0
-open_trades = {}        # trade_id -> {pair, side, entry, tp, sl, alert_msg, chat_id, signal_id}
+open_trades = {}
 
 def condition_score(df):
-    """Return (score, max_score, hour_ok, band_touch, detail_dict)."""
+    """Return (score, max_score, hour_ok, band_touch, detail_dict).
+       detail_dict contains numeric values and boolean flags with distinct keys."""
     if df.empty:
         return 0, 0, False, "none", {}
     latest = df.iloc[-1]
@@ -236,38 +235,36 @@ def condition_score(df):
     hour_ok = latest.name.hour not in BLOCKED_HOURS
     band_touch = "none"
     if latest["Low"] <= latest["vwap_2dn"] and c > latest["vwap_2dn"]:
-        band_touch = "lower"
+        band_touch = "LOWER"
     elif latest["High"] >= latest["vwap_2up"] and c < latest["vwap_2up"]:
-        band_touch = "upper"
+        band_touch = "UPPER"
 
-    # Condition booleans
-    cond_rsi = rsi < RSI_LONG_MAX or rsi > RSI_SHORT_MIN
-    cond_body = body > BODY_PCT_MIN
+    # Condition booleans (now with _ok suffix to avoid overwriting)
+    rsi_ok = rsi < RSI_LONG_MAX or rsi > RSI_SHORT_MIN
+    body_ok = body > BODY_PCT_MIN
     if rsi < RSI_LONG_MAX:
-        cond_dir = c > o
+        dir_ok = c > o
     elif rsi > RSI_SHORT_MIN:
-        cond_dir = c < o
+        dir_ok = c < o
     else:
-        cond_dir = False
-    cond_vol = vol_ratio >= VOL_MULT
-    cond_range = (latest["High"] - latest["Low"]) < MAX_RANGE_ATR * latest["atr"] if RANGE_CAP else True
+        dir_ok = False
+    vol_ok = vol_ratio >= VOL_MULT
+    range_ok = (latest["High"] - latest["Low"]) < MAX_RANGE_ATR * latest["atr"] if RANGE_CAP else True
 
-    conditions = {
-        "rsi": cond_rsi,
-        "body": cond_body,
-        "direction": cond_dir,
-        "volume": cond_vol,
-        "range": cond_range
-    }
     max_score = 5
-    score = sum(1 for v in conditions.values() if v)
-    return score, max_score, hour_ok, band_touch, {
+    score = sum([rsi_ok, body_ok, dir_ok, vol_ok, range_ok])
+    detail = {
         "price": c,
         "rsi": rsi,
         "body": body,
         "vol_ratio": vol_ratio,
-        **conditions
+        "rsi_ok": rsi_ok,
+        "body_ok": body_ok,
+        "dir_ok": dir_ok,
+        "vol_ok": vol_ok,
+        "range_ok": range_ok,
     }
+    return score, max_score, hour_ok, band_touch, detail
 
 # ═════════════════ TELEGRAM HANDLERS ═════════════════
 application = None
@@ -282,10 +279,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         entry, tp, sl = float(parts[3]), float(parts[4]), float(parts[5])
         signal_id = int(parts[6]) if len(parts) > 6 else 0
 
-        if side == 1:   # long
+        if side == 1:
             exit_price = tp if outcome == "TP" else sl
             pnl = 5 * (exit_price - entry) / entry * 20 - 0.08
-        else:           # short
+        else:
             exit_price = tp if outcome == "TP" else sl
             pnl = 5 * (entry - exit_price) / entry * 20 - 0.08
         pnl = round(pnl, 2)
@@ -369,19 +366,22 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
         df = add_indicators(df)
         score, max_score, hour_ok, band_touch, det = condition_score(df)
-        checks = []
-        if hour_ok:
-            checks.append("H✅")
-        else:
-            checks.append("H❌")
-        checks.append(f"RSI{det['rsi']:.0f}{'✅' if det['rsi'] else '❌'}")
-        checks.append(f"B{det['body']:.2f}{'✅' if det['body'] else '❌'}")
-        checks.append(f"D{'✅' if det['direction'] else '❌'}")
-        checks.append(f"V{det['vol_ratio']:.1f}x{'✅' if det['volume'] else '❌'}")
-        if RANGE_CAP:
-            checks.append(f"R{'✅' if det['range'] else '❌'}")
-        checks.append(f"Band{band_touch}")
-        line = f"{sym}: {det['price']:.6f} " + " ".join(checks) + f" [{score}/{max_score}]"
+        hour_icon = "🟢" if hour_ok else "⏰"
+        rsi_str = f"RSI {det['rsi']:.0f}"
+        body_str = f"Body {det['body']:.2f}"
+        vol_str = f"Vol {det['vol_ratio']:.1f}x"
+        dir_icon = "▲" if det['dir_ok'] else "▼" if not det['dir_ok'] else "?"
+        # Clean line
+        line = (
+            f"{sym}: {det['price']:.6f} {hour_icon} "
+            f"{rsi_str}{'✅' if det['rsi_ok'] else '❌'} "
+            f"{body_str}{'✅' if det['body_ok'] else '❌'} "
+            f"Dir{'✅' if det['dir_ok'] else '❌'} "
+            f"{vol_str}{'✅' if det['vol_ok'] else '❌'} "
+            f"Rng{'✅' if det['range_ok'] else '❌'} "
+            f"Band {band_touch} "
+            f"[{score}/{max_score}]"
+        )
         lines.append(line)
     await update.message.reply_text("📋 Full Pair Status:\n" + "\n".join(lines))
 
@@ -475,28 +475,27 @@ async def monitor():
             tp_sl = tp_sl_map.get(sym, {"TP%": 2.5, "SL%": 1.2})
             price = info.get("price", 0)
 
-            # Build heartbeat line with checkmarks and score
-            checks = []
-            # hour_ok already computed in condition_score
-            if hour_ok:
-                checks.append("H✅")
-            else:
-                checks.append("H❌")
-            checks.append(f"RSI{det['rsi']:.0f}{'✅' if det['rsi'] else '❌'}")
-            checks.append(f"B{det['body']:.2f}{'✅' if det['body'] else '❌'}")
-            checks.append(f"D{'✅' if det['direction'] else '❌'}")
-            checks.append(f"V{det['vol_ratio']:.1f}x{'✅' if det['volume'] else '❌'}")
-            if RANGE_CAP:
-                checks.append(f"R{'✅' if det['range'] else '❌'}")
-            checks.append(f"Band{band_touch}")
-            line = f"{sym}: {det['price']:.6f} " + " ".join(checks) + f" [{score}/{max_score}]"
+            # Clean heartbeat line
+            hour_icon = "🟢" if hour_ok else "⏰"
+            rsi_str = f"RSI {det['rsi']:.0f}"
+            body_str = f"Body {det['body']:.2f}"
+            vol_str = f"Vol {det['vol_ratio']:.1f}x"
+            line = (
+                f"{sym}: {det['price']:.6f} {hour_icon} "
+                f"{rsi_str}{'✅' if det['rsi_ok'] else '❌'} "
+                f"{body_str}{'✅' if det['body_ok'] else '❌'} "
+                f"Dir{'✅' if det['dir_ok'] else '❌'} "
+                f"{vol_str}{'✅' if det['vol_ok'] else '❌'} "
+                f"Rng{'✅' if det['range_ok'] else '❌'} "
+                f"Band {band_touch} "
+                f"[{score}/{max_score}]"
+            )
             heartbeat_lines.append(line)
 
-            # If a valid signal is generated
             if signal in (1, -1):
                 signal_counter += 1
                 sig_id = signal_counter
-                side = signal   # 1=long, -1=short
+                side = signal
                 tp_price = price * (1 + tp_sl["TP%"]/100) if side == 1 else price * (1 - tp_sl["TP%"]/100)
                 sl_price = price * (1 - tp_sl["SL%"]/100) if side == 1 else price * (1 + tp_sl["SL%"]/100)
                 direction = "LONG" if side == 1 else "SHORT"
@@ -521,36 +520,23 @@ async def monitor():
 
                 sent_msg = await bot.send_message(chat_id=CHAT_ID, text=alert_text,
                                                    reply_markup=keyboard, parse_mode='Markdown')
-
-                # Log signal
                 signal_log.append({
-                    "id": sig_id,
-                    "pair": sym,
-                    "side": side,
-                    "entry": price,
-                    "tp": tp_price,
-                    "sl": sl_price,
-                    "timestamp": datetime.now(timezone.utc),
-                    "outcome": None,
-                    "pnl": None
+                    "id": sig_id, "pair": sym, "side": side, "entry": price,
+                    "tp": tp_price, "sl": sl_price, "timestamp": datetime.now(timezone.utc),
+                    "outcome": None, "pnl": None
                 })
-
-                # Record open trade for auto‑track
                 trade_id = f"{sym}_{int(time.time())}"
                 open_trades[trade_id] = {
                     "pair": sym, "side": side, "entry": price, "tp": tp_price, "sl": sl_price,
                     "alert_msg": sent_msg, "chat_id": CHAT_ID, "signal_id": sig_id
                 }
-
-                # Optional: send a copy to the signal log channel
                 if SIGNAL_LOG_CHANNEL:
                     try:
-                        await bot.send_message(chat_id=SIGNAL_LOG_CHANNEL, text=alert_text,
-                                               parse_mode='Markdown')
+                        await bot.send_message(chat_id=SIGNAL_LOG_CHANNEL, text=alert_text, parse_mode='Markdown')
                     except Exception as e:
                         logging.error(f"Signal log channel error: {e}")
 
-        # Send heartbeat (full status for all pairs)
+        # Send heartbeat
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         heartbeat = f"📡 {now} | Full Status\n" + "\n".join(heartbeat_lines)
         await bot.send_message(chat_id=CHAT_ID, text=heartbeat)
