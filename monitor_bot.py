@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-VWAP Reversal Monitor Bot — Professional Edition
-Clean heartbeat, professional signals, auto‑track, logging.
+VWAP Reversal Monitor Bot – Professional Edition
+Clean heartbeat with scores, professional signals, auto‑track, logging.
 """
 import time, asyncio, logging, threading, itertools, os
 from datetime import datetime, timezone
 from pathlib import Path
-from collections import defaultdict
 
 import numpy as np
 import pandas as pd
@@ -19,7 +18,7 @@ from flask import Flask
 # ═════════════════ CREDENTIALS ═════════════════
 BOT_TOKEN = "8835542017:AAFDRUJjrXv2pgDdVpbxQlMAxILDlIBrL8g"
 CHAT_ID   = 6400145232
-SIGNAL_LOG_CHANNEL = os.environ.get("SIGNAL_LOG_CHANNEL", None)  # optional logging channel
+SIGNAL_LOG_CHANNEL = os.environ.get("SIGNAL_LOG_CHANNEL", None)   # optional
 
 # ═════════════════ HEALTH SERVER ═════════════════
 health_app = Flask(__name__)
@@ -53,7 +52,7 @@ VOL_MULT = 1.2
 RANGE_CAP = True
 MAX_RANGE_ATR = 3.0
 
-# Optimized TP/SL from E16 backtest
+# Optimized TP/SL from E16 backtest (extracted 2026-06-23)
 OPTIMIZED_TP_SL = {
     "PEPEUSDT":  (0.020, 0.015),
     "BONKUSDT":  (0.030, 0.012),
@@ -221,12 +220,12 @@ def optimize_tp_sl(symbol):
 
 # ═════════════════ TRADE LOGGING & SIGNAL COUNTER ═════════════════
 trade_log = []          # closed trades
-signal_log = []         # all generated signals, with status
+signal_log = []         # generated signals, with outcome
 signal_counter = 0
 open_trades = {}        # trade_id -> {pair, side, entry, tp, sl, alert_msg, chat_id, signal_id}
 
-def condition_score(df, symbol):
-    """Return a tuple (score, max_score, hour_ok, band_touch, detail_dict) for a pair."""
+def condition_score(df):
+    """Return (score, max_score, hour_ok, band_touch, detail_dict)."""
     if df.empty:
         return 0, 0, False, "none", {}
     latest = df.iloc[-1]
@@ -241,12 +240,24 @@ def condition_score(df, symbol):
     elif latest["High"] >= latest["vwap_2up"] and c < latest["vwap_2up"]:
         band_touch = "upper"
 
+    # Condition booleans
+    cond_rsi = rsi < RSI_LONG_MAX or rsi > RSI_SHORT_MIN
+    cond_body = body > BODY_PCT_MIN
+    if rsi < RSI_LONG_MAX:
+        cond_dir = c > o
+    elif rsi > RSI_SHORT_MIN:
+        cond_dir = c < o
+    else:
+        cond_dir = False
+    cond_vol = vol_ratio >= VOL_MULT
+    cond_range = (latest["High"] - latest["Low"]) < MAX_RANGE_ATR * latest["atr"] if RANGE_CAP else True
+
     conditions = {
-        "rsi": (rsi < RSI_LONG_MAX or rsi > RSI_SHORT_MIN),
-        "body": body > BODY_PCT_MIN,
-        "direction": (c > o) if rsi < RSI_LONG_MAX else (c < o) if rsi > RSI_SHORT_MIN else False,
-        "volume": vol_ratio >= VOL_MULT,
-        "range": (latest["High"] - latest["Low"]) < MAX_RANGE_ATR * latest["atr"] if RANGE_CAP else True
+        "rsi": cond_rsi,
+        "body": cond_body,
+        "direction": cond_dir,
+        "volume": cond_vol,
+        "range": cond_range
     }
     max_score = 5
     score = sum(1 for v in conditions.values() if v)
@@ -264,36 +275,26 @@ application = None
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data  # "outcome|pair|side|entry|tp|sl|signal_id"
+    data = query.data
     try:
         parts = data.split('|')
         outcome, pair, side = parts[0], parts[1], int(parts[2])
         entry, tp, sl = float(parts[3]), float(parts[4]), float(parts[5])
         signal_id = int(parts[6]) if len(parts) > 6 else 0
 
-        # Calculate PnL
         if side == 1:   # long
-            if outcome == "TP":
-                exit_price = tp
-            else:
-                exit_price = sl
+            exit_price = tp if outcome == "TP" else sl
             pnl = 5 * (exit_price - entry) / entry * 20 - 0.08
         else:           # short
-            if outcome == "TP":
-                exit_price = tp
-            else:
-                exit_price = sl
+            exit_price = tp if outcome == "TP" else sl
             pnl = 5 * (entry - exit_price) / entry * 20 - 0.08
         pnl = round(pnl, 2)
 
-        # Update trade log and signal log
-        trade = {
+        trade_log.append({
             "pair": pair, "side": side, "entry": entry, "tp": tp, "sl": sl,
             "outcome": outcome, "pnl": pnl, "timestamp": datetime.now(timezone.utc)
-        }
-        trade_log.append(trade)
-        # Update signal log if signal_id exists
-        if signal_id and signal_id <= len(signal_log):
+        })
+        if signal_id and 0 < signal_id <= len(signal_log):
             signal_log[signal_id - 1]["outcome"] = outcome
             signal_log[signal_id - 1]["pnl"] = pnl
 
@@ -367,10 +368,8 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"{sym}: no data")
             continue
         df = add_indicators(df)
-        score, max_score, hour_ok, band_touch, det = condition_score(df, sym)
-        # Build compact line
+        score, max_score, hour_ok, band_touch, det = condition_score(df)
         checks = []
-            hour_ok = latest.name.hour not in BLOCKED_HOURS
         if hour_ok: checks.append("H✅") else: checks.append("H❌")
         checks.append(f"RSI{det['rsi']:.0f}{'✅' if det['rsi'] else '❌'}")
         checks.append(f"B{det['body']:.2f}{'✅' if det['body'] else '❌'}")
@@ -437,8 +436,7 @@ async def monitor():
                     "pair": sym, "side": side, "entry": entry, "tp": t["tp"], "sl": t["sl"],
                     "outcome": hit, "pnl": pnl, "timestamp": datetime.now(timezone.utc)
                 })
-                # Update signal log
-                if "signal_id" in t and t["signal_id"] <= len(signal_log):
+                if "signal_id" in t and 0 < t["signal_id"] <= len(signal_log):
                     signal_log[t["signal_id"] - 1]["outcome"] = hit
                     signal_log[t["signal_id"] - 1]["pnl"] = pnl
 
@@ -470,13 +468,13 @@ async def monitor():
                 continue
             df = add_indicators(df)
             signal, info = check_signal(df)
-            score, max_score, hour_ok, band_touch, det = condition_score(df, sym)
+            score, max_score, hour_ok, band_touch, det = condition_score(df)
             tp_sl = tp_sl_map.get(sym, {"TP%": 2.5, "SL%": 1.2})
             price = info.get("price", 0)
 
-            # Build heartbeat line for this pair
+            # Build heartbeat line with checkmarks and score
             checks = []
-            hour_ok = latest.name.hour not in BLOCKED_HOURS
+            # hour_ok is already computed in condition_score
             if hour_ok: checks.append("H✅") else: checks.append("H❌")
             checks.append(f"RSI{det['rsi']:.0f}{'✅' if det['rsi'] else '❌'}")
             checks.append(f"B{det['body']:.2f}{'✅' if det['body'] else '❌'}")
@@ -488,15 +486,15 @@ async def monitor():
             line = f"{sym}: {det['price']:.6f} " + " ".join(checks) + f" [{score}/{max_score}]"
             heartbeat_lines.append(line)
 
-            if signal == 1 or signal == -1:
+            # If a valid signal is generated
+            if signal in (1, -1):
                 signal_counter += 1
                 sig_id = signal_counter
-                side = signal  # 1 long, -1 short
+                side = signal   # 1=long, -1=short
                 tp_price = price * (1 + tp_sl["TP%"]/100) if side == 1 else price * (1 - tp_sl["TP%"]/100)
                 sl_price = price * (1 - tp_sl["SL%"]/100) if side == 1 else price * (1 + tp_sl["SL%"]/100)
                 direction = "LONG" if side == 1 else "SHORT"
 
-                # Professional signal message
                 alert_text = (
                     f"📍 SIGNAL ID: #{sig_id}\n"
                     f"➖➖➖➖➖➖➖\n"
@@ -510,17 +508,16 @@ async def monitor():
                     f"Time: {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
                 )
 
-                # Inline buttons as fallback
                 keyboard = InlineKeyboardMarkup([
                     [InlineKeyboardButton("✅ TP Hit", callback_data=f"TP|{sym}|{side}|{price}|{tp_price}|{sl_price}|{sig_id}"),
                      InlineKeyboardButton("❌ SL Hit", callback_data=f"SL|{sym}|{side}|{price}|{tp_price}|{sl_price}|{sig_id}")]
                 ])
 
-                # Send alert to main chat
                 sent_msg = await bot.send_message(chat_id=CHAT_ID, text=alert_text,
                                                    reply_markup=keyboard, parse_mode='Markdown')
+
                 # Log signal
-                signal_entry = {
+                signal_log.append({
                     "id": sig_id,
                     "pair": sym,
                     "side": side,
@@ -530,8 +527,7 @@ async def monitor():
                     "timestamp": datetime.now(timezone.utc),
                     "outcome": None,
                     "pnl": None
-                }
-                signal_log.append(signal_entry)
+                })
 
                 # Record open trade for auto‑track
                 trade_id = f"{sym}_{int(time.time())}"
@@ -540,7 +536,7 @@ async def monitor():
                     "alert_msg": sent_msg, "chat_id": CHAT_ID, "signal_id": sig_id
                 }
 
-                # If log channel set, send a copy there
+                # Optional: send a copy to the signal log channel
                 if SIGNAL_LOG_CHANNEL:
                     try:
                         await bot.send_message(chat_id=SIGNAL_LOG_CHANNEL, text=alert_text,
@@ -548,10 +544,9 @@ async def monitor():
                     except Exception as e:
                         logging.error(f"Signal log channel error: {e}")
 
-        # Send heartbeat (full status)
+        # Send heartbeat (full status for all pairs)
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         heartbeat = f"📡 {now} | Full Status\n" + "\n".join(heartbeat_lines)
-        # If message too long, split (unlikely)
         await bot.send_message(chat_id=CHAT_ID, text=heartbeat)
 
         elapsed = (datetime.now(timezone.utc) - scan_start).total_seconds()
