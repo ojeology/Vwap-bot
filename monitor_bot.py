@@ -370,6 +370,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         score, max_score, hour_ok, band_touch, det = condition_score(df, sym)
         # Build compact line
         checks = []
+            hour_ok = latest.name.hour not in BLOCKED_HOURS
         if hour_ok: checks.append("H✅") else: checks.append("H❌")
         checks.append(f"RSI{det['rsi']:.0f}{'✅' if det['rsi'] else '❌'}")
         checks.append(f"B{det['body']:.2f}{'✅' if det['body'] else '❌'}")
@@ -475,6 +476,7 @@ async def monitor():
 
             # Build heartbeat line for this pair
             checks = []
+            hour_ok = latest.name.hour not in BLOCKED_HOURS
             if hour_ok: checks.append("H✅") else: checks.append("H❌")
             checks.append(f"RSI{det['rsi']:.0f}{'✅' if det['rsi'] else '❌'}")
             checks.append(f"B{det['body']:.2f}{'✅' if det['body'] else '❌'}")
