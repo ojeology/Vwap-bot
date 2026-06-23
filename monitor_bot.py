@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-VWAP Reversal Monitor Bot – Professional Edition
+VWAP Reversal Monitor Bot – Professional Edition (Error‑Free)
 Clean heartbeat with scores, professional signals, auto‑track, logging.
 """
 import time, asyncio, logging, threading, itertools, os
@@ -370,7 +370,10 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         df = add_indicators(df)
         score, max_score, hour_ok, band_touch, det = condition_score(df)
         checks = []
-        if hour_ok: checks.append("H✅") else: checks.append("H❌")
+        if hour_ok:
+            checks.append("H✅")
+        else:
+            checks.append("H❌")
         checks.append(f"RSI{det['rsi']:.0f}{'✅' if det['rsi'] else '❌'}")
         checks.append(f"B{det['body']:.2f}{'✅' if det['body'] else '❌'}")
         checks.append(f"D{'✅' if det['direction'] else '❌'}")
@@ -474,8 +477,11 @@ async def monitor():
 
             # Build heartbeat line with checkmarks and score
             checks = []
-            # hour_ok is already computed in condition_score
-            if hour_ok: checks.append("H✅") else: checks.append("H❌")
+            # hour_ok already computed in condition_score
+            if hour_ok:
+                checks.append("H✅")
+            else:
+                checks.append("H❌")
             checks.append(f"RSI{det['rsi']:.0f}{'✅' if det['rsi'] else '❌'}")
             checks.append(f"B{det['body']:.2f}{'✅' if det['body'] else '❌'}")
             checks.append(f"D{'✅' if det['direction'] else '❌'}")
