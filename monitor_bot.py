@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 VWAP Reversal Monitor Bot – Final Professional Edition
-Clean heartbeat, professional signals, daily reports, auto‑track, logging.
+Clean Markdown heartbeat, professional signals, daily reports, auto‑track, logging.
 """
 import time, asyncio, logging, threading, itertools, os
 from datetime import datetime, timezone
@@ -400,7 +400,6 @@ async def daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gross_win = sum(t['pnl'] for t in today_trades if t['pnl'] > 0)
     gross_loss = abs(sum(t['pnl'] for t in today_trades if t['pnl'] <= 0))
     pf = gross_win / gross_loss if gross_loss > 0 else float('inf')
-    # Simulated max drawdown from daily PnL
     cum_pnl = 0
     max_dd = 0
     peak = 0
@@ -500,12 +499,12 @@ async def monitor():
         for tid in closed_ids:
             del open_trades[tid]
 
-        # --- Scan pairs for new signals & build heartbeat report ---
-        report_rows = []
+        # --- Scan pairs & build Preview‑A heartbeat ---
         strong_pairs = []
         watch_pairs = []
         weak_pairs = []
-        no_trade_pairs = []
+        no_trade_count = 0
+        heartbeat_lines = []
 
         for sym in PAIRS:
             live = fetch_live_data(sym)
@@ -517,8 +516,7 @@ async def monitor():
             else:
                 df = live
             if df.empty:
-                no_trade_pairs.append(sym)
-                report_rows.append((sym, "N/A", "N/A", "0/5", "❌ NO DATA"))
+                no_trade_count += 1
                 continue
 
             df = add_indicators(df)
@@ -527,25 +525,41 @@ async def monitor():
             tp_sl = tp_sl_map.get(sym, {"TP%": 2.5, "SL%": 1.2})
             price = info.get("price", 0)
 
-            # Determine signal tag
+            # Categorize
             if score == 5:
-                tag = "🟢 STRONG"
                 strong_pairs.append(sym)
             elif score == 4:
-                tag = "⚠️ WATCH"
                 watch_pairs.append(sym)
             elif score == 3:
-                tag = "⚠️ WEAK"
                 weak_pairs.append(sym)
             else:
-                tag = "❌ NO TRADE"
-                no_trade_pairs.append(sym)
+                no_trade_count += 1
 
-            rsi_val = f"{det['rsi']:.0f}"
-            price_str = f"${price:.6f}" if price else "N/A"
-            report_rows.append((sym, price_str, rsi_val, f"{score}/{max_score}", tag))
+            # Build line only for score >= 3
+            if score >= 3:
+                icon = "🟢" if score == 5 else "⚠️"
+                band_str = f"Band **{band_touch}**" if band_touch != "none" else "Band none"
+                line = f"{icon} *{sym}* — ${price:.6f}\nRSI {det['rsi']:.0f} · Score {score}/{max_score} · {band_str}"
+                if score < 5:
+                    missing = []
+                    if not det['rsi_ok']: missing.append("RSI")
+                    if not det['body_ok']: missing.append("body")
+                    if not det['dir_ok']: missing.append("direction")
+                    if not det['vol_ok']: missing.append("volume")
+                    if not det['range_ok']: missing.append("range")
+                    if missing:
+                        line += f"\nMissing: {', '.join(missing)}"
+                else:
+                    # Score 5 – give extra info
+                    if hour_ok and band_touch in ("LOWER", "UPPER"):
+                        line += "\n👉 *Trade signal possible! (hour allowed)*"
+                    elif not hour_ok:
+                        line += "\n⏰ Hour blocked"
+                    elif band_touch == "none":
+                        line += "\n⚠️ No band touch yet"
+                heartbeat_lines.append(line)
 
-            # If a valid signal fires
+            # If a real signal fires
             if signal in (1, -1):
                 signal_counter += 1
                 sig_id = signal_counter
@@ -598,31 +612,20 @@ async def monitor():
                     except:
                         pass
 
-        # Compose clean table heartbeat
-        header = f"📡 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} | MARKET SCAN REPORT"
-        table = "```\n"
-        table += f"{'SYMBOL':<14} {'PRICE':<12} {'RSI':<6} {'SCORE':<7} {'SIGNAL':<12}\n"
-        table += "─" * 60 + "\n"
-        for sym, price_str, rsi_str, score_str, tag in report_rows:
-            table += f"{sym:<14} {price_str:<12} {rsi_str:<6} {score_str:<7} {tag:<12}\n"
-        table += "```\n"
+        # Compose heartbeat (Preview A)
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        total_watch = len(watch_pairs) + len(weak_pairs)
+        summary = f"📊 SCANNED: {len(PAIRS)} pairs | 🟢 {len(strong_pairs)} strong | ⚠️ {total_watch} watch | ❌ {no_trade_count} no trade"
+        if heartbeat_lines:
+            full_heartbeat = f"📡 {now} | MARKET SCAN REPORT\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" + "\n\n".join(heartbeat_lines) + f"\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n{summary}"
+        else:
+            full_heartbeat = f"📡 {now} | MARKET SCAN REPORT\n\n❌ No high‑score pairs this scan.\n\n{summary}"
+        await bot.send_message(chat_id=CHAT_ID, text=full_heartbeat, parse_mode='Markdown')
 
-        summary = ""
-        if strong_pairs:
-            summary += f"🟢 STRONG SETUPS: {', '.join(strong_pairs)}\n"
-        if watch_pairs:
-            summary += f"⚠️ WATCHLIST: {', '.join(watch_pairs)}\n"
-        summary += f"📊 TOTAL ASSETS SCANNED: {len(PAIRS)}"
-
-        full_report = header + "\n" + table + summary
-        await bot.send_message(chat_id=CHAT_ID, text=full_report)
-
-        # Send daily report at 23:59 UTC automatically
-        now = datetime.now(timezone.utc)
-        if now.hour == 23 and now.minute == 59:
-            await daily_command(None, None)   # we'll call the daily function directly with a trick? Actually need bot/update context. Simpler: we use the existing daily_command but need a fake update. Better: just call the internal logic and send via bot.
-            # We'll implement a simplified version:
-            today = now.date()
+        # Send daily report at 23:59 UTC
+        now_dt = datetime.now(timezone.utc)
+        if now_dt.hour == 23 and now_dt.minute == 59:
+            today = now_dt.date()
             today_trades = [t for t in trade_log if t['timestamp'].date() == today]
             if today_trades:
                 wins = sum(1 for t in today_trades if t['pnl'] > 0)
@@ -639,11 +642,9 @@ async def monitor():
                 peak = 0
                 for t in today_trades:
                     cum_pnl += t['pnl']
-                    if cum_pnl > peak:
-                        peak = cum_pnl
+                    if cum_pnl > peak: peak = cum_pnl
                     dd = cum_pnl - peak
-                    if dd < max_dd:
-                        max_dd = dd
+                    if dd < max_dd: max_dd = dd
                 daily_text = (
                     f"📊 DAILY PERFORMANCE REPORT\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
