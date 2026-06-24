@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-VWAP Reversal Bot – Institutional Grade (Thread‑Safe, Daily Backtest Report)
+VWAP Reversal Bot – Institutional Grade (E15 V3 Signal, No Strict Regime Filters)
+Ready for paper trading.
 """
 import time, asyncio, logging, threading, itertools, os
 from datetime import datetime, timezone, timedelta
@@ -16,7 +17,7 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from flask import Flask
 
-# ════════════════ CREDENTIALS (hardcoded) ════════════════
+# ════════════════ CREDENTIALS ════════════════
 BOT_TOKEN = "8835542017:AAFDRUJjrXv2pgDdVpbxQlMAxILDlIBrL8g"
 CHAT_ID   = 6400145232
 
@@ -41,7 +42,7 @@ ALL_PAIRS = [
     "BOMEUSDT","ETHUSDT","ADAUSDT","TRXUSDT","ICPUSDT",
     "SOLUSDT","SHIBUSDT"
 ]
-PAIRS = ALL_PAIRS[:21]   # initial set, will be updated daily
+PAIRS = ALL_PAIRS[:21]   # initial, updated daily at 12:00 UTC
 
 SCAN_INTERVAL_MINUTES = 10
 LOOKBACK_DAYS = 30
@@ -52,17 +53,15 @@ BLOCKED_HOURS = {0,1,3,4,6,9,10,14,18,19,20,21}
 BODY_PCT_MIN = 0.50
 RSI_LONG_MAX = 40
 RSI_SHORT_MIN = 60
-VOL_MULT = 1.2
+VOL_MULT = 1.2               # volume confirmation (>1.2× 20‑period avg)
 RANGE_CAP = True
 MAX_RANGE_ATR = 3.0
 
-SL_COOLDOWN = 5          # minutes
-DAILY_LOSS_LIMIT = 0.08  # 8% of starting balance
-
-USE_EMA_REGIME = True
+SL_COOLDOWN = 5              # minutes
+DAILY_LOSS_LIMIT = 0.08      # 8% of starting balance
 
 STARTING_BALANCE = 100.0
-RISK_PER_TRADE = 0.01    # 1% of equity
+RISK_PER_TRADE = 0.01        # 1% of equity
 MAX_CONCURRENT_TRADES = 3
 
 SECTORS = {
@@ -90,7 +89,7 @@ cooldowns = {}
 daily_pnl = 0.0
 sector_counts = {}
 
-state_lock = asyncio.Lock()   # protects open_trades, cooldowns, sector_counts, trade_log, signal_log
+state_lock = asyncio.Lock()
 
 OPTIMIZED_TP_SL = {}
 
@@ -183,8 +182,6 @@ def add_indicators(df):
                     (df["Low"]-df["Close"].shift()).abs()], axis=1).max(1)
     df["atr"] = tr.rolling(14).mean()
     df["vol20"] = df["Volume"].rolling(20).mean()
-    df["ema50"] = df["Close"].ewm(span=50).mean()
-    df["ema200"] = df["Close"].ewm(span=200).mean()
     dates = df.index.normalize()
     tp = (df["High"] + df["Low"] + df["Close"]) / 3
     ctv = (tp * df["Volume"]).groupby(dates).cumsum()
@@ -222,42 +219,7 @@ def update_pair_cache(sym):
         logging.error(f"update_pair_cache {sym}: {e}")
         return sym, None
 
-# ════════════════ REGIME & RISK CHECKS ════════════════
-def volatility_regime_ok(df):
-    atr = df["atr"].iloc[-1]
-    hist = df["atr"].tail(100)
-    if len(hist) < 50:
-        return True
-    low, high = np.percentile(hist, [25, 85])
-    return low <= atr <= high
-
-def get_sector(sym):
-    for sec, pairs in SECTORS.items():
-        if sym in pairs:
-            return sec
-    return "mid"
-
-async def can_trade(sym):
-    async with state_lock:
-        if len(open_trades) >= MAX_CONCURRENT_TRADES:
-            return False
-        sec = get_sector(sym)
-        if sector_counts.get(sec, 0) >= MAX_SECTOR_EXPOSURE:
-            return False
-        return True
-
-def get_equity():
-    """Single source of truth: starting balance + all logged PnL"""
-    return STARTING_BALANCE + sum(t.get("pnl", 0) for t in trade_log)
-
-def get_latest_price(sym):
-    """Consistent price source: cached indicators first, else None"""
-    df = cached_indicators.get(sym)
-    if df is not None and not df.empty:
-        return df.iloc[-1]["Close"]
-    return None
-
-# ════════════════ SIGNAL LOGIC ════════════════
+# ════════════════ SIGNAL (E15 V3 – no EMA, no volatility regime) ════════════════
 def check_signal(df, sym):
     if df.empty: return 0, {"error": "no data"}
     latest = df.iloc[-1]
@@ -271,12 +233,8 @@ def check_signal(df, sym):
         "hour": latest.name.hour,
         "band_touch": "none"
     }
-    now_ts = latest.name
     if info["hour"] in BLOCKED_HOURS:
         return 0, {**info, "fail": "blocked hour"}
-    # cooldown check will be done outside with lock
-    if not volatility_regime_ok(df):
-        return 0, {**info, "fail": "volatility regime"}
 
     touch_low = latest["Low"] <= latest["vwap_2dn"]
     close_inside_low = c > latest["vwap_2dn"]
@@ -285,17 +243,6 @@ def check_signal(df, sym):
 
     buy_sig = touch_low and close_inside_low and c > o and latest["body_pct"] > BODY_PCT_MIN and latest["rsi"] < RSI_LONG_MAX
     sell_sig = touch_high and close_inside_high and c < o and latest["body_pct"] > BODY_PCT_MIN and latest["rsi"] > RSI_SHORT_MIN
-
-    if USE_EMA_REGIME:
-        ema50 = latest.get("ema50", 0)
-        ema200 = latest.get("ema200", 0)
-        if ema50 and ema200:
-            trend_up = ema50 > ema200
-            trend_down = ema50 < ema200
-            if buy_sig and not trend_up:
-                return 0, {**info, "fail": "regime (no long in downtrend)"}
-            if sell_sig and not trend_down:
-                return 0, {**info, "fail": "regime (no short in uptrend)"}
 
     if buy_sig:
         info["band_touch"] = "lower"
@@ -346,7 +293,32 @@ def condition_score(df):
     }
     return score, max_score, hour_ok, band_touch, detail
 
-# ════════════════ BACKTEST HELPERS ════════════════
+# ── Risk & Position Sizing (unchanged) ──
+def get_sector(sym):
+    for sec, pairs in SECTORS.items():
+        if sym in pairs:
+            return sec
+    return "mid"
+
+async def can_trade(sym):
+    async with state_lock:
+        if len(open_trades) >= MAX_CONCURRENT_TRADES:
+            return False
+        sec = get_sector(sym)
+        if sector_counts.get(sec, 0) >= MAX_SECTOR_EXPOSURE:
+            return False
+        return True
+
+def get_equity():
+    return STARTING_BALANCE + sum(t.get("pnl", 0) for t in trade_log)
+
+def get_latest_price(sym):
+    df = cached_indicators.get(sym)
+    if df is not None and not df.empty:
+        return df.iloc[-1]["Close"]
+    return None
+
+# ── Backtest Helpers (for daily pair selection) ──
 TP_GRID = [0.012,0.015,0.018,0.020,0.025,0.030,0.035,0.040]
 SL_GRID = [0.007,0.010,0.012,0.015,0.018]
 
@@ -420,7 +392,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         outcome, pair, side = parts[0], parts[1], int(parts[2])
         entry, tp, sl = float(parts[3]), float(parts[4]), float(parts[5])
         signal_id = int(parts[6]) if len(parts) > 6 else 0
-
         if side == 1:
             exit_price = tp if outcome == "TP" else sl
             pnl = 5 * (exit_price - entry) / entry * 20 - 0.08
@@ -428,24 +399,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             exit_price = tp if outcome == "TP" else sl
             pnl = 5 * (entry - exit_price) / entry * 20 - 0.08
         pnl = round(pnl, 2)
-
         async with state_lock:
             trade_log.append({
                 "pair": pair, "side": side, "entry": entry, "tp": tp, "sl": sl,
                 "outcome": outcome, "pnl": pnl, "timestamp": datetime.now(timezone.utc)
             })
             if len(trade_log) > 1000: del trade_log[:-1000]
-
             if signal_id and 0 < signal_id <= len(signal_log):
                 signal_log[signal_id - 1]["outcome"] = outcome
                 signal_log[signal_id - 1]["pnl"] = pnl
             if len(signal_log) > 1000: del signal_log[:-1000]
-
             global daily_pnl
             daily_pnl += pnl
             if outcome == "SL":
                 cooldowns[pair] = datetime.now(timezone.utc) + timedelta(minutes=SL_COOLDOWN)
-
         new_text = query.message.text + f"\n\n✅ Outcome: {outcome} | PnL: ${pnl:.2f}"
         await query.edit_message_text(text=new_text, reply_markup=None)
     except Exception as e:
@@ -516,7 +483,7 @@ async def optimize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Running daily pair selection & TP/SL optimisation...")
     asyncio.create_task(daily_pair_selection_and_optimize())
 
-# ════════════════ CONTINUOUS TP MONITOR (thread‑safe) ════════════════
+# ════════════════ CONTINUOUS TP MONITOR ════════════════
 async def continuous_tp_monitor():
     await asyncio.sleep(5)
     while True:
@@ -537,7 +504,6 @@ async def continuous_tp_monitor():
                     elif price >= t["sl"]: hit = "SL"
                 if not hit:
                     continue
-
                 entry = t["entry"]
                 exit_price = t["tp"] if hit == "TP" else t["sl"]
                 if side == 1:
@@ -545,27 +511,22 @@ async def continuous_tp_monitor():
                 else:
                     pnl = 5 * (entry - exit_price) / entry * 20 - 0.08
                 pnl = round(pnl, 2)
-
                 trade_log.append({
                     "pair": sym, "side": side, "entry": entry, "tp": t["tp"], "sl": t["sl"],
                     "outcome": hit, "pnl": pnl, "timestamp": datetime.now(timezone.utc)
                 })
                 if len(trade_log) > 1000: del trade_log[:-1000]
-
                 if "signal_id" in t and 0 < t["signal_id"] <= len(signal_log):
                     signal_log[t["signal_id"] - 1]["outcome"] = hit
                     signal_log[t["signal_id"] - 1]["pnl"] = pnl
                 if len(signal_log) > 1000: del signal_log[:-1000]
-
                 global daily_pnl
                 daily_pnl += pnl
                 if hit == "SL":
                     cooldowns[sym] = datetime.now(timezone.utc) + timedelta(minutes=SL_COOLDOWN)
-
                 sec = get_sector(sym)
                 sector_counts[sec] = max(0, sector_counts.get(sec, 0) - 1)
                 closed_ids.append(trade_id)
-
                 try:
                     new_text = t["alert_msg"].text + f"\n\n✅ Auto‑close: {hit} | PnL: ${pnl:.2f}"
                     await application.bot.edit_message_text(
@@ -574,10 +535,8 @@ async def continuous_tp_monitor():
                         text=new_text)
                 except: pass
                 await application.bot.send_message(chat_id=CHAT_ID, text=f"🔔 {sym} {hit} hit! PnL: ${pnl:.2f}")
-
             for tid in closed_ids:
                 del open_trades[tid]
-
         await asyncio.sleep(30)
 
 # ════════════════ DAILY PAIR SELECTION & BACKTEST REPORT ════════════════
@@ -587,7 +546,6 @@ async def daily_pair_selection_and_optimize():
     now = datetime.now(timezone.utc)
     end_ms = int(now.timestamp() * 1000)
     start_ms = int((now - timedelta(days=30)).timestamp() * 1000)
-
     results = {}
     for sym in ALL_PAIRS:
         df = fetch_klines(sym, start_ms, end_ms)
@@ -604,11 +562,8 @@ async def daily_pair_selection_and_optimize():
         sigs_test = get_signals_for_backtest(df_test)
         oos_pnl = quick_simulate(df_test, sigs_test, best_tp, best_sl)
         results[sym] = {"oos_pnl": oos_pnl, "tp": best_tp, "sl": best_sl}
-
     if not results:
         await application.bot.send_message(chat_id=CHAT_ID, text="❌ Not enough data for daily optimisation."); return
-
-    # Build full breakdown message
     sorted_all = sorted(results.items(), key=lambda x: x[1]['oos_pnl'], reverse=True)
     lines = ["📋 *Daily Backtest Results (OOS PnL)*", "```"]
     for sym, d in sorted_all:
@@ -617,15 +572,12 @@ async def daily_pair_selection_and_optimize():
         sl_str = f"{d['sl']*100:.2f}%"
         lines.append(f"{sym:<12} {pnl_str:>8}  TP:{tp_str}  SL:{sl_str}")
     lines.append("```")
-
     top_pairs = [sym for sym, d in sorted_all if d['oos_pnl'] > 0][:20]
     if len(top_pairs) < 5:
         top_pairs = [sym for sym, d in sorted_all][:20]
-
     async with state_lock:
         PAIRS = top_pairs
         OPTIMIZED_TP_SL = {sym: (results[sym]['tp'], results[sym]['sl']) for sym in top_pairs}
-
     summary = (f"✅ Daily optimisation done.\n"
                f"🟢 New pair list ({len(PAIRS)} pairs): {', '.join(PAIRS[:10])}...\n"
                f"📊 Selected pairs OOS PnL total: ${sum(results[s]['oos_pnl'] for s in top_pairs):.2f}")
@@ -644,16 +596,12 @@ async def monitor():
     await application.start()
     asyncio.create_task(application.updater.start_polling())
     asyncio.create_task(continuous_tp_monitor())
-
     bot = application.bot
-    await bot.send_message(chat_id=CHAT_ID, text="🏦 Institutional VWAP Bot started.\nAll features active, daily backtest report enabled.")
-
-    # Run initial optimisation
-    await daily_pair_selection_and_optimize()
-
+    await bot.send_message(chat_id=CHAT_ID, text="🏦 Institutional VWAP Bot (E15 V3 signal) started. No strict regime filters. Ready for paper trading.")
+    if not OPTIMIZED_TP_SL:
+        await daily_pair_selection_and_optimize()
     last_date = datetime.now(timezone.utc).date()
     executor = ThreadPoolExecutor(max_workers=10)
-
     while True:
         now = datetime.now(timezone.utc)
         if now.date() != last_date:
@@ -662,47 +610,34 @@ async def monitor():
                 cooldowns.clear()
                 sector_counts.clear()
             last_date = now.date()
-
         if daily_pnl <= -DAILY_LOSS_LIMIT * STARTING_BALANCE:
             await bot.send_message(chat_id=CHAT_ID, text="⚠️ Daily loss limit hit. Trading halted until midnight.")
             await asyncio.sleep(SCAN_INTERVAL_MINUTES * 60)
             continue
-
-        # Clean expired cooldowns
         async with state_lock:
             for pair, until in list(cooldowns.items()):
                 if now >= until:
                     del cooldowns[pair]
-
-        # Scan all pairs in parallel
         futures = [executor.submit(update_pair_cache, sym) for sym in PAIRS]
         strong = []; watch = []; weak = []; no_trade = 0
         lines = []
-
         for future in as_completed(futures):
             sym, ind_df = future.result()
             if ind_df is None or ind_df.empty:
                 no_trade += 1; continue
-
-            # Check cooldown with lock
             async with state_lock:
                 cooldown_until = cooldowns.get(sym)
-
             signal, info = check_signal(ind_df, sym)
-            # Apply cooldown if exists
             if cooldown_until and ind_df.index[-1] < cooldown_until:
                 signal = 0
                 info["fail"] = "cooldown"
-
             score, max_score, hour_ok, band_touch, det = condition_score(ind_df)
             tp_sl = OPTIMIZED_TP_SL.get(sym, (0.025, 0.012))
             price = info.get("price", 0)
-
             if score == 5: strong.append(sym)
             elif score == 4: watch.append(sym)
             elif score == 3: weak.append(sym)
             else: no_trade += 1
-
             if score >= 3:
                 icon = "🟢" if score == 5 else "⚠️"
                 band_str = f"Band {band_touch}" if band_touch != "none" else "Band none"
@@ -717,14 +652,10 @@ async def monitor():
                 if missing:
                     line += f"\n     Missing: {', '.join(missing)}"
                 lines.append(line)
-
-            # Execute trade if signal valid and risk checks pass
             if signal != 0:
                 if not await can_trade(sym):
-                    await bot.send_message(chat_id=CHAT_ID,
-                                           text=f"⛔ {sym} signal blocked – concurrency or sector limit.")
+                    await bot.send_message(chat_id=CHAT_ID, text=f"⛔ {sym} signal blocked – concurrency or sector limit.")
                     continue
-
                 async with state_lock:
                     signal_counter += 1
                     sig_id = signal_counter
@@ -733,15 +664,12 @@ async def monitor():
                     tp_price = price * (1 + tp) if side == 1 else price * (1 - tp)
                     sl_price = price * (1 - sl) if side == 1 else price * (1 + sl)
                     direction = "LONG" if side == 1 else "SHORT"
-
                     equity = get_equity()
                     risk_capital = equity * RISK_PER_TRADE
                     notional = risk_capital / sl
-
                     reason = (f"VWAP±2σ {band_touch} band touch, RSI {info['rsi']} "
                               f"{'<' if side==1 else '>'} {'40' if side==1 else '60'}, "
                               f"body/ATR {info['body/atr']}, volume {info['vol_ratio']}x > {VOL_MULT}x")
-
                     alert_text = (
                         f"{'🟢 ENTRY SIGNAL' if side==1 else '🔴 ENTRY SIGNAL'}\n"
                         f"━━━━━━━━━━━━━━━━━\n"
@@ -758,12 +686,10 @@ async def monitor():
                         f"❌ SL: ${sl_price:.6f} (-{sl*100:.2f}%)\n"
                         f"📊 Suggested Size: ${notional:.2f} (risk: ${risk_capital:.2f})"
                     )
-
                     keyboard = InlineKeyboardMarkup([
                         [InlineKeyboardButton("✅ TP Hit", callback_data=f"TP|{sym}|{side}|{price}|{tp_price}|{sl_price}|{sig_id}"),
                          InlineKeyboardButton("❌ SL Hit", callback_data=f"SL|{sym}|{side}|{price}|{tp_price}|{sl_price}|{sig_id}")]
                     ])
-
                     sent_msg = await bot.send_message(chat_id=CHAT_ID, text=alert_text,
                                                        reply_markup=keyboard, parse_mode='Markdown')
                     signal_log.append({
@@ -772,23 +698,17 @@ async def monitor():
                         "outcome": None, "pnl": None
                     })
                     if len(signal_log) > 1000: del signal_log[:-1000]
-
                     open_trades[f"{sym}_{time.time()}"] = {
                         "pair": sym, "side": side, "entry": price, "tp": tp_price, "sl": sl_price,
                         "alert_msg": sent_msg, "chat_id": CHAT_ID, "signal_id": sig_id
                     }
                     sec = get_sector(sym)
                     sector_counts[sec] = sector_counts.get(sec, 0) + 1
-
-        # Heartbeat
         summary = f"📊 SCANNED: {len(PAIRS)} | 🟢 {len(strong)} | ⚠️ {len(watch)+len(weak)} | ❌ {no_trade}"
         heartbeat = f"📡 {now:%Y-%m-%d %H:%M} UTC | MARKET SCAN\n" + "\n".join(lines) + f"\n\n{summary}"
         await bot.send_message(chat_id=CHAT_ID, text=heartbeat, parse_mode='Markdown')
-
-        # Daily optimisation at 12:00 UTC
         if now.hour == 12 and now.minute == 0:
             asyncio.create_task(daily_pair_selection_and_optimize())
-
         elapsed = (datetime.now(timezone.utc) - now).total_seconds()
         sleep_seconds = max(1, SCAN_INTERVAL_MINUTES * 60 - elapsed)
         await asyncio.sleep(sleep_seconds)
