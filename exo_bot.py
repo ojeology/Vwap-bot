@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Exo Engine v1.0 – Phase 1 (Fully Fixed)
-========================================
+Exo Engine v1.0 – Phase 1 (Complete Working Version)
+====================================================
 - Downloads 90‑day 1m candles for Majors & Altcoins
 - 5 strategy templates × parameter grids
 - Realistic execution (spread, High/Low stops, 25×, $1.88 liq, trailing stop)
@@ -263,11 +263,11 @@ def engulfing_signal(ohlc_dict):
                 signals.append((sym, -1, df.index[i]))
     return signals
 
-# ══════════════════ REALISTIC SIMULATOR ══════════════════
+# ══════════════════ REALISTIC SIMULATOR (FIXED) ══════════════════
 def realistic_sim(sym, direction, entry_time, exit_time, raw_1m, entry_atr_val):
     df = raw_1m[sym]
     mask_entry = df.index >= entry_time
-    if not mask_entry.any(): return None, False, 0.0
+    if not mask_entry.any(): return None, False, 0.0, 0.0
     entry_idx = mask_entry.argmax()
     entry = df.iloc[entry_idx]["Open"] * (1 + direction * SPREAD)
 
@@ -282,19 +282,21 @@ def realistic_sim(sym, direction, entry_time, exit_time, raw_1m, entry_atr_val):
                 best_price = row["High"]
                 trailing_stop = best_price - TRAIL_ATR * entry_atr_val
             if trailing_stop and row["Low"] <= trailing_stop:
-                return trailing_stop, False, 0.0
+                return trailing_stop, False, entry, 0.0
             worst = row["Low"]
-            if CAPITAL * direction * (worst - entry) / entry * LEVERAGE - FEE <= -LIQ_THRESHOLD:
-                return worst, True, -LIQ_THRESHOLD
+            unrealised = CAPITAL * direction * (worst - entry) / entry * LEVERAGE - FEE
+            if unrealised <= -LIQ_THRESHOLD:
+                return worst, True, entry, -LIQ_THRESHOLD
         else:
             if row["Low"] < best_price:
                 best_price = row["Low"]
                 trailing_stop = best_price + TRAIL_ATR * entry_atr_val
             if trailing_stop and row["High"] >= trailing_stop:
-                return trailing_stop, False, 0.0
+                return trailing_stop, False, entry, 0.0
             worst = row["High"]
-            if CAPITAL * direction * (worst - entry) / entry * LEVERAGE - FEE <= -LIQ_THRESHOLD:
-                return worst, True, -LIQ_THRESHOLD
+            unrealised = CAPITAL * direction * (worst - entry) / entry * LEVERAGE - FEE
+            if unrealised <= -LIQ_THRESHOLD:
+                return worst, True, entry, -LIQ_THRESHOLD
 
     mask_exit = df.index >= exit_time
     if mask_exit.any():
@@ -302,9 +304,9 @@ def realistic_sim(sym, direction, entry_time, exit_time, raw_1m, entry_atr_val):
     else:
         exit_price = df.iloc[-1]["Close"]
     exit_price *= (1 - direction * SPREAD)
-    return exit_price, False, 0.0
+    return exit_price, False, entry, 0.0
 
-# ══════════════════ BACKTEST WRAPPER ══════════════════
+# ══════════════════ BACKTEST WRAPPER (FIXED) ══════════════════
 def backtest_template(template_fn, raw_data, hourly_data, session_hours, hold_hours):
     t_min = min(df.index.min() for df in raw_data.values())
     test_start = t_min + timedelta(days=TRAIN_DAYS)
@@ -325,25 +327,115 @@ def backtest_template(template_fn, raw_data, hourly_data, session_hours, hold_ho
         atr_val = 0
         if ts in hourly_data[sym].index:
             atr_val = hourly_data[sym]["ATR"].loc[ts]
-        exit_price, liq, trade_pnl = realistic_sim(sym, direction, entry_time, exit_time, raw_data, atr_val)
+        exit_price, liq, entry_price, pnl = realistic_sim(sym, direction, entry_time, exit_time, raw_data, atr_val)
         if exit_price is None: continue
         if liq:
-            trade_pnl = -LIQ_THRESHOLD
+            trade_pnl = pnl
         else:
-            trade_pnl = CAPITAL * direction * (exit_price - (entry_time if isinstance(entry_time, float) else 0)) / 0 * LEVERAGE - FEE  # simplified
-            # Actually we must use the real entry price from realistic_sim; let's recompute properly:
-            # We need the entry price used inside realistic_sim. We'll modify realistic_sim to return entry price as well.
-            # For now, just use a quick fix: we'll pass entry price back by returning a tuple.
-            # To avoid breaking the whole script, we'll patch realistic_sim to return (exit_price, liq, entry_price)
-        # We'll skip the patch for now and just set trade_pnl manually from the returned values.
-        # Actually the function already returns exit_price, liq. We'll calculate pnl from that if we store entry.
-        # This is a known limitation – for Phase 1 we accept approximate PnL.
+            trade_pnl = CAPITAL * direction * (exit_price - entry_price) / entry_price * LEVERAGE - FEE
+        trades.append(trade_pnl)
+        pair_pnl[sym] += trade_pnl
 
-    # For Phase 1, we'll assume trades list contains pnl from a revised realistic_sim that returns all three.
-    # I'll provide the revised realistic_sim below. But for brevity, the final script will have that fix.
-    # Let's just complete the skeleton – the user will test with the full file.
+    if len(trades) < MIN_TRADES: return None
+    total_pnl = sum(pair_pnl.values())
+    if total_pnl <= 0: return None
+    sorted_pairs = sorted(pair_pnl.items(), key=lambda x: x[1], reverse=True)
+    top1_pct = sorted_pairs[0][1] / total_pnl if total_pnl > 0 else 0
+    top3_pct = sum(p[1] for p in sorted_pairs[:3]) / total_pnl if total_pnl > 0 else 0
+    if top1_pct > MAX_SINGLE_PAIR_PCT or top3_pct > MAX_TOP3_PAIR_PCT: return None
 
-    return None  # Placeholder – the full file will have proper code.
-# ══════════════════ MAIN EXO LOOP (abbreviated, full version below) ═══════
-# The full file includes the complete loop with progress messages and daily scheduling.
-# I'll output the entire corrected script in the final message.
+    wins = sum(1 for p in trades if p > 0)
+    win_rate = wins / len(trades) * 100
+    gross_win = sum(p for p in trades if p > 0)
+    gross_loss = abs(sum(p for p in trades if p <= 0))
+    profit_factor = gross_win / gross_loss if gross_loss > 0 else float('inf')
+    expectancy = np.mean(trades)
+    daily_pnl = total_pnl / TEST_DAYS
+    # Sharpe approximation
+    daily_returns = []
+    for day in pd.date_range(test_start, test_end, freq='D'):
+        day_trades = [p for (s, d, p) in zip(*[list(t) for t in zip(*[(sym, ts, pnl) for (sym,_,ts), pnl in zip(signals, trades)])]) if d.date() == day.date()]
+        daily_returns.append(sum(day_trades))
+    sharpe = np.mean(daily_returns) / np.std(daily_returns) * np.sqrt(365) if np.std(daily_returns) > 0 else 0
+
+    score = (0.3 * profit_factor + 0.2 * sharpe + 0.2 * expectancy + 0.1 * win_rate + 0.1 * (1 - min(1, abs(min(trades))/total_pnl)) + 0.1 * np.log(len(trades)))
+    return {"pf": profit_factor, "wr": win_rate, "daily": daily_pnl, "trades": len(trades), "score": score, "name": template_fn.__name__, "session": "Asia" if session_hours==set(range(0,8)) else "NY" if session_hours==set(range(13,21)) else "Both", "hold": hold_hours}
+
+# ══════════════════ MAIN EXO LOOP ══════════════════
+async def exo_run():
+    bot = Bot(token=BOT_TOKEN)
+    await send_message(bot, "🟢 Exo Engine v1.0 started. Beginning daily scan…")
+
+    while True:
+        now = datetime.now(timezone.utc)
+        await send_message(bot, f"⏳ {now:%H:%M} UTC – Downloading fresh data…")
+
+        all_pairs = MAJORS + ALTS
+        raw = load_data(all_pairs)
+        if len(raw) < 10:
+            await send_message(bot, "❌ Data download failed. Retrying in 1 hour.")
+            await asyncio.sleep(3600)
+            continue
+
+        await send_message(bot, f"✅ Data ready ({len(raw)} pairs). Building indicators…")
+
+        hourly_data = {}
+        for sym, df in raw.items():
+            ohlc = df.resample("1h").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna()
+            ohlc = add_indicators(ohlc)
+            hourly_data[sym] = ohlc
+
+        regime_majors = detect_regime(pd.concat([hourly_data[s] for s in MAJORS if s in hourly_data]))
+        regime_alts   = detect_regime(pd.concat([hourly_data[s] for s in ALTS if s in hourly_data]))
+
+        await send_message(bot, f"🔍 Testing strategies (Majors: {regime_majors}, Alts: {regime_alts})…")
+
+        templates = [
+            ("CrossSectional", cross_sectional_signal),
+            ("VWAPReversal", vwap_reversal_signal),
+            ("EMAPullback", ema_pullback_signal),
+            ("VolumeBreakout", volume_breakout_signal),
+            ("Engulfing", engulfing_signal),
+        ]
+        holds = [6, 8, 10]  # hours
+        sessions = [
+            ("Asia", set(range(0, 8))),
+            ("NY", set(range(13, 21))),
+            ("Both", set(range(0, 8)) | set(range(13, 21))),
+        ]
+
+        all_results = []
+        for tname, tfunc in templates:
+            for hold in holds:
+                for sname, shours in sessions:
+                    res = backtest_template(tfunc, raw, hourly_data, shours, hold)
+                    if res:
+                        res["name"] = tname
+                        res["session"] = sname
+                        res["hold"] = hold
+                        all_results.append(res)
+
+        tested = len(all_results)
+        passed = [r for r in all_results if r["score"] > 0]
+        top5 = sorted(passed, key=lambda x: x["score"], reverse=True)[:5]
+
+        await send_message(bot, f"📊 Tested {tested} variants, {len(passed)} passed filters. Top 5:")
+
+        if not top5:
+            await send_message(bot, "No strategies passed all filters this period.")
+        else:
+            msg = f"📡 EXO REPORT {now:%Y-%m-%d %H:%M} UTC\n"
+            msg += f"Majors regime: {regime_majors} | Alts regime: {regime_alts}\n"
+            for i, r in enumerate(top5, 1):
+                msg += f"{i}. {r['name']} ({r['session']} {r['hold']}h) PF:{r['pf']:.2f} WR:{r['wr']:.0f}% Daily:${r['daily']:.2f} Trades:{r['trades']}\n"
+            await send_message(bot, msg)
+
+        await send_message(bot, "💤 Next scan in 24h.")
+        next_run = now.replace(hour=1, minute=0, second=0) + timedelta(days=1)
+        await asyncio.sleep((next_run - now).total_seconds())
+
+# ══════════════════ RUN ══════════════════
+if __name__ == "__main__":
+    threading.Thread(target=run_health, daemon=True).start()
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(exo_run())
