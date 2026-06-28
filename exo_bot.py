@@ -15,7 +15,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 from flask import Flask
 
 # ══════════════════ CREDENTIALS ══════════════════
-BOT_TOKEN = "8835542017:AAFDRUJjrXv2pgDdVpbxQlMAxILDlIBrL8g"
+BOT_TOKEN = "8908331931:AAFHiBW7k_RSRENrhegpsqg8E-gl_nAaLx0"
 CHAT_ID   = 6400145232
 
 # ══════════════════ CONFIG ══════════════════
@@ -99,7 +99,7 @@ STATS_FILE = "stats.json"
 LOG_FILE = "bot.log"
 FAIL_THRESHOLD = 3
 RETRY_HOURS = 12
-FORCE_BACKTEST = False
+FORCE_BACKTEST = True
 
 # ══════════════════ LOGGING ══════════════════
 logging.basicConfig(
