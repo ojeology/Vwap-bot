@@ -870,126 +870,43 @@ async def health_watchdog(context: ContextTypes.DEFAULT_TYPE):
     await bot.send_message(chat_id=CHAT_ID, text=msg)
 
 # ══════════════════ MAIN ══════════════════
+
 async def main():
-    threading.Thread(target=run_health, daemon=True).start()
-
-    global PAIRS
-    PAIRS = get_valid_symbols()
-    if not PAIRS:
-        logging.error("No valid symbols found, using all candidates.")
-        PAIRS = CANDIDATES.copy()
-    logging.info(f"Valid symbols: {len(PAIRS)}")
-
-    load_active_signals()
-    load_stats()
-
-    await asyncio.get_event_loop().run_in_executor(None, initial_data_download)
-    downloaded = sum(1 for s in get_active_pairs() + [BTC_PAIR] if s in data_cache)
-    logging.info(f"Downloaded: {downloaded}")
-
-    bt_win_rate = None
-    if FORCE_BACKTEST or not os.path.exists(PERF_FILE):
-        bt_signals = run_backtest()
-        wins = sum(1 for s in bt_signals if s["outcome"]=="win")
-        total = len(bt_signals)
-        if total:
-            bt_win_rate = wins/total*100
-            logging.info(f"Backtest: {bt_win_rate:.1f}% ({wins}/{total})")
-    else:
-        logging.info("Backtest skipped (CSV exists).")
-
     app = Application.builder().token(BOT_TOKEN).build()
 
-    startup_msg = f"🚀 <b>Bot Online</b>\nPairs: {len(get_active_pairs())}\nHistory: {HISTORY_DAYS} days\nActive Signals: {len(active_signals)}"
+    startup_msg = f"🚀 <b>Bot Online</b>
+Pairs: {len(get_active_pairs())}
+History: {HISTORY_DAYS} days
+Active Signals: {len(active_signals)}"
     if bt_win_rate is not None:
-        pass
-    else:
-        startup_msg += "\nBacktest: 0 signals found in last 30 days"
-        startup_msg += f"\nBacktest Win Rate: {bt_win_rate:.1f}%"
+        startup_msg += f"
+Backtest Win Rate: {bt_win_rate:.1f}%"
+    elif FORCE_BACKTEST or not os.path.exists(PERF_FILE):
+        startup_msg += f"
+Backtest: {bt_signal_count} signals found (0 wins)"
     with stats_lock:
-        startup_msg += f"\nTotal P&L: ${stats['total_pnl']:.2f}"
+        startup_msg += f"
+Total P&L: ${stats["total_pnl"]:.2f}"
+
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    job_queue = app.job_queue
+    job_queue.run_repeating(periodic_scan, interval=SCAN_INTERVAL_MINUTES * 60, first=10)
+    now = datetime.now(timezone.utc)
+    next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    seconds_to_midnight = (next_midnight - now).total_seconds()
+    job_queue.run_repeating(daily_summary, interval=86400, first=seconds_to_midnight)
+    job_queue.run_repeating(health_watchdog, interval=1800, first=60)
+
     await app.bot.send_message(chat_id=CHAT_ID, text=startup_msg, parse_mode="HTML")
-
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CallbackQueryHandler(button_handler))
-
-    # JobQueue now works because we installed python-telegram-bot[job-queue]
-    job_queue = app.job_queue
-    job_queue.run_repeating(periodic_scan, interval=SCAN_INTERVAL_MINUTES*60, first=10)
-
-    now = datetime.now(timezone.utc)
-    next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    seconds_to_midnight = (next_midnight - now).total_seconds()
-    job_queue.run_repeating(daily_summary, interval=86400, first=seconds_to_midnight)
-
-    job_queue.run_repeating(health_watchdog, interval=1800, first=60)
-
-    await app.run_polling(close_loop=False)   # ← critical fix for Render
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    await app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     threading.Thread(target=run_health, daemon=True).start()
 
-    PAIRS = get_valid_symbols()
-    if not PAIRS:
-        logging.error("No valid symbols found, using all candidates.")
-        PAIRS = CANDIDATES.copy()
-    logging.info(f"Valid symbols: {len(PAIRS)}")
-
-    load_active_signals()
-    load_stats()
-
-    initial_data_download()
-    downloaded = sum(1 for s in get_active_pairs() + [BTC_PAIR] if s in data_cache)
-    logging.info(f"Downloaded: {downloaded}")
-
-    bt_win_rate = None
-    if FORCE_BACKTEST or not os.path.exists(PERF_FILE):
-        bt_signals = run_backtest()
-        wins = sum(1 for s in bt_signals if s["outcome"]=="win")
-        total = len(bt_signals)
-        if total:
-            bt_win_rate = wins/total*100
-            logging.info(f"Backtest: {bt_win_rate:.1f}% ({wins}/{total})")
-    else:
-        logging.info("Backtest skipped (CSV exists).")
-
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    startup_msg = f"🚀 <b>Bot Online</b>\nPairs: {len(get_active_pairs())}\nHistory: {HISTORY_DAYS} days\nActive Signals: {len(active_signals)}"
-    if bt_win_rate is not None:
-        pass
-    else:
-        startup_msg += "\nBacktest: 0 signals found in last 30 days"
-        startup_msg += f"\nBacktest Win Rate: {bt_win_rate:.1f}%"
-    with stats_lock:
-        startup_msg += f"\nTotal P&L: ${stats['total_pnl']:.2f}"
-
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CallbackQueryHandler(button_handler))
-
-    job_queue = app.job_queue
-    job_queue.run_repeating(periodic_scan, interval=SCAN_INTERVAL_MINUTES*60, first=10)
-
-    now = datetime.now(timezone.utc)
-    next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    seconds_to_midnight = (next_midnight - now).total_seconds()
-    job_queue.run_repeating(daily_summary, interval=86400, first=seconds_to_midnight)
-    job_queue.run_repeating(health_watchdog, interval=1800, first=60)
-
-    async def _run():
-        await app.bot.send_message(chat_id=CHAT_ID, text=startup_msg, parse_mode="HTML")
-        await app.run_polling(close_loop=False)
-
-    asyncio.run(_run())
-
-if __name__ == "__main__":
+    # Symbol validation and setup
     global PAIRS
-
-    threading.Thread(target=run_health, daemon=True).start()
-
     PAIRS = get_valid_symbols()
     if not PAIRS:
         logging.error("No valid symbols found, using all candidates.")
@@ -1017,30 +934,5 @@ if __name__ == "__main__":
     else:
         logging.info("Backtest skipped (CSV exists).")
 
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    startup_msg = f"🚀 <b>Bot Online</b>\nPairs: {len(get_active_pairs())}\nHistory: {HISTORY_DAYS} days\nActive Signals: {len(active_signals)}"
-    if bt_win_rate is not None:
-        startup_msg += f"\nBacktest Win Rate: {bt_win_rate:.1f}%"
-    elif FORCE_BACKTEST or not os.path.exists(PERF_FILE):
-        startup_msg += f"\nBacktest: {bt_signal_count} signals found (0 wins)"
-    with stats_lock:
-        startup_msg += f"\nTotal P&L: ${stats['total_pnl']:.2f}"
-
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CallbackQueryHandler(button_handler))
-
-    job_queue = app.job_queue
-    job_queue.run_repeating(periodic_scan, interval=SCAN_INTERVAL_MINUTES * 60, first=10)
-
-    now = datetime.now(timezone.utc)
-    next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    seconds_to_midnight = (next_midnight - now).total_seconds()
-    job_queue.run_repeating(daily_summary, interval=86400, first=seconds_to_midnight)
-    job_queue.run_repeating(health_watchdog, interval=1800, first=60)
-
-    async def _run():
-        await app.bot.send_message(chat_id=CHAT_ID, text=startup_msg, parse_mode="HTML")
-        await app.run_polling(close_loop=False)
-
-    asyncio.run(_run())
+    # Run the bot
+    asyncio.run(main())
