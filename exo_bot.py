@@ -932,7 +932,6 @@ if __name__ == "__main__":
 if __name__ == "__main__":
     threading.Thread(target=run_health, daemon=True).start()
 
-    global PAIRS
     PAIRS = get_valid_symbols()
     if not PAIRS:
         logging.error("No valid symbols found, using all candidates.")
