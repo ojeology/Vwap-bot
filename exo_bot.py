@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Signal Bot v11 – Fixed MEXC 8‑column API + JobQueue support
-============================================================
+Signal Bot v12 – All fixes applied (MEXC 8‑col, pandas freq, JobQueue, asyncio)
+================================================================================
 """
 import os, time, asyncio, logging, csv, threading, json, sys, traceback
 from datetime import datetime, timezone, timedelta
@@ -15,7 +15,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 from flask import Flask
 
 # ══════════════════ CREDENTIALS ══════════════════
-BOT_TOKEN = "8835542017:AAF09E6kmNv8l4WiybXzxzU5BrV8TEfsefo"
+BOT_TOKEN = "8835542017:AAFDRUJjrXv2pgDdVpbxQlMAxILDlIBrL8g"
 CHAT_ID   = 6400145232
 
 # ══════════════════ CONFIG ══════════════════
@@ -710,7 +710,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📊 Stats", callback_data="stats")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Signal Bot v11 ready. Choose an option:", reply_markup=reply_markup)
+    await update.message.reply_text("Signal Bot v12 ready. Choose an option:", reply_markup=reply_markup)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -910,7 +910,7 @@ async def main():
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    # JobQueue now works because we installed the extra
+    # JobQueue now works because we installed python-telegram-bot[job-queue]
     job_queue = app.job_queue
     job_queue.run_repeating(periodic_scan, interval=SCAN_INTERVAL_MINUTES*60, first=10)
 
@@ -921,12 +921,7 @@ async def main():
 
     job_queue.run_repeating(health_watchdog, interval=1800, first=60)
 
-    await app.run_polling()
+    await app.run_polling(close_loop=False)   # ← critical fix for Render
 
 if __name__ == "__main__":
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(main())
-    finally:
-        loop.close()
+    asyncio.run(main())
