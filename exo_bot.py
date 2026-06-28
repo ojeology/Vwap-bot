@@ -924,9 +924,6 @@ async def main():
     await app.run_polling()
 
 if __name__ == "__main__":
-    
-loop = asyncio.get_event_loop()
-if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
