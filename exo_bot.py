@@ -81,15 +81,15 @@ STOP_PCT_MIN = 0.0188
 TP_ATR_MULT = 2.0
 SL_ATR_MULT = 1.2
 TOP_N = 5
-MIN_ADX = 20
-MIN_EFFICIENCY = 0.5
+MIN_ADX = 15
+MIN_EFFICIENCY = 0.3
 ATR_PERIOD = 14
 LOOKBACK_RANGE = 15
 SCAN_INTERVAL_MINUTES = 15
 MAX_MEME = 1
 MAX_L1_AI_DEFI = 1
 HISTORY_DAYS = 30
-DOLLAR_VOLUME_THRESHOLD = 500_000
+DOLLAR_VOLUME_THRESHOLD = 200_000
 MARKET_BREADTH_LONG_MIN = 0.3
 MARKET_BREADTH_SHORT_MAX = 0.7
 OUTCOME_WINDOW_HOURS = 2
@@ -902,6 +902,9 @@ async def main():
 
     startup_msg = f"🚀 <b>Bot Online</b>\nPairs: {len(get_active_pairs())}\nHistory: {HISTORY_DAYS} days\nActive Signals: {len(active_signals)}"
     if bt_win_rate is not None:
+        pass
+    else:
+        startup_msg += "\nBacktest: 0 signals found in last 30 days"
         startup_msg += f"\nBacktest Win Rate: {bt_win_rate:.1f}%"
     with stats_lock:
         startup_msg += f"\nTotal P&L: ${stats['total_pnl']:.2f}"
@@ -958,6 +961,9 @@ if __name__ == "__main__":
 
     startup_msg = f"🚀 <b>Bot Online</b>\nPairs: {len(get_active_pairs())}\nHistory: {HISTORY_DAYS} days\nActive Signals: {len(active_signals)}"
     if bt_win_rate is not None:
+        pass
+    else:
+        startup_msg += "\nBacktest: 0 signals found in last 30 days"
         startup_msg += f"\nBacktest Win Rate: {bt_win_rate:.1f}%"
     with stats_lock:
         startup_msg += f"\nTotal P&L: ${stats['total_pnl']:.2f}"
