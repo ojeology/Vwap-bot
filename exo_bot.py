@@ -328,7 +328,7 @@ def add_indicators(df):
     cum_vol = vol.groupby(day).cumsum()
     df["vwap_daily"] = cum_vp / cum_vol
 
-    ohlc_15 = df.resample("15T").agg({"Close": "last", "Volume": "sum"}).dropna()
+    ohlc_15 = df.resample("15min").agg({"Close": "last", "Volume": "sum"}).dropna()
     ohlc_15["ema20"] = ohlc_15["Close"].ewm(span=20, adjust=False).mean()
     df["ema20_15m"] = ohlc_15["ema20"].reindex(df.index, method="ffill")
 
@@ -356,7 +356,7 @@ def backtest_pair(sym, df, btc_df):
     if df.empty or btc_df.empty:
         return []
     signals = []
-    decision_times = df.resample("15T").last().dropna()
+    decision_times = df.resample("15min").last().dropna()
     perf = load_rolling_performance(100)
     for timestamp, row in decision_times.iterrows():
         if row["ADX"] < MIN_ADX or row["eff_ratio"] < MIN_EFFICIENCY:
