@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Signal Bot v10 – Production‑hardened (full symbol list, thread‑safe, persistent stats)
-=====================================================================================
+Signal Bot v11 – Fixed MEXC 8‑column API + JobQueue support
+============================================================
 """
 import os, time, asyncio, logging, csv, threading, json, sys, traceback
 from datetime import datetime, timezone, timedelta
@@ -15,7 +15,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 from flask import Flask
 
 # ══════════════════ CREDENTIALS ══════════════════
-BOT_TOKEN = "8835542017:AAFDRUJjrXv2pgDdVpbxQlMAxILDlIBrL8g"
+BOT_TOKEN = "8835542017:AAF09E6kmNv8l4WiybXzxzU5BrV8TEfsefo"
 CHAT_ID   = 6400145232
 
 # ══════════════════ CONFIG ══════════════════
@@ -178,6 +178,7 @@ fail_count = defaultdict(int)
 data_lock = threading.Lock()
 
 def fetch_candles(sym, start_time, end_time, retries=2):
+    """Fetch candles with rate‑limit handling. Works with MEXC's 8‑column response."""
     for attempt in range(retries+1):
         try:
             cursor = int(start_time.timestamp() * 1000)
@@ -196,22 +197,25 @@ def fetch_candles(sym, start_time, end_time, retries=2):
                     continue
                 r.raise_for_status()
                 data = r.json()
-                if not isinstance(data, list) or not data: break
+                if not isinstance(data, list) or not data:
+                    break
                 rows.extend(data)
                 cursor = data[-1][0] + 60_000
-                if len(data) < 500: break
+                if len(data) < 500:
+                    break
                 time.sleep(0.02)
             if not rows:
                 return pd.DataFrame()
-            df = pd.DataFrame(rows, columns=[
-                "OpenTime","Open","High","Low","Close","Volume","CloseTime","QuoteVol",
-                "Trades","TakerBuyBase","TakerBuyQuote","Ignore"
-            ])
+
+            # MEXC now returns 8 columns: [OpenTime, Open, High, Low, Close, Volume, CloseTime, QuoteVolume]
+            col_names = ["OpenTime", "Open", "High", "Low", "Close", "Volume", "CloseTime", "QuoteVolume"]
+            df = pd.DataFrame(rows, columns=col_names)
+
             df["OpenTime"] = pd.to_datetime(df["OpenTime"], unit="ms", utc=True)
             df.set_index("OpenTime", inplace=True)
-            for c in ["Open","High","Low","Close","Volume"]:
+            for c in ["Open", "High", "Low", "Close", "Volume"]:
                 df[c] = pd.to_numeric(df[c])
-            return df[["Open","High","Low","Close","Volume"]].sort_index()
+            return df[["Open", "High", "Low", "Close", "Volume"]].sort_index()
         except Exception as e:
             if attempt < retries:
                 time.sleep(2 ** attempt)
@@ -706,7 +710,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📊 Stats", callback_data="stats")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Signal Bot v10 ready. Choose an option:", reply_markup=reply_markup)
+    await update.message.reply_text("Signal Bot v11 ready. Choose an option:", reply_markup=reply_markup)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -906,6 +910,7 @@ async def main():
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
 
+    # JobQueue now works because we installed the extra
     job_queue = app.job_queue
     job_queue.run_repeating(periodic_scan, interval=SCAN_INTERVAL_MINUTES*60, first=10)
 
