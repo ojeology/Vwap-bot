@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """
-Signal Bot v19 – Pro Hedge Signal System + Heartbeat
-======================================================
-- A+ straddle alerts every 15 min
-- Heartbeat every 10 min (top near‑A+ coins)
-- Fully stable for Termux & Render
+Signal Bot v20 – Relaxed A+ Filters + Auto‑restart + Heartbeat
+================================================================
 """
 import os, time, asyncio, logging, threading, sys, json
 from datetime import datetime, timezone, timedelta
@@ -51,20 +48,20 @@ HEARTBEAT_INTERVAL_MINUTES = 10
 HISTORY_DAYS = 2
 ATR_PERIOD = 14
 LOOKBACK_RANGE = 15
-MIN_ADX = 10
+MIN_ADX = 8                         # lowered from 10
 DOLLAR_VOLUME_THRESHOLD = 50_000
 FAIL_THRESHOLD = 3
 RETRY_HOURS = 12
 LOG_FILE = "bot.log"
 
-# ── Pro filters ──
+# ── Relaxed A+ filters ──
 COOLDOWN_MINUTES = 30
 MAX_ATR_PCT = 8.0
 MAX_PRICE_CHANGE_15M = 5.0
-BB_EXPANSION_MIN = 1.2
+BB_EXPANSION_MIN = 1.0             # was 1.2
 BB_EXPANSION_MAX = 2.5
-MIN_CONSECUTIVE_VOL_SURGE = 2
-BREAKOUT_MIN = 0.6
+MIN_CONSECUTIVE_VOL_SURGE = 1      # was 2
+BREAKOUT_MIN = 0.4                 # was 0.6
 CHOPPY_ADX_THRESHOLD = 15
 CHOPPY_ALERT_REDUCTION = 0.3
 RELIABILITY_WINDOW = 20
@@ -77,7 +74,7 @@ logging.basicConfig(
     handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)]
 )
 
-# ══════════════════ HEALTH SERVER (optional) ══════════════════
+# ══════════════════ HEALTH SERVER ══════════════════
 health_app = Flask(__name__)
 @health_app.route('/health')
 def health(): return 'OK', 200
@@ -233,39 +230,32 @@ def add_indicators(df):
     low = df["Low"]
     vol = df["Volume"]
 
-    # True Range & ATR
     tr = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
     df["ATR"] = tr.rolling(ATR_PERIOD, min_periods=1).mean()
     df["ATR_pct"] = df["ATR"] / close * 100
 
-    # ATR Expansion
     df["ATR_30min_ago"] = df["ATR"].shift(30)
     df["atr_expansion"] = df["ATR"] / df["ATR_30min_ago"].replace(0, np.nan)
     df["atr_expansion"] = df["atr_expansion"].clip(upper=5)
 
-    # Relative Volume
     df["vol_avg"] = vol.rolling(20, min_periods=1).mean()
     df["vol_ratio"] = vol / df["vol_avg"]
 
-    # Dollar volume surge
     df["dollar_vol"] = close * vol
     df["dollar_vol_avg20"] = df["dollar_vol"].rolling(20, min_periods=1).mean()
     df["vol_surge"] = df["dollar_vol"] / df["dollar_vol_avg20"]
 
-    # Price velocity
     df["roc1"] = close.pct_change(1).abs() * 100
     df["roc3"] = close.pct_change(3).abs() * 100
     df["roc5"] = close.pct_change(5).abs() * 100
     df["price_velocity"] = (df["roc1"] + df["roc3"] + df["roc5"]) / 3
 
-    # Breakout
     df["range_high_30"] = high.rolling(30, min_periods=1).max()
     df["range_low_30"] = low.rolling(30, min_periods=1).min()
     df["range_30"] = df["range_high_30"] - df["range_low_30"]
     df["breakout"] = (close - df["range_low_30"]) / df["range_30"].replace(0, np.nan)
     df["breakout"] = df["breakout"].clip(0, 1)
 
-    # ADX
     up_move = high.diff()
     down_move = -low.diff()
     plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0), index=df.index)
@@ -276,7 +266,6 @@ def add_indicators(df):
     dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-6)
     df["ADX"] = dx.rolling(ATR_PERIOD, min_periods=1).mean()
 
-    # Bollinger Bands
     df["sma20"] = close.rolling(20, min_periods=1).mean()
     df["std20"] = close.rolling(20, min_periods=1).std()
     df["upper_bb"] = df["sma20"] + 2 * df["std20"]
@@ -286,9 +275,7 @@ def add_indicators(df):
     df["bb_expansion"] = df["bb_width"] / df["bb_width_20min_ago"].replace(0, np.nan)
     df["bb_expansion"] = df["bb_expansion"].clip(upper=5)
 
-    # 15‑min price change for no‑trade filter
     df["chg_15min"] = close.pct_change(periods=15) * 100
-
     return df
 
 # ══════════════════ ORDER BOOK ══════════════════
@@ -336,7 +323,6 @@ def get_reliability(sym):
 
 # ══════════════════ A+ SETUP CLASSIFIER ══════════════════
 def check_ap_criteria(row, df):
-    """Return a dict with pass/fail and missing items."""
     reasons = []
     passed = True
 
@@ -381,7 +367,6 @@ def check_ap_criteria(row, df):
     return passed, reasons
 
 def get_near_ap_coins(top_n=5):
-    """Return coins sorted by composite score, with their missing criteria."""
     active_syms = get_active_pairs()
     results = []
     with data_lock:
@@ -394,7 +379,6 @@ def get_near_ap_coins(top_n=5):
             if row["ADX"] < MIN_ADX: continue
             if row["dollar_vol_avg20"] < DOLLAR_VOLUME_THRESHOLD: continue
 
-            # Compute composite score (same as A+ but without filtering)
             rvol_n = min(row["vol_ratio"] / 8, 1.0)
             atr_exp_n = min(row["atr_expansion"] / 3, 1.0)
             bb_exp_n = min(row["bb_expansion"] / 3, 1.0)
@@ -402,18 +386,15 @@ def get_near_ap_coins(top_n=5):
             brk_n = row["breakout"]
             surge_n = min(row["vol_surge"] / 8, 1.0)
             adx_n = min(row["ADX"] / 50, 1.0)
-            # order book not needed for near-A+; skip for speed
             rel_n = get_reliability(sym)
             score = (0.20 * rvol_n + 0.15 * atr_exp_n + 0.20 * bb_exp_n +
                      0.15 * vel_n + 0.10 * brk_n + 0.10 * surge_n +
                      0.05 * 0 + 0.03 * rel_n + 0.02 * adx_n) * 100
-
             passed, reasons = check_ap_criteria(row, df)
             results.append((sym, score, passed, reasons))
     results.sort(key=lambda x: x[1], reverse=True)
     return results[:top_n]
 
-# ══════════════════ A+ STRADDLE ALERT (existing) ══════════════════
 def is_ap_setup(row, df):
     passed, reasons = check_ap_criteria(row, df)
     if passed:
@@ -425,8 +406,6 @@ def is_ap_setup(row, df):
 def get_ap_signals(n=5):
     now = datetime.now(timezone.utc)
     active_syms = get_active_pairs()
-
-    # Fetch order books only for A+ candidates (optimized)
     regime = get_market_regime()
     candidates = []
     with data_lock:
@@ -444,8 +423,6 @@ def get_ap_signals(n=5):
             ok, reason = is_ap_setup(row, df)
             if not ok:
                 continue
-
-            # same scoring as before
             rvol_n = min(row["vol_ratio"] / 8, 1.0)
             atr_exp_n = min(row["atr_expansion"] / 3, 1.0)
             bb_exp_n = min(row["bb_expansion"] / 3, 1.0)
@@ -453,10 +430,8 @@ def get_ap_signals(n=5):
             brk_n = row["breakout"]
             surge_n = min(row["vol_surge"] / 8, 1.0)
             adx_n = min(row["ADX"] / 50, 1.0)
-            # fetch OB later
             candidates.append((sym, row, rvol_n, atr_exp_n, bb_exp_n, vel_n, brk_n, surge_n, adx_n))
 
-    # get order books for passed candidates
     ob_data = {}
     syms_to_fetch = [c[0] for c in candidates]
     if syms_to_fetch:
@@ -497,7 +472,6 @@ def get_ap_signals(n=5):
 
     return final_signals, regime
 
-# ══════════════════ MARKET REGIME DETECTION ══════════════════
 def get_market_regime():
     adxs = []
     with data_lock:
@@ -519,7 +493,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔄 Refresh", callback_data="refresh")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Pro Hedge Straddle v19", reply_markup=reply_markup)
+    await update.message.reply_text("Pro Hedge Straddle v20", reply_markup=reply_markup)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -600,12 +574,11 @@ async def health_watchdog(context: ContextTypes.DEFAULT_TYPE):
     await bot.send_message(chat_id=CHAT_ID, text=msg)
 
 async def send_startup(context: ContextTypes.DEFAULT_TYPE):
-    msg = f"🚀 Pro Hedge Straddle v19 Online\nPairs: {len(get_active_pairs())}\nA+ Scan: {SCAN_INTERVAL_MINUTES} min\nHeartbeat: {HEARTBEAT_INTERVAL_MINUTES} min\nOnly A+ Setups"
+    msg = f"🚀 Pro Hedge Straddle v20 Online\nPairs: {len(get_active_pairs())}\nA+ Scan: {SCAN_INTERVAL_MINUTES} min\nHeartbeat: {HEARTBEAT_INTERVAL_MINUTES} min\nOnly A+ Setups"
     await context.bot.send_message(chat_id=CHAT_ID, text=msg)
 
-# ══════════════════ MAIN (stable event loop) ══════════════════
+# ══════════════════ MAIN (with auto‑restart) ══════════════════
 if __name__ == "__main__":
-    # Optional health server – comment out if port conflict on Termux
     threading.Thread(target=run_health, daemon=True).start()
 
     PAIRS = get_valid_symbols()
@@ -619,7 +592,6 @@ if __name__ == "__main__":
     logging.info(f"Downloaded: {downloaded}")
 
     app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
 
@@ -629,4 +601,9 @@ if __name__ == "__main__":
     job_queue.run_repeating(heartbeat, interval=HEARTBEAT_INTERVAL_MINUTES * 60, first=5)
     job_queue.run_repeating(health_watchdog, interval=1800, first=60)
 
-    app.run_polling(close_loop=False)
+    while True:
+        try:
+            app.run_polling(close_loop=False)
+        except Exception as e:
+            logging.error(f"Polling crashed: {e}", exc_info=True)
+            time.sleep(10)
