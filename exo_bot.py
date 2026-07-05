@@ -33,7 +33,7 @@ from telegram.ext import (
 #  CONFIG
 # ══════════════════════════════════════════════════════════════════════
 DERIV_APP_TOKEN    = os.environ.get("DERIV_TOKEN",    "m8MRwwwroJy6YQw")
-TELEGRAM_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN",   "8908331931:AAFHiBW7k_RSRENrhegpsqg8E-gl_nAaLx0")
+TELEGRAM_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.environ.get("TG_CHAT_ID",     "6400145232")
 
 # Loud warning if still using hardcoded fallbacks (set env vars for production)
