@@ -6,7 +6,7 @@
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
-import json, time, sqlite3, threading, queue, logging, asyncio, os, sys
+import json, time, sqlite3, threading, queue, logging, asyncio, os, sys, pickle
 from datetime import datetime, timedelta, timezone
 from collections import deque
 from typing import Optional
@@ -14,6 +14,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import websocket
+from sklearn.ensemble import RandomForestClassifier
 
 from rich.console import Console
 from rich.layout import Layout
@@ -33,14 +34,14 @@ from telegram.ext import (
 #  CONFIG
 # ══════════════════════════════════════════════════════════════════════
 DERIV_APP_TOKEN    = os.environ.get("DERIV_TOKEN",    "m8MRwwwroJy6YQw")
-TELEGRAM_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
+TELEGRAM_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN",   "8908331931:AAHIbTDn67QLSODEhQo0EHWUvx6mYOkU_-o")
 TELEGRAM_CHAT_ID   = os.environ.get("TG_CHAT_ID",     "6400145232")
 
 # Loud warning if still using hardcoded fallbacks (set env vars for production)
 if not os.environ.get("DERIV_TOKEN"):
-    print("⚠  DERIV_TOKEN not set — using hardcoded fallback. Set env var for production.")
+    print("⚠   DERIV_TOKEN not set — using hardcoded fallback. Set env var for production.")
 if not os.environ.get("TG_BOT_TOKEN"):
-    print("⚠  TG_BOT_TOKEN not set — using hardcoded fallback. Set env var for production.")
+    print("⚠   TG_BOT_TOKEN not set — using hardcoded fallback. Set env var for production.")
 
 SYNTH_VOLATILITY    = ["R_100", "R_75", "R_50", "R_25", "R_10"]
 SYNTH_VOLATILITY_1S = ["1HZ100V", "1HZ90V", "1HZ75V", "1HZ50V", "1HZ30V", "1HZ25V", "1HZ15V", "1HZ10V"]
@@ -49,33 +50,41 @@ SYNTH_RANGE_BREAK   = ["RDBULL", "RDBEAR"]
 SYMBOLS = SYNTH_VOLATILITY + SYNTH_VOLATILITY_1S + SYNTH_RANGE_BREAK
 ALL_TOUCH_SYMBOLS = SYMBOLS
 
-STAKE                  = 5.0
-TARGET_PROFIT          = 0.60        # display only; real profit depends on market
+# ── Risk parameters ───────────────────────────────────────────────────
+STAKE                  = 3.0          # fixed risk per trade
+TARGET_PROFIT          = 0.60         # display only; real profit depends on market
 # Barrier = ATR × ATR_BARRIER_MULT above/below spot.
-# ATR already reflects each symbol's natural tick size, so this scales
-# automatically. Tightened to keep real gain in the $0.50–$0.70 band.
 ATR_BARRIER_MULT       = 0.40
 DURATION               = 15
-CONTRACT_TYPE          = "ONETOUCH"  # Deriv API name for Touch contracts
+CONTRACT_TYPE          = "ONETOUCH"
 COOLDOWN_MINUTES       = 20
 MAX_CONSECUTIVE_LOSSES = 3
 PAUSE_MINUTES          = 30
-DAILY_LOSS_LIMIT       = -25.0
-# Daily take-profit target. Hitting this (or the loss floor, or the trade
-# cap below) sends a full session summary to Telegram and starts a fresh
-# session automatically — no manual restart needed. Tune this to taste.
-DAILY_PROFIT_TARGET    = 20.0
-MAX_DAILY_TRADES       = 50
+DAILY_LOSS_LIMIT       = -20.0        # stop-loss floor per session
+DAILY_PROFIT_TARGET    = 9.0          # take-profit per session
+MAX_DAILY_TRADES       = 9999         # effectively no cap
 
 EMA_FAST               = 50
 EMA_SLOW               = 200
 ATR_PERIOD             = 14
 ATR_MA_PERIOD          = 30
 RSI_PERIOD             = 14
-# Minimum confidence required to trade. Raised from 70 -> 80 so only the
-# highest-quality setups fire.
 SCORE_THRESHOLD        = 80
 HEARTBEAT_INTERVAL_SEC = 900
+
+# ── ML filter ────────────────────────────────────────────────────────
+# The model trains in *observe-only* mode (never blocks a trade) until
+# ML_MIN_TRADES real trades are recorded. After that it retrains every
+# ML_RETRAIN_EVERY trades and starts filtering low-confidence trades.
+# A progress bar is shown in Telegram during each retrain cycle.
+MODEL_PATH        = "ml_model.pkl"
+ML_MIN_TRADES     = 100
+ML_RETRAIN_EVERY  = 100
+ML_CONFIDENCE_MIN = 0.5
+ML_FEATURE_COLS   = [
+    "score", "wick_atr_ratio", "atr", "atr_ma",
+    "ema_fast_slope", "ema_slow_slope", "ema_distance",
+]
 
 logging.basicConfig(
     filename="sniper.log", level=logging.INFO,
@@ -89,8 +98,8 @@ logger = logging.getLogger("sniper")
 _lock = threading.RLock()
 ohlcv, indicators, cooldown_until, current_candle, last_price = {}, {}, {}, {}, {}
 pending_signals, active_contracts = {}, {}
-locked_symbols: dict = {}            # symbol -> {score, details, direction, lock_price}
-unconfirmed_buys: dict = {}          # symbol -> {details, expires_at} for late buy acks
+locked_symbols: dict = {}
+unconfirmed_buys: dict = {}
 total_pnl = 0.0
 peak_equity = 0.0
 max_drawdown = 0.0
@@ -99,12 +108,258 @@ paused = False
 pause_until = datetime.min.replace(tzinfo=timezone.utc)
 session_start = datetime.now(timezone.utc)
 signal_log: deque[str] = deque(maxlen=20)
-session_symbol_stats: dict = {}      # symbol -> {"wins": int, "losses": int, "pnl": float}
+session_symbol_stats: dict = {}   # symbol -> {"wins": int, "losses": int, "pnl": float}
+
+# Daily session log — appended on every TP or SL hit; cleared at calendar midnight
+# Each entry: {reason, pnl, wins, losses, trades, time, best_sym, best_pnl, worst_sym, worst_pnl, duration_min}
+daily_session_log: list = []
+_daily_session_log_date: str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+# Per-symbol score history for sparklines — {symbol: deque(maxlen=20)}
+symbol_score_history: dict = {sym: deque(maxlen=20) for sym in SYMBOLS}
+
 telegram_app = None
 _tg_loop = None
 _auto_resume_active = False
-_test_trade_sem = threading.Semaphore(1)   # only 1 test trade at a time
-_test_trade_active: dict = {}              # {symbol: start_time} for display
+_test_trade_sem = threading.Semaphore(1)
+_test_trade_active: dict = {}
+
+# ── ML filter state ─────────────────────────────────────────────────
+ml_model = None
+ml_trained_on = 0
+ml_total_trades = 0
+ml_lock = threading.Lock()
+ml_training_active = False   # True while a retrain is in progress (for the progress bar)
+
+
+def _ml_load():
+    global ml_model, ml_trained_on
+    if os.path.exists(MODEL_PATH):
+        try:
+            with open(MODEL_PATH, "rb") as f:
+                payload = pickle.load(f)
+            ml_model = payload.get("model")
+            ml_trained_on = payload.get("trained_on", 0)
+            logger.info(f"ML model loaded from {MODEL_PATH} (trained_on={ml_trained_on})")
+        except Exception as e:
+            logger.error(f"Failed to load ML model: {e}")
+
+
+def _ml_save():
+    try:
+        with open(MODEL_PATH, "wb") as f:
+            pickle.dump({"model": ml_model, "trained_on": ml_trained_on}, f)
+    except Exception as e:
+        logger.error(f"Failed to save ML model: {e}")
+
+
+def _ml_export_csv(total: int):
+    """Fetch all trades from DB, write to CSV bytes, send as Telegram document."""
+    import io, csv as _csv
+    try:
+        conn = sqlite3.connect("trades.db")
+        cols = [
+            "id", "timestamp", "symbol", "direction", "barrier",
+            "stake", "payout", "profit", "win", "score",
+            "wick_atr_ratio", "atr", "atr_ma",
+            "ema_fast_slope", "ema_slow_slope", "ema_distance",
+        ]
+        rows = conn.execute(f"SELECT {', '.join(cols)} FROM trades ORDER BY id").fetchall()
+        conn.close()
+
+        buf = io.StringIO()
+        writer = _csv.writer(buf)
+        writer.writerow(cols)
+        writer.writerows(rows)
+        csv_bytes = buf.getvalue().encode("utf-8")
+
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
+        filename = f"ml_training_{total}trades_{ts}.csv"
+        caption = (
+            f"📊 <b>ML Training Export</b>\n"
+            f"Trained on <b>{total}</b> trades.\n"
+            f"All trade features + outcomes — ready for external analysis."
+        )
+        _send_tg_document(csv_bytes, filename, caption)
+        logger.info(f"ML CSV export sent ({total} rows, {len(csv_bytes)} bytes)")
+    except Exception as e:
+        logger.error(f"ML CSV export failed: {e}")
+        _send_tg(f"⚠️ <b>ML CSV export failed</b>\n<code>{e}</code>")
+
+
+def _ml_progress_bar(pct: float, width: int = 12) -> str:
+    filled = int(width * min(1.0, pct))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _ml_train():
+    """Train (or retrain) the RandomForest.
+    Sends a Telegram progress bar at start → complete (or skipped).
+    ml_training_active is already set to True by the caller before this
+    thread is spawned; this function clears it in a finally block so the
+    flag is always reset even on error."""
+    global ml_model, ml_trained_on, ml_training_active
+
+    try:
+        try:
+            conn = sqlite3.connect("trades.db")
+            rows = conn.execute(
+                f"SELECT {', '.join(ML_FEATURE_COLS)}, win FROM trades"
+            ).fetchall()
+            conn.close()
+        except Exception as e:
+            logger.error(f"ML training query failed: {e}")
+            return
+
+        total = len(rows)
+        bar_start = _ml_progress_bar(0.0)
+
+        _send_tg(
+            f"🤖 <b>ML RETRAINING</b> — started\n"
+            f"Training on <b>{total}</b> trades…\n"
+            f"<code>[{bar_start}]   0%</code>"
+        )
+
+        if total < ML_MIN_TRADES:
+            _send_tg(
+                f"🤖 <b>ML RETRAINING</b> — skipped\n"
+                f"Need {ML_MIN_TRADES} trades, only {total} recorded.\n"
+                f"<code>[{_ml_progress_bar(total / ML_MIN_TRADES)}] {int(total / ML_MIN_TRADES * 100)}%</code> (observe-only)"
+            )
+            return
+
+        X = [[r[i] if r[i] is not None else 0.0 for i in range(len(ML_FEATURE_COLS))] for r in rows]
+        y = [r[-1] for r in rows]
+
+        if len(set(y)) < 2:
+            _send_tg(
+                f"🤖 <b>ML RETRAINING</b> — skipped\n"
+                f"Need both wins and losses in history. Only one class found."
+            )
+            logger.info("ML training skipped: need both wins and losses in trades.db")
+            return
+
+        try:
+            clf = RandomForestClassifier(n_estimators=150, max_depth=6, random_state=42)
+            clf.fit(X, y)
+            with ml_lock:
+                ml_model = clf
+                ml_trained_on = total
+            _ml_save()
+            logger.info(f"ML model trained on {total} trades")
+            bar_done = _ml_progress_bar(1.0)
+            _send_tg(
+                f"🤖 <b>ML RETRAINING COMPLETE</b> ✅\n"
+                f"<code>[{bar_done}] 100%</code>\n"
+                f"Trained on <b>{total}</b> trades.\n"
+                f"Low-confidence trades will now be filtered."
+            )
+            # Export all training rows to CSV and send to Telegram
+            _ml_export_csv(total)
+        except Exception as e:
+            logger.error(f"ML training failed: {e}")
+            _send_tg(f"🤖 <b>ML RETRAINING FAILED</b>\n<code>{e}</code>")
+    finally:
+        # Always clear the in-progress flag, even on early returns or exceptions
+        with ml_lock:
+            ml_training_active = False
+
+
+def _ml_maybe_retrain(total_trades: int):
+    global ml_total_trades, ml_training_active
+    ml_total_trades = total_trades
+    spawn = False
+    with ml_lock:
+        # Never spawn a second retrain while one is already running
+        if not ml_training_active:
+            if ml_trained_on == 0 and total_trades >= ML_MIN_TRADES:
+                spawn = True
+            elif ml_trained_on and total_trades - ml_trained_on >= ML_RETRAIN_EVERY:
+                spawn = True
+        if spawn:
+            # Set the flag while still holding the lock so no second caller
+            # can race in before the thread starts.
+            ml_training_active = True
+    if spawn:
+        threading.Thread(target=_ml_train, daemon=True, name="MLTrain").start()
+
+
+def _ml_should_trade(details: dict) -> bool:
+    with ml_lock:
+        model = ml_model
+    if model is None:
+        return True
+    try:
+        feats = [[
+            details.get("total_score", 0),
+            details.get("extension_atr", 0),
+            details.get("atr", 0),
+            details.get("atr_ma", 0),
+            details.get("ema_fast_sl", 0),
+            details.get("ema_slow_sl", 0),
+            details.get("ema_distance", 0),
+        ]]
+        proba = model.predict_proba(feats)[0]
+        classes = list(model.classes_)
+        win_idx = classes.index(1) if 1 in classes else (len(classes) - 1)
+        confidence = proba[win_idx]
+        return confidence >= ML_CONFIDENCE_MIN
+    except Exception as e:
+        logger.error(f"ML prediction failed, allowing trade: {e}")
+        return True
+
+
+def _ml_progress_text() -> str:
+    with ml_lock:
+        trained_on, model, training = ml_trained_on, ml_model, ml_training_active
+    total = ml_total_trades
+    bar_len = 10
+
+    if training:
+        bar = _ml_progress_bar(0.5, bar_len)
+        return f"ML Filter  : ⏳ RETRAINING [{bar}] in progress…"
+
+    if model is None:
+        pct = min(1.0, total / ML_MIN_TRADES) if ML_MIN_TRADES else 1.0
+        filled = int(bar_len * pct)
+        bar = "█" * filled + "░" * (bar_len - filled)
+        return f"ML Filter  : warming up [{bar}] {total}/{ML_MIN_TRADES} trades (observe-only)"
+    else:
+        since = max(0, total - trained_on)
+        pct = min(1.0, since / ML_RETRAIN_EVERY) if ML_RETRAIN_EVERY else 1.0
+        filled = int(bar_len * pct)
+        bar = "█" * filled + "░" * (bar_len - filled)
+        return f"ML Filter  : ACTIVE [{bar}] next retrain in {max(0, ML_RETRAIN_EVERY - since)} trades"
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  SESSION BEST / WORST ASSET
+# ══════════════════════════════════════════════════════════════════════
+def _best_worst_session():
+    """Return (best_sym, best_stats, worst_sym, worst_stats) for the current
+    session. Returns (None, None, None, None) if no trades yet."""
+    with _lock:
+        stats = {s: dict(v) for s, v in session_symbol_stats.items()
+                 if v["wins"] + v["losses"] > 0}
+    if not stats:
+        return None, None, None, None
+    best_sym  = max(stats, key=lambda s: stats[s]["pnl"])
+    worst_sym = min(stats, key=lambda s: stats[s]["pnl"])
+    return best_sym, stats[best_sym], worst_sym, stats[worst_sym]
+
+
+def _best_worst_line() -> str:
+    """One-liner summary for dashboards."""
+    b_sym, b_st, w_sym, w_st = _best_worst_session()
+    if b_sym is None:
+        return "Best/Worst  : — (no trades yet)"
+    b_wr = b_st["wins"] / (b_st["wins"] + b_st["losses"]) * 100 if (b_st["wins"] + b_st["losses"]) else 0
+    w_wr = w_st["wins"] / (w_st["wins"] + w_st["losses"]) * 100 if (w_st["wins"] + w_st["losses"]) else 0
+    return (
+        f"🏅 Best  : {b_sym}  {'+' if b_st['pnl'] >= 0 else ''}${b_st['pnl']:.2f}  {b_wr:.0f}% WR\n"
+        f"💔 Worst : {w_sym}  {'+' if w_st['pnl'] >= 0 else ''}${w_st['pnl']:.2f}  {w_wr:.0f}% WR"
+    )
+
 
 def _init_symbol(sym):
     ohlcv[sym] = pd.DataFrame()
@@ -129,6 +384,7 @@ for sym in SYMBOLS:
 
 db_queue: queue.Queue = queue.Queue()
 
+
 def _db_writer():
     conn = sqlite3.connect("trades.db", check_same_thread=False)
     conn.execute("""
@@ -144,10 +400,6 @@ def _db_writer():
             ema_distance    REAL
         )
     """)
-    # NOTE: the "wick_atr_ratio" column is kept for schema compatibility with
-    # existing trades.db files, but now stores the entry-quality "extension"
-    # ratio (distance of price from EMA_FAST in ATR units) instead of a wick
-    # ratio — see score_signal().
     conn.commit()
     while True:
         item = db_queue.get()
@@ -155,9 +407,36 @@ def _db_writer():
             break
         conn.execute("INSERT INTO trades VALUES (NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", item)
         conn.commit()
+        total = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        _ml_maybe_retrain(total)
     conn.close()
 
-threading.Thread(target=_db_writer, daemon=True, name="DBWriter").start()
+
+def _watch_thread(target, args=(), name="Worker", restartable=True):
+    def _wrapper():
+        restart_count = 0
+        while True:
+            try:
+                target(*args)
+                if not restartable:
+                    return
+                raise RuntimeError(f"{name} exited unexpectedly")
+            except Exception as e:
+                restart_count += 1
+                logger.error(f"Thread '{name}' crashed: {e}", exc_info=True)
+                try:
+                    _send_tg(
+                        f"⚠️ <b>Worker thread crashed</b>: <code>{name}</code>\n"
+                        f"Error: <code>{e}</code>\n"
+                        f"Restarting (attempt {restart_count})…"
+                    )
+                except Exception:
+                    pass
+                time.sleep(min(30, 3 * restart_count))
+    threading.Thread(target=_wrapper, daemon=True, name=name).start()
+
+# DBWriter is started inside main() after _ml_load() so startup order is guaranteed
+
 
 def get_recent_trades(limit=8):
     conn = sqlite3.connect("trades.db")
@@ -168,6 +447,7 @@ def get_recent_trades(limit=8):
     conn.close()
     return rows
 
+
 def get_db_summary():
     conn = sqlite3.connect("trades.db")
     row = conn.execute(
@@ -176,9 +456,8 @@ def get_db_summary():
     conn.close()
     return row
 
+
 def get_alltime_symbol_stats(limit=10):
-    """All-time (persists across sessions, restarts, and days) per-symbol
-    win/loss/PnL breakdown, sourced directly from trades.db."""
     conn = sqlite3.connect("trades.db")
     rows = conn.execute(
         "SELECT symbol, COUNT(*), SUM(win), SUM(profit) "
@@ -188,8 +467,8 @@ def get_alltime_symbol_stats(limit=10):
     conn.close()
     return rows
 
+
 def get_alltime_daily_stats(limit=7):
-    """All-time PnL grouped by calendar day, most recent first."""
     conn = sqlite3.connect("trades.db")
     rows = conn.execute(
         "SELECT substr(timestamp, 1, 10) AS day, COUNT(*), SUM(win), SUM(profit) "
@@ -198,6 +477,7 @@ def get_alltime_daily_stats(limit=7):
     ).fetchall()
     conn.close()
     return rows
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  INDICATORS
@@ -213,8 +493,6 @@ def update_indicators(symbol: str) -> bool:
     df["ATR"] = tr.rolling(ATR_PERIOD).mean()
     df["ATR_MA"] = df["ATR"].rolling(ATR_MA_PERIOD).mean()
 
-    # RSI (Wilder smoothing) — used to avoid entering when price is already
-    # overbought/oversold, i.e. chasing the top (or bottom) of a trend.
     delta = df["Close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -224,17 +502,12 @@ def update_indicators(symbol: str) -> bool:
     df["RSI"] = 100 - (100 / (1 + rs))
     df["RSI"] = df["RSI"].fillna(100)
 
-    # ── MACD (12/26/9) — trend + momentum confirmation, independent of the
-    # EMA200/EMA50 trend filter above. A bullish MACD (line > signal, and
-    # histogram expanding) confirms the trend indicator isn't a fakeout. ──
     ema12 = df["Close"].ewm(span=12, adjust=False).mean()
     ema26 = df["Close"].ewm(span=26, adjust=False).mean()
     df["MACD"] = ema12 - ema26
     df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
     df["MACD_HIST"] = df["MACD"] - df["MACD_SIGNAL"]
 
-    # ── ADX (14) — trend *strength*. Filters out choppy/ranging markets
-    # where the EMA trend filter alone tends to whipsaw. ──────────────────
     up_move = hi.diff()
     down_move = -lo.diff()
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
@@ -247,7 +520,6 @@ def update_indicators(symbol: str) -> bool:
     df["PLUS_DI"] = plus_di
     df["MINUS_DI"] = minus_di
 
-    # ── Bollinger Bands (20, 2) — volatility squeeze / breakout confirmation.
     bb_mid = df["Close"].rolling(20).mean()
     bb_std = df["Close"].rolling(20).std()
     df["BB_MID"] = bb_mid
@@ -292,12 +564,8 @@ def update_indicators(symbol: str) -> bool:
         ind["ready"] = True
     return True
 
+
 def score_signal(symbol: str, candle: dict) -> tuple[int, str, dict]:
-    """
-    Return (score, direction, details).
-    Direction is UP when price is above EMA200, DOWN when below.
-    We only trade in the direction of the EMA200 trend.
-    """
     with _lock:
         ind = dict(indicators[symbol])
     score, details = 0, {}
@@ -316,7 +584,6 @@ def score_signal(symbol: str, candle: dict) -> tuple[int, str, dict]:
         if ind["ema_dist_increasing"]:
             trend += 6
     else:
-        # Bearish trend scoring (mirrored for DOWN trades)
         if not ind["ema_fast_rising"] and not ind["ema_slow_rising"]:
             trend += 15
         if (ema_fast or 0) < (ema_slow or 0):
@@ -326,14 +593,6 @@ def score_signal(symbol: str, candle: dict) -> tuple[int, str, dict]:
     score += trend
     details["trend"] = trend
 
-    # ── Entry quality (replaces the old wick-ratio component) ──────────
-    # Two checks that both push us toward a *pullback* entry instead of
-    # chasing an already-extended move (the classic "top of trend" mistake):
-    #   1. Extension: how far price has stretched from EMA_FAST, in ATR
-    #      units. Close to EMA_FAST = fresh pullback (good). Far = probably
-    #      already exhausted (bad).
-    #   2. RSI: reward a healthy mid-range RSI: penalize overbought (UP) or
-    #      oversold (DOWN) extremes where reversals are more likely.
     atr = ind["atr"] or 1
     ema_fast_val = ema_fast or price
     extension = abs(price - ema_fast_val) / atr if atr else 0
@@ -344,7 +603,6 @@ def score_signal(symbol: str, candle: dict) -> tuple[int, str, dict]:
         entry_quality += 15
     elif extension <= 1.0:
         entry_quality += 8
-    # extension > 1.0 -> 0 pts: too far extended, likely late/top-of-trend
 
     if rsi is not None:
         if direction == "UP":
@@ -352,13 +610,11 @@ def score_signal(symbol: str, candle: dict) -> tuple[int, str, dict]:
                 entry_quality += 15
             elif 30 <= rsi < 40 or 65 < rsi <= 75:
                 entry_quality += 7
-            # rsi >= 80 or <= 20 -> 0 pts: avoid buying an overbought blow-off top
         else:
             if 35 <= rsi <= 60:
                 entry_quality += 15
             elif 25 <= rsi < 35 or 60 < rsi <= 70:
                 entry_quality += 7
-            # rsi <= 20 or >= 80 -> 0 pts: avoid shorting an oversold capitulation low
     score += entry_quality
     details["entry_quality"] = entry_quality
     details["extension_atr"] = round(extension, 2)
@@ -380,11 +636,6 @@ def score_signal(symbol: str, candle: dict) -> tuple[int, str, dict]:
     score += mom
     details["momentum"] = mom
 
-    # ── Confluence — powerful indicator *combo* that must agree with the
-    # EMA trend before we trust the setup. MACD, ADX and Bollinger position
-    # are independent of the EMA calc, so requiring 2+ of them to line up
-    # filters out the fakeouts that a single-indicator (EMA-only) system
-    # tends to trade. This is the main lever for improving win rate. ──────
     macd_agree = ind["macd_bullish"] if direction == "UP" else not ind["macd_bullish"]
     macd_agree = macd_agree and ind["macd_hist_rising"]
 
@@ -396,9 +647,9 @@ def score_signal(symbol: str, candle: dict) -> tuple[int, str, dict]:
     if bb_pos is None:
         bb_agree = False
     elif direction == "UP":
-        bb_agree = bb_pos <= 0.75  # not already glued to the upper band
+        bb_agree = bb_pos <= 0.75
     else:
-        bb_agree = bb_pos >= 0.25  # not already glued to the lower band
+        bb_agree = bb_pos >= 0.25
 
     confluence_count = int(macd_agree) + int(adx_agree) + int(bb_agree)
     confluence = 0
@@ -412,9 +663,6 @@ def score_signal(symbol: str, candle: dict) -> tuple[int, str, dict]:
     details["confluence"] = confluence
     details["confluence_count"] = confluence_count
 
-    # Hard gate: fewer than 2/3 confluence checks agreeing means the combo
-    # indicators are fighting the EMA trend — heavily discount the score so
-    # it can't clear SCORE_THRESHOLD on trend/entry points alone.
     if confluence_count < 2:
         score = int(score * 0.5)
     details["confluence_gate_passed"] = confluence_count >= 2
@@ -432,13 +680,11 @@ def score_signal(symbol: str, candle: dict) -> tuple[int, str, dict]:
     })
     return score, direction, details
 
+
 # ══════════════════════════════════════════════════════════════════════
 #  BARRIER HELPER
 # ══════════════════════════════════════════════════════════════════════
 def _compute_barrier(symbol: str, direction: str = "UP") -> str:
-    """
-    Return a relative barrier string like '+0.20' or '-0.20' scaled to ATR.
-    """
     with _lock:
         atr = (indicators.get(symbol) or {}).get("atr") or 0.0
     if atr <= 0:
@@ -446,6 +692,7 @@ def _compute_barrier(symbol: str, direction: str = "UP") -> str:
     offset = atr * ATR_BARRIER_MULT
     sign = "+" if direction == "UP" else "-"
     return f"{sign}{offset:.2f}"
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  TELEGRAM HELPERS
@@ -466,23 +713,46 @@ def _send_tg(text: str, reply_markup=None, parse_mode: str = "HTML"):
     fut = asyncio.run_coroutine_threadsafe(_inner(), _tg_loop)
     return fut
 
+
+def _send_tg_document(file_bytes: bytes, filename: str, caption: str = ""):
+    """Send a file/document to Telegram (runs on the bot's async loop)."""
+    if not telegram_app or not _tg_loop:
+        return
+
+    async def _inner():
+        try:
+            import io
+            await telegram_app.bot.send_document(
+                chat_id=TELEGRAM_CHAT_ID,
+                document=io.BytesIO(file_bytes),
+                filename=filename,
+                caption=caption,
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.error(f"Telegram send_document: {e}")
+
+    asyncio.run_coroutine_threadsafe(_inner(), _tg_loop)
+
+
 def _send_tg_wait(text: str, reply_markup=None, parse_mode: str = "HTML", timeout: float = 8.0):
-    """Like _send_tg but BLOCKS until Telegram confirms delivery. Use when message order matters."""
     fut = _send_tg(text, reply_markup=reply_markup, parse_mode=parse_mode)
     if fut is not None:
         try:
             fut.result(timeout=timeout)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"_send_tg_wait timeout/error: {e}")
+
 
 def _score_bar_str(score: int, width: int = 10) -> str:
     filled = max(0, min(width, int(score / 100 * width)))
     return "█" * filled + "░" * (width - filled)
 
+
 def _component_bar(pts: int, max_pts: int, width: int = 8) -> str:
-    """Mini filled bar for one scoring component, e.g. '████░░░░ 20/35'"""
     filled = round(width * pts / max_pts) if max_pts else 0
     return "█" * filled + "░" * (width - filled)
+
 
 def _signal_card(sym: str, score: int, direction: str, details: dict) -> str:
     trend  = details.get("trend",         0)
@@ -550,6 +820,7 @@ def _signal_card(sym: str, score: int, direction: str, details: dict) -> str:
     )
     return text
 
+
 def _result_card(sym: str, profit: float, win: bool, details: dict) -> str:
     with _lock:
         wc, lc, pnl, cl = win_count, loss_count, total_pnl, consecutive_losses
@@ -570,13 +841,13 @@ def _result_card(sym: str, profit: float, win: bool, details: dict) -> str:
         f"(ext {details.get('extension_atr', 0):.2f}×ATR)\n"
     )
 
+
 def _session_summary_text(snap: dict) -> str:
     reason = snap["reason"]
     reason_line = {
-        "TP":        f"🎯 <b>DAILY TAKE-PROFIT HIT</b>  (target ${DAILY_PROFIT_TARGET:.2f})",
-        "SL":        f"🛑 <b>DAILY STOP-LOSS HIT</b>  (floor ${DAILY_LOSS_LIMIT:.2f})",
-        "TRADE CAP": f"🔁 <b>MAX DAILY TRADES REACHED</b>  ({MAX_DAILY_TRADES})",
-        "MANUAL":    "📄 <b>SESSION REPORT</b>",
+        "TP":     f"🎯 <b>DAILY TAKE-PROFIT HIT</b>  (target ${DAILY_PROFIT_TARGET:.2f})",
+        "SL":     f"🛑 <b>DAILY STOP-LOSS HIT</b>  (floor ${DAILY_LOSS_LIMIT:.2f})",
+        "MANUAL": "📄 <b>SESSION REPORT</b>",
     }.get(reason, "🔁 <b>SESSION LIMIT REACHED</b>")
 
     pnl   = snap["pnl"]
@@ -600,10 +871,26 @@ def _session_summary_text(snap: dict) -> str:
         f"  Peak Equity : ${snap['peak']:.2f}",
         f"  Max DD      : -${snap['max_dd']:.2f}  ({mdd_pct:.1f}%)",
         "",
-        "<b>Asset Breakdown</b>",
     ]
+
+    # Best / worst asset for the completed session
     symbols = snap.get("symbols") or {}
     if symbols:
+        traded = {s: v for s, v in symbols.items() if v["wins"] + v["losses"] > 0}
+        if traded:
+            best_sym  = max(traded, key=lambda s: traded[s]["pnl"])
+            worst_sym = min(traded, key=lambda s: traded[s]["pnl"])
+            bv, wv = traded[best_sym], traded[worst_sym]
+            b_wr = bv["wins"] / (bv["wins"] + bv["losses"]) * 100 if (bv["wins"] + bv["losses"]) else 0
+            w_wr = wv["wins"] / (wv["wins"] + wv["losses"]) * 100 if (wv["wins"] + wv["losses"]) else 0
+            lines += [
+                "<b>Best / Worst Asset</b>",
+                f"  🏅 Best  : <code>{best_sym}</code>  {'+' if bv['pnl'] >= 0 else ''}${bv['pnl']:.2f}  ({b_wr:.0f}% WR)",
+                f"  💔 Worst : <code>{worst_sym}</code>  {'+' if wv['pnl'] >= 0 else ''}${wv['pnl']:.2f}  ({w_wr:.0f}% WR)",
+                "",
+            ]
+
+        lines.append("<b>Asset Breakdown</b>")
         for sym, s in sorted(symbols.items(), key=lambda kv: kv[1]["pnl"], reverse=True):
             s_total = s["wins"] + s["losses"]
             s_wr = s["wins"] / s_total * 100 if s_total else 0
@@ -621,11 +908,11 @@ def _session_summary_text(snap: dict) -> str:
     ]
     return "\n".join(lines)
 
+
 # ══════════════════════════════════════════════════════════════════════
 #  ORDER MANAGEMENT
 # ══════════════════════════════════════════════════════════════════════
 def _reserve_trade_slot(symbol: str, now: datetime) -> bool:
-    """Atomically reserve a daily-trade slot and set cooldown."""
     global daily_trades
     with _lock:
         if (
@@ -640,12 +927,13 @@ def _reserve_trade_slot(symbol: str, now: datetime) -> bool:
             return True
         return False
 
+
 def _release_trade_slot(symbol: str):
-    """Release a reserved slot if the buy/proposal failed."""
     global daily_trades
     with _lock:
         daily_trades = max(0, daily_trades - 1)
         cooldown_until[symbol] = datetime.min.replace(tzinfo=timezone.utc)
+
 
 def request_proposal(ws, symbol: str, details: dict, direction: str):
     details["direction"] = direction
@@ -654,7 +942,7 @@ def request_proposal(ws, symbol: str, details: dict, direction: str):
         pending_signals[symbol] = details
     ws.send(json.dumps({
         "proposal": 1,
-        "amount": STAKE,          # basis="stake" → always risk exactly $STAKE
+        "amount": STAKE,
         "basis": "stake",
         "contract_type": CONTRACT_TYPE,
         "currency": "USD",
@@ -664,13 +952,13 @@ def request_proposal(ws, symbol: str, details: dict, direction: str):
         "barrier": _compute_barrier(symbol, direction),
     }))
 
+
 def on_proposal(ws, msg: dict, symbol: str):
     prop = msg.get("proposal", {})
     pid = prop.get("id")
     with _lock:
         if symbol not in pending_signals:
             return
-        # Ignore duplicate/late proposals if we already sent a buy for this signal
         if pending_signals[symbol].get("proposal_id"):
             return
         pending_signals[symbol]["proposal_id"] = pid
@@ -680,13 +968,13 @@ def on_proposal(ws, msg: dict, symbol: str):
             if symbol in pending_signals:
                 pending_signals[symbol]["buy_sent_at"] = datetime.now(timezone.utc)
 
+
 def on_buy(ws, msg: dict, symbol: str):
     buy = msg.get("buy", {})
     cid = buy.get("contract_id")
     with _lock:
         details = pending_signals.pop(symbol, None)
         if details is None:
-            # Check if this is a late buy ack for an unconfirmed trade
             ub = unconfirmed_buys.pop(symbol, None)
             if ub:
                 details = ub["details"]
@@ -694,7 +982,6 @@ def on_buy(ws, msg: dict, symbol: str):
                 return
     direction = details.get("direction", "UP")
     if not cid:
-        # Reserved slot won't be used — release it
         _release_trade_slot(symbol)
         return
     with _lock:
@@ -717,10 +1004,11 @@ def on_buy(ws, msg: dict, symbol: str):
     _send_tg(_signal_card(symbol, details.get("total_score", 0), direction, details))
     _log(f"🔥 OPEN  {symbol} {direction}  score={details.get('total_score','?')}/100  cid={cid}")
 
+
 def on_contract_update(ws, msg: dict, symbol: str):
     global total_pnl, win_count, loss_count, consecutive_losses, paused, pause_until
     global daily_trades, _auto_resume_active, peak_equity, max_drawdown, session_start
-    global session_symbol_stats
+    global session_symbol_stats, daily_session_log, _daily_session_log_date
 
     contract = msg.get("proposal_open_contract", {})
     cid = contract.get("contract_id")
@@ -773,16 +1061,15 @@ def on_contract_update(ws, msg: dict, symbol: str):
         trigger_consec = cl >= MAX_CONSECUTIVE_LOSSES
         trigger_floor  = pnl_snap <= DAILY_LOSS_LIMIT
         trigger_profit = DAILY_PROFIT_TARGET > 0 and pnl_snap >= DAILY_PROFIT_TARGET
-        trigger_cap    = dt_snap >= MAX_DAILY_TRADES
-        session_reset_trigger = trigger_floor or trigger_profit or trigger_cap
+        session_reset_trigger = trigger_floor or trigger_profit
 
         session_snapshot = None
         needs_resume_thread = False
 
         if session_reset_trigger:
-            # Demo account — no need to pause. Snapshot the session, report
-            # it, then immediately reset everything and keep trading.
-            reason = "TP" if trigger_profit else ("SL" if trigger_floor else "TRADE CAP")
+            reason = "TP" if trigger_profit else "SL"
+            _sym_snap = {s: dict(v) for s, v in session_symbol_stats.items()}
+            _dur      = datetime.now(timezone.utc) - session_start
             session_snapshot = {
                 "reason": reason,
                 "pnl": pnl_snap,
@@ -791,9 +1078,31 @@ def on_contract_update(ws, msg: dict, symbol: str):
                 "trades": dt_snap,
                 "peak": peak_equity,
                 "max_dd": max_drawdown,
-                "symbols": {s: dict(v) for s, v in session_symbol_stats.items()},
-                "duration": datetime.now(timezone.utc) - session_start,
+                "symbols": _sym_snap,
+                "duration": _dur,
             }
+            # --- persist to daily session log ---
+            _traded = {s: v for s, v in _sym_snap.items() if v["wins"] + v["losses"] > 0}
+            _best_s  = max(_traded, key=lambda s: _traded[s]["pnl"]) if _traded else None
+            _worst_s = min(_traded, key=lambda s: _traded[s]["pnl"]) if _traded else None
+            today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            if today_str != _daily_session_log_date:
+                daily_session_log.clear()
+                _daily_session_log_date = today_str
+            daily_session_log.append({
+                "reason":       reason,
+                "pnl":          pnl_snap,
+                "wins":         win_count,
+                "losses":       loss_count,
+                "trades":       dt_snap,
+                "time":         datetime.now(timezone.utc).strftime("%H:%M UTC"),
+                "duration_min": max(1, int(_dur.total_seconds() // 60)),
+                "best_sym":     _best_s,
+                "best_pnl":     _traded[_best_s]["pnl"] if _best_s else 0.0,
+                "worst_sym":    _worst_s,
+                "worst_pnl":    _traded[_worst_s]["pnl"] if _worst_s else 0.0,
+            })
+            # --- reset session ---
             total_pnl = 0.0
             win_count = 0
             loss_count = 0
@@ -849,6 +1158,7 @@ def on_contract_update(ws, msg: dict, symbol: str):
             _log("▶ Auto-resumed from timed pause")
         threading.Thread(target=_auto_resume, daemon=True, name="AutoResume").start()
 
+
 # ══════════════════════════════════════════════════════════════════════
 #  HISTORY LOADER
 # ══════════════════════════════════════════════════════════════════════
@@ -870,7 +1180,7 @@ def fetch_history(symbol: str, hard_timeout: int = 60):
             if r.get("msg_type") == "authorize":
                 break
             if "error" in r:
-                _log(f"⚠ {symbol}: auth denied")
+                _log(f"⚠  {symbol}: auth denied")
                 return
         for _ in range(3):
             if time.time() >= wall_end:
@@ -894,7 +1204,7 @@ def fetch_history(symbol: str, hard_timeout: int = 60):
                     candles = r.get("candles", [])
                     break
                 if "error" in r:
-                    _log(f"⚠ {symbol}: {r['error'].get('message', 'API error')} – skipping history")
+                    _log(f"⚠  {symbol}: {r['error'].get('message', 'API error')} – skipping history")
                     candles = []
                     break
             if not candles:
@@ -927,7 +1237,8 @@ def fetch_history(symbol: str, hard_timeout: int = 60):
         update_indicators(symbol)
         _log(f"✓ {symbol}: {len(full)} candles loaded")
     else:
-        _log(f"⚠ {symbol}: no history – will accumulate live")
+        _log(f"⚠  {symbol}: no history – will accumulate live")
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  LIVE WEBSOCKET
@@ -940,12 +1251,12 @@ def _on_open(ws, symbol: str):
     }))).start()
     _log(f"⚡ {symbol} connected")
 
+
 def _on_message(ws, message: str, symbol: str):
     try:
         msg   = json.loads(message)
         mtype = msg.get("msg_type")
         if mtype == "candles":
-            # Initial history snapshot
             candles = msg.get("candles", [])
             if not candles:
                 return
@@ -974,7 +1285,6 @@ def _on_message(ws, message: str, symbol: str):
                 prev = current_candle[symbol]
 
             if prev is not None and prev["epoch"] != c["epoch"]:
-                # Previous 1-minute candle just closed
                 closed  = prev
                 new_row = pd.DataFrame(
                     [{"Open":  float(closed["open"]),
@@ -996,7 +1306,6 @@ def _on_message(ws, message: str, symbol: str):
                     score, direction, details = score_signal(symbol, row_c)
                     details["direction"] = direction
 
-                    # ── Lock asset when score is hot ─────────────────────
                     if score >= SCORE_THRESHOLD:
                         with _lock:
                             already_locked = symbol in locked_symbols
@@ -1008,7 +1317,6 @@ def _on_message(ws, message: str, symbol: str):
                                 "lock_price": float(closed["close"]),
                                 "lock_time": now,
                             }
-                        # Only notify once when first locking; silently refresh thereafter
                         if not already_locked:
                             _send_tg(
                                 f"🔒 <b>LOCKED</b> — {symbol}\n"
@@ -1018,7 +1326,6 @@ def _on_message(ws, message: str, symbol: str):
                                 f"{('cooldown ' + str(cooldown_left) + 'm' if cooldown_left else 'armed for tick entry')}"
                             )
                     else:
-                        # Clear stale lock when score drops or direction flips
                         with _lock:
                             old_lock = locked_symbols.pop(symbol, None)
                         if old_lock:
@@ -1027,12 +1334,10 @@ def _on_message(ws, message: str, symbol: str):
                 with _lock:
                     current_candle[symbol] = dict(c)
             else:
-                # Same candle in progress — rapid tick scan
                 with _lock:
                     lock = locked_symbols.get(symbol)
                 if lock:
                     now = datetime.now(timezone.utc)
-                    # Locks expire after 2 minutes if no pullback entry happened
                     if (now - lock["lock_time"]).total_seconds() > 120:
                         with _lock:
                             locked_symbols.pop(symbol, None)
@@ -1047,7 +1352,6 @@ def _on_message(ws, message: str, symbol: str):
                     score, direction, details = score_signal(symbol, row_c)
                     details["direction"] = direction
                     if score >= SCORE_THRESHOLD and direction == lock["direction"]:
-                        # Check for a small pullback from lock price
                         atr = (indicators.get(symbol) or {}).get("atr") or 0.0
                         lock_price = lock["lock_price"]
                         price = row_c["Close"]
@@ -1056,17 +1360,13 @@ def _on_message(ws, message: str, symbol: str):
                             pullback = True
                         elif direction == "DOWN" and price - lock_price >= 0.1 * atr:
                             pullback = True
-                        # entry_quality (extension + RSI, see score_signal) replaces
-                        # the old wick-ratio gate so we don't buy an already-extended
-                        # candle sitting at the top (or bottom) of the move.
                         entry_passed = pullback or details.get("entry_quality", 0) >= 15
                         if entry_passed:
-                            # Tick entry has passed — clear the lock instantly so we
-                            # never re-evaluate or re-fire on this symbol again this
-                            # candle, whether or not the trade actually goes through.
                             with _lock:
                                 locked_symbols.pop(symbol, None)
-                            if _reserve_trade_slot(symbol, datetime.now(timezone.utc)):
+                            if not _ml_should_trade(details):
+                                _log(f"🤖 {symbol} {direction} skipped — ML predicted low confidence")
+                            elif _reserve_trade_slot(symbol, datetime.now(timezone.utc)):
                                 request_proposal(ws, symbol, details, direction)
                                 _log(f"🎯 {symbol} {direction} TICK-ENTRY  score={score}/100  "
                                      f"entry_quality={details.get('entry_quality',0)}/30")
@@ -1089,7 +1389,6 @@ def _on_message(ws, message: str, symbol: str):
                 if symbol in pending_signals:
                     det = pending_signals[symbol]
                     if det.get("proposal_id"):
-                        # Buy already sent; wait for on_buy instead of releasing
                         pass
                     else:
                         pending_signals.pop(symbol, None)
@@ -1099,20 +1398,17 @@ def _on_message(ws, message: str, symbol: str):
     except Exception as e:
         logger.exception(f"{symbol} on_message exception: {e}")
 
+
 def _on_error(ws, error):
     logger.error(f"WS error: {error}")
 
+
 def _pending_trade_timeout_loop():
-    """Release reserved trade slots if a proposal or buy ack never arrives.
-    - No proposal_id within 30s -> release (proposal failed/never arrived).
-    - Buy sent but no on_buy ack within 60s -> move to unconfirmed_buys and keep
-      the slot reserved for another 120s so a late ack can still be attached."""
     while True:
         time.sleep(10)
         try:
             now = datetime.now(timezone.utc)
             with _lock:
-                # Move stale pending buy-acks to unconfirmed_buys
                 for symbol in list(pending_signals.keys()):
                     det = pending_signals[symbol]
                     buy_sent_at = det.get("buy_sent_at")
@@ -1129,7 +1425,6 @@ def _pending_trade_timeout_loop():
                         pending_signals.pop(symbol, None)
                         _release_trade_slot(symbol)
                         _log(f"⏰ {symbol} pending proposal timed out — slot released")
-                # Expire unconfirmed buy acks that never arrived
                 for symbol in list(unconfirmed_buys.keys()):
                     if now >= unconfirmed_buys[symbol]["expires_at"]:
                         unconfirmed_buys.pop(symbol, None)
@@ -1137,11 +1432,12 @@ def _pending_trade_timeout_loop():
                         _send_tg(
                             f"⚠️ <b>UNCONFIRMED TRADE EXPIRED</b> — {symbol}\n"
                             f"A buy order was sent but no ack was received within 3 minutes.\n"
-                            f"The trade slot has been released; please check your Deriv account for any executed contract."
+                            f"The trade slot has been released; please check your Deriv account."
                         )
                         _log(f"⏰ {symbol} unconfirmed buy expired — slot released")
         except Exception as e:
             logger.error(f"pending_trade_timeout_loop: {e}")
+
 
 def _ws_thread(symbol: str):
     while True:
@@ -1155,14 +1451,16 @@ def _ws_thread(symbol: str):
             ws_app.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as e:
             logger.error(f"{symbol} WS thread exception: {e}")
-        _log(f"⚠ {symbol} disconnected. Reconnecting in 5s…")
+        _log(f"⚠  {symbol} disconnected. Reconnecting in 5s…")
         time.sleep(5)
+
 
 def _log(msg: str):
     ts = datetime.now().strftime("%H:%M:%S")
     with _lock:
         signal_log.appendleft(f"[{ts}] {msg}")
     logger.info(msg)
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  TELEGRAM KEYBOARD BUILDERS
@@ -1172,23 +1470,28 @@ def _main_kb() -> InlineKeyboardMarkup:
         is_paused = paused
     pause_lbl = "▶ Resume" if is_paused else "⏸ Pause"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Status",      callback_data="status"),
-         InlineKeyboardButton("💰 P&L",         callback_data="pnl")],
-        [InlineKeyboardButton("📜 History",     callback_data="history"),
-         InlineKeyboardButton("📋 Log",         callback_data="signals")],
+        [InlineKeyboardButton("📊 Status",         callback_data="status"),
+         InlineKeyboardButton("💰 P&L",            callback_data="pnl")],
+        [InlineKeyboardButton("📜 History",        callback_data="history"),
+         InlineKeyboardButton("📋 Log",            callback_data="signals")],
         [InlineKeyboardButton("📄 Session Report", callback_data="session_report"),
          InlineKeyboardButton("🏆 All-Time",       callback_data="alltime")],
-        [InlineKeyboardButton(pause_lbl,        callback_data="toggle_pause"),
-         InlineKeyboardButton("⏭ Skip Symbol",  callback_data="skip_menu")],
-        [InlineKeyboardButton("⚙ Settings",    callback_data="settings"),
-         InlineKeyboardButton("🔄 Refresh",     callback_data="refresh")],
-        [InlineKeyboardButton("🧪 Test Trade",  callback_data="test_menu")],
+        [InlineKeyboardButton("📅 Day History",    callback_data="daily_history"),
+         InlineKeyboardButton("🏅 Best/Worst",     callback_data="best_worst")],
+        [InlineKeyboardButton("📈 Scores",         callback_data="score_sparklines"),
+         InlineKeyboardButton("⚙ Settings",       callback_data="settings")],
+        [InlineKeyboardButton(pause_lbl,           callback_data="toggle_pause"),
+         InlineKeyboardButton("⏭ Skip Symbol",    callback_data="skip_menu")],
+        [InlineKeyboardButton("🔄 Refresh",        callback_data="refresh"),
+         InlineKeyboardButton("🧪 Test Trade",     callback_data="test_menu")],
     ])
+
 
 def _skip_kb() -> InlineKeyboardMarkup:
     btns = [[InlineKeyboardButton(s, callback_data=f"skip_{s}")] for s in SYMBOLS]
     btns.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
     return InlineKeyboardMarkup(btns)
+
 
 def _test_group_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -1197,6 +1500,7 @@ def _test_group_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📉 Range Break (RD*)",     callback_data="tg_rdb")],
         [InlineKeyboardButton("🔙 Back",                  callback_data="main_menu")],
     ])
+
 
 def _test_sym_kb(group: str) -> InlineKeyboardMarkup:
     groups = {
@@ -1217,6 +1521,7 @@ def _test_sym_kb(group: str) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("🔙 Back", callback_data="test_menu")])
     return InlineKeyboardMarkup(rows)
 
+
 # ══════════════════════════════════════════════════════════════════════
 #  TEXT BUILDERS
 # ══════════════════════════════════════════════════════════════════════
@@ -1231,7 +1536,10 @@ def _status_text():
         "📊 <b>BOT STATUS</b>\n━━━━━━━━━━━━━━━━━━━━",
         f"State      : {'⏸ PAUSED' if is_paused else '▶ RUNNING'}",
         f"Active     : {len(contracts)} trade(s)",
-        f"Day trades : {trades}/{MAX_DAILY_TRADES}",
+        f"Day trades : {trades}",
+        _ml_progress_text(),
+        "",
+        _best_worst_line(),
     ]
     for cid, c in contracts.items():
         exp  = c["entry_time"] + timedelta(minutes=DURATION)
@@ -1243,9 +1551,10 @@ def _status_text():
         lines.append(f"  • {sym} — {int((t - now).total_seconds() // 60)}m left")
     return "\n".join(lines)
 
+
 def _pnl_text():
     with _lock:
-        pnl, wc, lc, cl, dt = total_pnl, win_count, loss_count, consecutive_losses, daily_trades
+        pnl, wc, lc, cl, dt, is_paused = total_pnl, win_count, loss_count, consecutive_losses, daily_trades, paused
         peak, mdd = peak_equity, max_drawdown
     total  = wc + lc
     wr     = wc / total * 100 if total else 0
@@ -1254,14 +1563,27 @@ def _pnl_text():
     at_wr  = aw / at * 100 if at else 0
     cur_dd     = max(0.0, peak - pnl)
     mdd_pct    = (mdd / peak * 100) if peak > 0 else 0.0
+
+    b_sym, b_st, w_sym, w_st = _best_worst_session()
+    bw_lines = ""
+    if b_sym:
+        b_wr = b_st["wins"] / (b_st["wins"] + b_st["losses"]) * 100 if (b_st["wins"] + b_st["losses"]) else 0
+        w_wr = w_st["wins"] / (w_st["wins"] + w_st["losses"]) * 100 if (w_st["wins"] + w_st["losses"]) else 0
+        bw_lines = (
+            f"\n<b>Best / Worst Asset (session)</b>\n"
+            f"  🏅 Best  : <code>{b_sym}</code>  {'+' if b_st['pnl'] >= 0 else ''}${b_st['pnl']:.2f}  ({b_wr:.0f}% WR)\n"
+            f"  💔 Worst : <code>{w_sym}</code>  {'+' if w_st['pnl'] >= 0 else ''}${w_st['pnl']:.2f}  ({w_wr:.0f}% WR)\n"
+        )
+
     return (
         f"💰 <b>P&L REPORT</b>\n━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>Session</b>\n"
         f"  P&L      : <b>{'+' if pnl >= 0 else ''}${pnl:.2f}</b>\n"
         f"  Trades   : {total}  ({wc}W / {lc}L)\n"
         f"  Win Rate : {wr:.1f}%\n"
-        f"  Streak   : {'🔴' * cl if cl else '🟢 No losses'}\n\n"
-        f"<b>Drawdown</b>\n"
+        f"  Streak   : {'🔴' * cl if cl else '🟢 No losses'}\n"
+        f"{bw_lines}"
+        f"\n<b>Drawdown</b>\n"
         f"  Peak Equity  : ${peak:.2f}\n"
         f"  Current DD   : -${cur_dd:.2f}\n"
         f"  Max DD       : -${mdd:.2f}  ({mdd_pct:.1f}%)\n\n"
@@ -1270,14 +1592,12 @@ def _pnl_text():
         f"  Trades   : {at}  ({aw}W / {al}L)\n"
         f"  Win Rate : {at_wr:.1f}%\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Daily TP: ${DAILY_PROFIT_TARGET:.2f}  |  Daily SL: ${DAILY_LOSS_LIMIT}  |  "
-        f"Trade cap: {MAX_DAILY_TRADES}\n"
-        f"<i>Hitting any of these auto-resets the session and keeps trading.</i>"
+        f"Session TP: ${DAILY_PROFIT_TARGET:.2f}  |  Session SL: ${DAILY_LOSS_LIMIT}\n"
+        f"<i>Hitting either auto-resets the session and keeps trading.</i>"
     )
 
+
 def _live_session_report_text():
-    """On-demand session report — same layout as the auto TP/SL/cap summary,
-    but callable anytime without resetting anything."""
     with _lock:
         snap = {
             "reason": "MANUAL",
@@ -1291,17 +1611,14 @@ def _live_session_report_text():
             "duration": datetime.now(timezone.utc) - session_start,
         }
     text = _session_summary_text(snap)
-    # Swap the auto-reset framing for a "still running" one since nothing
-    # actually got reset here.
     text = text.replace(
         "🔄 <b>New session started — bot keeps trading.</b>",
         "📄 <i>Live snapshot — session continues, nothing was reset.</i>",
     )
     return text
 
+
 def _alltime_text():
-    """Persistent scoreboard across every session and day — sourced from
-    trades.db, so it survives bot restarts/redeploys."""
     db_sum = get_db_summary()
     at, ap, aw, al = db_sum if db_sum[0] else (0, 0, 0, 0)
     ap = ap or 0.0
@@ -1346,6 +1663,7 @@ def _alltime_text():
     ]
     return "\n".join(lines)
 
+
 def _history_text():
     rows = get_recent_trades(8)
     if not rows:
@@ -1359,12 +1677,165 @@ def _history_text():
         )
     return "\n".join(lines)
 
+
 def _signals_text():
     with _lock:
         lines = list(signal_log)
     if not lines:
         return "📋 <b>No signals logged yet this session.</b>"
     return "📋 <b>Recent Signal Log</b>\n━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines[:15])
+
+
+def _daily_history_text() -> str:
+    """Show every TP / SL hit recorded today.
+    Also clears the log if UTC date has rolled past the stored date,
+    so the view is never stale from a prior calendar day."""
+    global daily_session_log, _daily_session_log_date
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with _lock:
+        if today != _daily_session_log_date:
+            daily_session_log = []
+            _daily_session_log_date = today
+        log = list(daily_session_log)
+
+    if not log:
+        return (
+            "📅 <b>Daily Session History</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+            f"Date: {today}\n\n"
+            "— No TP or SL hits yet today. —\n\n"
+            "<i>Each time the bot hits its daily TP or SL it resets and "
+            "this record is updated.</i>"
+        )
+
+    tp_hits = sum(1 for e in log if e["reason"] == "TP")
+    sl_hits = sum(1 for e in log if e["reason"] == "SL")
+    total_day_pnl = sum(e["pnl"] for e in log)
+    total_day_trades = sum(e["trades"] for e in log)
+    total_day_wins   = sum(e["wins"]   for e in log)
+    total_day_losses = sum(e["losses"] for e in log)
+    total_possible   = total_day_wins + total_day_losses
+    day_wr = total_day_wins / total_possible * 100 if total_possible else 0
+
+    lines = [
+        "📅 <b>Daily Session History</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Date   : {today}",
+        f"🎯 TP hits  : <b>{tp_hits}</b>   🛑 SL hits : <b>{sl_hits}</b>",
+        f"Day P&L     : <b>{'+' if total_day_pnl >= 0 else ''}${total_day_pnl:.2f}</b>",
+        f"Day trades  : {total_day_trades}  ({total_day_wins}W / {total_day_losses}L  {day_wr:.0f}%)",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    for i, e in enumerate(log, 1):
+        icon = "🎯" if e["reason"] == "TP" else "🛑"
+        sign = "+" if e["pnl"] >= 0 else ""
+        h, m_rem = divmod(e["duration_min"], 60)
+        dur_str  = f"{h}h {m_rem}m" if h else f"{m_rem}m"
+        entry = (
+            f"{icon} <b>Session {i}</b>  [{e['time']}]  {dur_str}\n"
+            f"   P&L: <b>{sign}${e['pnl']:.2f}</b>  ·  "
+            f"Trades: {e['trades']} ({e['wins']}W/{e['losses']}L)"
+        )
+        if e["best_sym"]:
+            b_sign = "+" if e["best_pnl"] >= 0 else ""
+            w_sign = "+" if e["worst_pnl"] >= 0 else ""
+            entry += (
+                f"\n   🏅 {e['best_sym']} {b_sign}${e['best_pnl']:.2f}  "
+                f"· 💔 {e['worst_sym']} {w_sign}${e['worst_pnl']:.2f}"
+            )
+        lines.append(entry)
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"<i>Resets at midnight UTC. Today: {today}</i>")
+    return "\n".join(lines)
+
+
+def _best_worst_text() -> str:
+    """Full ranked asset breakdown for the current session."""
+    with _lock:
+        stats = {s: dict(v) for s, v in session_symbol_stats.items()
+                 if v["wins"] + v["losses"] > 0}
+
+    if not stats:
+        return (
+            "🏅 <b>Best / Worst Asset</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+            "— No trades in this session yet. —"
+        )
+
+    ranked = sorted(stats.items(), key=lambda kv: kv[1]["pnl"], reverse=True)
+    best_sym, best_st   = ranked[0]
+    worst_sym, worst_st = ranked[-1]
+
+    def _fmt(sym, st):
+        total = st["wins"] + st["losses"]
+        wr    = st["wins"] / total * 100 if total else 0
+        sign  = "+" if st["pnl"] >= 0 else ""
+        return f"  <code>{sym:<10}</code>  {st['wins']}W/{st['losses']}L ({wr:.0f}%)  {sign}${st['pnl']:.2f}"
+
+    lines = [
+        "🏅 <b>Best / Worst Asset — Current Session</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        f"🏅 <b>Best :</b>  {_fmt(best_sym, best_st).strip()}",
+        f"💔 <b>Worst:</b>  {_fmt(worst_sym, worst_st).strip()}",
+        "",
+        "<b>All Assets Ranked</b>",
+    ]
+
+    medals = ["🥇", "🥈", "🥉"]
+    for rank, (sym, st) in enumerate(ranked):
+        medal = medals[rank] if rank < 3 else "  "
+        lines.append(f"{medal}{_fmt(sym, st)}")
+
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━",
+        "<i>Resets each time TP or SL is hit. Live session data.</i>",
+    ]
+    return "\n".join(lines)
+
+
+# ── Sparklines ────────────────────────────────────────────────────────
+_SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+def _sparkline(values) -> str:
+    """Return an 8-level ASCII sparkline string from a sequence of numbers."""
+    vals = list(values)
+    if not vals:
+        return "—"
+    lo, hi = min(vals), max(vals)
+    rng = hi - lo or 1
+    return "".join(_SPARK_CHARS[min(7, int((v - lo) / rng * 7.99))] for v in vals)
+
+
+def _score_sparklines_text() -> str:
+    """Per-symbol score trend sparklines (last 20 scans) for Telegram."""
+    with _lock:
+        snap = {sym: list(symbol_score_history.get(sym, [])) for sym in SYMBOLS}
+
+    lines = [
+        "📈 <b>Score Sparklines</b>  <i>(last ≤20 scans, newest right)</i>",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+    for sym in SYMBOLS:
+        vals = snap[sym]
+        if not vals:
+            lines.append(f"  <code>{sym:<10}</code>  — no data yet")
+            continue
+        spark   = _sparkline(vals)
+        current = vals[-1]
+        avg     = sum(vals) / len(vals)
+        trend   = "↑" if len(vals) >= 3 and vals[-1] > vals[-3] else ("↓" if len(vals) >= 3 and vals[-1] < vals[-3] else "→")
+        lines.append(
+            f"  <code>{sym:<10}</code> {trend} "
+            f"<code>{spark}</code>  "
+            f"now <b>{current}</b>  avg {avg:.0f}"
+        )
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"<i>Threshold: {SCORE_THRESHOLD}/100 to trigger a trade.</i>",
+    ]
+    return "\n".join(lines)
+
 
 def _settings_text():
     return (
@@ -1377,14 +1848,16 @@ def _settings_text():
         f"Cooldown        : {COOLDOWN_MINUTES} min\n"
         f"Max Consec Loss : {MAX_CONSECUTIVE_LOSSES}\n"
         f"Pause Duration  : {PAUSE_MINUTES} min\n"
-        f"Daily Take-Profit: ${DAILY_PROFIT_TARGET:.2f}\n"
-        f"Daily Floor     : ${DAILY_LOSS_LIMIT}\n"
-        f"Max Daily Trades: {MAX_DAILY_TRADES}\n"
+        f"Session TP      : ${DAILY_PROFIT_TARGET:.2f}\n"
+        f"Session SL      : ${DAILY_LOSS_LIMIT}\n"
+        f"Trade Cap       : none\n"
+        f"{_ml_progress_text()}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<i>Hitting TP / SL / trade cap sends a full session summary,\n"
+        f"<i>Hitting TP or SL sends a full session summary,\n"
         f"then auto-resets and keeps trading (demo mode — no pause).</i>\n"
         f"<i>Edit STAKE / ATR_BARRIER_MULT / SCORE_THRESHOLD in bot.py to change.</i>"
     )
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  TEST TRADE — independent WS connection, bypasses signal filter
@@ -1446,7 +1919,6 @@ def _run_test_trade(symbol: str):
         return None
 
     try:
-        # Step 1 – Authorise
         ws.send(json.dumps({"authorize": DERIV_APP_TOKEN}))
         auth = recv_typed("authorize", timeout=10)
         if not auth or "error" in auth:
@@ -1455,7 +1927,6 @@ def _run_test_trade(symbol: str):
             return
         account = auth.get("authorize", {}).get("loginid", "?")
 
-        # Step 2 – Get current spot and direction
         ws.send(json.dumps({"ticks": symbol}))
         tick_msg = recv_typed("tick", timeout=8)
         spot_now = float((tick_msg or {}).get("tick", {}).get("quote", 0)) if tick_msg else 0
@@ -1502,7 +1973,6 @@ def _run_test_trade(symbol: str):
             f"<i>Step 3/4 – Buying contract…</i>"
         )
 
-        # Step 3 – Buy
         ws.send(json.dumps({"buy": pid, "price": STAKE}))
         buy_msg = recv_typed("buy", timeout=10)
         if not buy_msg or "error" in buy_msg:
@@ -1523,7 +1993,6 @@ def _run_test_trade(symbol: str):
             f"<i>Step 4/4 – Waiting for result…  ⏳</i>"
         )
 
-        # Step 4 – Subscribe and wait for settlement
         ws.send(json.dumps({
             "proposal_open_contract": 1,
             "contract_id": int(cid),
@@ -1580,6 +2049,7 @@ def _run_test_trade(symbol: str):
             _test_trade_active.pop(symbol, None)
         _test_trade_sem.release()
 
+
 # ══════════════════════════════════════════════════════════════════════
 #  TELEGRAM COMMAND HANDLERS
 # ══════════════════════════════════════════════════════════════════════
@@ -1619,6 +2089,7 @@ async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_alltime(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(_alltime_text(), reply_markup=_main_kb(), parse_mode="HTML")
 
+
 # ══════════════════════════════════════════════════════════════════════
 #  TELEGRAM BUTTON HANDLER
 # ══════════════════════════════════════════════════════════════════════
@@ -1652,6 +2123,12 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(_alltime_text(),  reply_markup=_main_kb(), parse_mode="HTML")
         elif d == "signals":
             await q.edit_message_text(_signals_text(),  reply_markup=_main_kb(), parse_mode="HTML")
+        elif d == "daily_history":
+            await q.edit_message_text(_daily_history_text(), reply_markup=_main_kb(), parse_mode="HTML")
+        elif d == "best_worst":
+            await q.edit_message_text(_best_worst_text(), reply_markup=_main_kb(), parse_mode="HTML")
+        elif d == "score_sparklines":
+            await q.edit_message_text(_score_sparklines_text(), reply_markup=_main_kb(), parse_mode="HTML")
         elif d == "settings":
             await q.edit_message_text(
                 _settings_text(),
@@ -1739,6 +2216,7 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         logger.error(f"btn_handler error d={d!r}: {e}")
         import traceback; traceback.print_exc()
 
+
 # ══════════════════════════════════════════════════════════════════════
 #  HEARTBEAT JOB
 # ══════════════════════════════════════════════════════════════════════
@@ -1760,9 +2238,11 @@ async def heartbeat_job(ctx: ContextTypes.DEFAULT_TYPE):
         f"Trades : {total}  ({wc}W / {lc}L  {wr:.1f}%)\n"
         f"Active : {ac}\n"
         f"Streak : {'🔴' * cl if cl else '🟢 None'}\n"
-        f"Drawdown: -${cur_dd:.2f}  (max -${mdd:.2f})"
+        f"Drawdown: -${cur_dd:.2f}  (max -${mdd:.2f})\n"
+        f"{_best_worst_line()}"
     )
     _send_tg(msg, reply_markup=_main_kb())
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  RICH TERMINAL DASHBOARD
@@ -1779,6 +2259,7 @@ def _make_header() -> Panel:
     t.append("    ")
     t.append(mode)
     return Panel(Align.center(t), style="bold blue", box=box.DOUBLE_EDGE)
+
 
 def _make_symbols_table() -> Panel:
     tbl = Table(
@@ -1827,9 +2308,11 @@ def _make_symbols_table() -> Panel:
         )
     return Panel(tbl, title="[bold blue]📊 Symbol Monitor", border_style="blue")
 
+
 def _bar(pct: int, width: int = 20) -> str:
     filled = max(0, min(width, int(pct / 100 * width)))
     return "█" * filled + "░" * (width - filled)
+
 
 def _make_trades_panel() -> Panel:
     now = datetime.now(timezone.utc)
@@ -1885,6 +2368,7 @@ def _make_trades_panel() -> Panel:
         border_style="green",
     )
 
+
 def _make_pnl_panel() -> Panel:
     with _lock:
         pnl, wc, lc, cl, dt, is_paused = (
@@ -1904,6 +2388,9 @@ def _make_pnl_panel() -> Panel:
         if DAILY_LOSS_LIMIT < 0 else 0
     )
     risk_col = "red" if risk_used >= 80 else ("yellow" if risk_used >= 50 else "green")
+
+    b_sym, b_st, w_sym, w_st = _best_worst_session()
+
     t = Text()
     t.append("  Session P&L : ", style="dim"); t.append(f"${pnl:+.2f}\n", style=f"bold {col}")
     t.append("  Wins / Losses: ", style="dim")
@@ -1913,15 +2400,28 @@ def _make_pnl_panel() -> Panel:
     t.append(f"{wr:.1f}%\n", style="bold yellow" if wr >= 50 else "bold red")
     t.append("  Consec Loss : ", style="dim")
     t.append(f"{cl}/{MAX_CONSECUTIVE_LOSSES}\n", style="bold red" if cl > 0 else "white")
-    t.append("  Daily Trades: ", style="dim"); t.append(f"{dt}/{MAX_DAILY_TRADES}\n", style="white")
+    t.append("  Day Trades  : ", style="dim"); t.append(f"{dt}\n", style="white")
     t.append("  Session Up  : ", style="dim"); t.append(f"{h}h {mi}m\n", style="white")
     t.append("  Drawdown    : ", style="dim")
     t.append(f"-${cur_dd:.2f}", style="bold red" if cur_dd > 0 else "white")
     t.append("  (max ", style="dim"); t.append(f"-${mdd:.2f}", style="bold red"); t.append(")\n", style="dim")
+
+    # Best / Worst asset block
+    if b_sym:
+        b_wr = b_st["wins"] / (b_st["wins"] + b_st["losses"]) * 100 if (b_st["wins"] + b_st["losses"]) else 0
+        w_wr = w_st["wins"] / (w_st["wins"] + w_st["losses"]) * 100 if (w_st["wins"] + w_st["losses"]) else 0
+        t.append("\n  🏅 Best  : ", style="dim")
+        t.append(f"{b_sym}", style="bold green")
+        t.append(f"  {'+' if b_st['pnl'] >= 0 else ''}${b_st['pnl']:.2f}  ({b_wr:.0f}% WR)\n", style="green")
+        t.append("  💔 Worst : ", style="dim")
+        t.append(f"{w_sym}", style="bold red")
+        t.append(f"  {'+' if w_st['pnl'] >= 0 else ''}${w_st['pnl']:.2f}  ({w_wr:.0f}% WR)\n", style="red")
+
     t.append(f"\n  Risk Limit  : [", style="dim")
     t.append(_bar(risk_used), style=risk_col)
     t.append(f"]  {risk_used}%  (floor ${DAILY_LOSS_LIMIT:.0f})", style="dim")
     return Panel(t, title="[bold yellow]💰 P&L  &  Risk", border_style="yellow")
+
 
 def _make_log_panel() -> Panel:
     with _lock:
@@ -1931,16 +2431,18 @@ def _make_log_panel() -> Panel:
         t.append(line + "\n")
     return Panel(t, title="[bold white]📋 Signal Log", border_style="white")
 
+
 def _make_footer() -> Panel:
     return Panel(
         Align.center(Text(
-            f"  Stake ${STAKE}  ·  Target +${TARGET_PROFIT}  ·  Duration {DURATION}min  ·  "
-            f"Cooldown {COOLDOWN_MINUTES}min  ·  Min Confidence ≥ {SCORE_THRESHOLD}  ·  "
-            f"Daily Floor ${DAILY_LOSS_LIMIT}  ·  Symbols: {', '.join(SYMBOLS)}",
+            f"  Stake ${STAKE}  ·  Session TP ${DAILY_PROFIT_TARGET}  ·  Session SL ${DAILY_LOSS_LIMIT}  ·  "
+            f"Duration {DURATION}min  ·  Cooldown {COOLDOWN_MINUTES}min  ·  "
+            f"Min Confidence ≥ {SCORE_THRESHOLD}  ·  {_ml_progress_text()}",
             style="dim",
         )),
         style="dim blue",
     )
+
 
 _layout = Layout()
 _layout.split_column(
@@ -1967,22 +2469,34 @@ def refresh_dashboard():
             Layout(_make_log_panel(), name="log", ratio=2),
         )
         _layout["footer"].update(_make_footer())
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"dashboard refresh error: {e}")
+
 
 def _terminal_loop():
     while True:
         try:
             refresh_dashboard()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"terminal loop error: {e}")
         time.sleep(1)
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  SCAN STATUS — periodic digest sent every 5 minutes
 # ══════════════════════════════════════════════════════════════════════
+def _score_sparkline_loop():
+    """Hourly thread: sends per-symbol score sparklines to Telegram."""
+    time.sleep(3600)  # first report after 1 hour
+    while True:
+        try:
+            _send_tg(_score_sparklines_text())
+        except Exception as e:
+            logger.error(f"score_sparkline_loop: {e}")
+        time.sleep(3600)
+
+
 def _scan_status_loop():
-    """Every 5 minutes, send a compact table of all symbols with score + blocking reason."""
     time.sleep(90)
     while True:
         try:
@@ -2012,6 +2526,13 @@ def _scan_status_loop():
                 else:
                     score, direction, det = 0, "UP", {}
 
+                # Track score history for sparklines
+                with _lock:
+                    if sym in symbol_score_history:
+                        symbol_score_history[sym].append(score)
+                    else:
+                        symbol_score_history[sym] = deque([score], maxlen=20)
+
                 heat = "🔥🔥" if score >= SCORE_THRESHOLD else "🔥" if score >= SCORE_THRESHOLD - 20 else "  "
                 locked = " 🔒" if sym in locked_symbols else ""
 
@@ -2022,8 +2543,6 @@ def _scan_status_loop():
                     elif now < cd:
                         left = max(0, int((cd - now).total_seconds() // 60))
                         blocked = f" ⏱{left}m cd"
-                    elif dtrd >= MAX_DAILY_TRADES:
-                        blocked = " 🚫limit"
                     elif ppnl <= DAILY_LOSS_LIMIT:
                         blocked = " 🚫floor"
 
@@ -2036,10 +2555,13 @@ def _scan_status_loop():
                     f"{heat}<code>{sym:<10}</code>  <b>{score:>3}/100</b> {direction} {bar}{blocked}{locked}"
                 )
 
+            lines.append("")
+            lines.append(_best_worst_line())
             _send_tg("\n".join(lines))
         except Exception as e:
             logger.error(f"scan_status_loop: {e}")
         time.sleep(300)
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  TELEGRAM STARTUP
@@ -2100,17 +2622,15 @@ def _start_telegram():
 
     asyncio.run(_run())
 
+
 # ══════════════════════════════════════════════════════════════════════
-#  HEALTH CHECK SERVER — lets UptimeRobot (or Render's own health check)
-#  ping the bot over plain HTTP so it can monitor uptime / keep a free-tier
-#  web service awake. Uses only the stdlib (http.server) so the bot stays
-#  a single file with no extra dependency.
+#  HEALTH CHECK SERVER
 # ══════════════════════════════════════════════════════════════════════
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 class _HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        pass  # keep sniper.log clean — don't log every ping
+        pass
 
     def do_GET(self):
         with _lock:
@@ -2139,6 +2659,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
 
+
 def _start_health_server():
     port = int(os.environ.get("PORT", "8099"))
     try:
@@ -2147,6 +2668,7 @@ def _start_health_server():
         server.serve_forever()
     except Exception as e:
         logger.error(f"Health server failed to start on :{port}: {e}")
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  MAIN
@@ -2176,14 +2698,19 @@ def main():
 
     console.print("[green]✓ History phase done.  Starting live feeds…[/green]")
 
-    for sym in SYMBOLS:
-        threading.Thread(target=_ws_thread, args=(sym,), daemon=True, name=f"WS-{sym}").start()
+    _ml_load()
 
-    threading.Thread(target=_start_telegram,           daemon=True, name="Telegram").start()
-    threading.Thread(target=_terminal_loop,            daemon=True, name="TermRefresh").start()
-    threading.Thread(target=_scan_status_loop,         daemon=True, name="ScanStatus").start()
-    threading.Thread(target=_pending_trade_timeout_loop, daemon=True, name="PendingTimeout").start()
-    threading.Thread(target=_start_health_server,      daemon=True, name="HealthServer").start()
+    _watch_thread(_db_writer,                  name="DBWriter")   # must be after _ml_load()
+
+    for sym in SYMBOLS:
+        _watch_thread(_ws_thread, args=(sym,), name=f"WS-{sym}")
+
+    _watch_thread(_start_telegram,             name="Telegram")
+    _watch_thread(_terminal_loop,              name="TermRefresh")
+    _watch_thread(_scan_status_loop,           name="ScanStatus")
+    _watch_thread(_score_sparkline_loop,       name="ScoreSparkline")
+    _watch_thread(_pending_trade_timeout_loop, name="PendingTimeout")
+    _watch_thread(_start_health_server,        name="HealthServer")
 
     if is_tty:
         with Live(_layout, refresh_per_second=1, screen=True):
@@ -2208,20 +2735,10 @@ def main():
 
 
 def _run_forever():
-    """
-    Crash-proof wrapper: if main() ever raises an unhandled exception
-    (e.g. a bad API response, a bug, a transient network failure that
-    slipped past inner retries), log it, tell Telegram, wait, and restart
-    the whole bot in-process instead of letting the process die.
-    Render's own process supervisor will also restart the service if the
-    Python process exits, but this avoids losing the deploy/telegram
-    session on recoverable errors and gives a much faster recovery.
-    """
     restart_count = 0
     while True:
         try:
             main()
-            # main() only returns on a clean KeyboardInterrupt shutdown
             break
         except KeyboardInterrupt:
             break
@@ -2234,8 +2751,8 @@ def _run_forever():
                     f"Error: <code>{e}</code>\n"
                     f"Auto-restarting (attempt {restart_count})…"
                 )
-            except Exception:
-                pass
+            except Exception as tg_err:
+                logger.error(f"Failed to send crash notification: {tg_err}")
             backoff = min(60, 5 * restart_count)
             time.sleep(backoff)
 
