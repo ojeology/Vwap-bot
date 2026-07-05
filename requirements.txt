@@ -1,5 +1,5 @@
-python-telegram-bot[job-queue]==21.0
-pandas
-numpy
-requests
-flask
+websocket-client>=1.7.0
+pandas>=2.1.0
+numpy>=1.24.0
+python-telegram-bot>=20.3
+rich>=13.0
