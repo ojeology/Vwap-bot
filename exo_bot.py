@@ -69,7 +69,7 @@ EMA_SLOW               = 200
 ATR_PERIOD             = 14
 ATR_MA_PERIOD          = 30
 RSI_PERIOD             = 14
-SCORE_THRESHOLD        = 80
+SCORE_THRESHOLD        = 93
 HEARTBEAT_INTERVAL_SEC = 900
 
 # ── ML filter ────────────────────────────────────────────────────────
