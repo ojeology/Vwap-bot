@@ -35,7 +35,7 @@ from telegram.ext import (
 #  CONFIG
 # ══════════════════════════════════════════════════════════════════════
 DERIV_APP_TOKEN    = os.environ.get("DERIV_TOKEN",    "m8MRwwwroJy6YQw")
-TELEGRAM_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN",   "8908331931:AAHIbTDn67QLSODEhQo0EHWUvx6mYOkU_-o")
+TELEGRAM_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN",   "")
 TELEGRAM_CHAT_ID   = os.environ.get("TG_CHAT_ID",     "6400145232")
 
 if not os.environ.get("DERIV_TOKEN"):
