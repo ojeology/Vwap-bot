@@ -145,6 +145,7 @@ symbol_score_history: dict = {sym: deque(maxlen=20) for sym in SYMBOLS}
 telegram_app = None
 _tg_loop = None
 _auto_resume_active = False
+_bot_ready = False          # set True after history + DB + WS threads are up
 _test_trade_sem = threading.Semaphore(1)
 _test_trade_active: dict = {}
 
@@ -2596,10 +2597,16 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(_status_text(), reply_markup=_main_kb(), parse_mode="HTML")
 
+_NOT_READY_MSG = "⏳ <b>Bot is still warming up</b> (loading candle history…)\nTry again in 30–60 seconds."
+
 async def cmd_pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _bot_ready:
+        await update.message.reply_text(_NOT_READY_MSG, parse_mode="HTML"); return
     await update.message.reply_text(_pnl_text(), reply_markup=_main_kb(), parse_mode="HTML")
 
 async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _bot_ready:
+        await update.message.reply_text(_NOT_READY_MSG, parse_mode="HTML"); return
     global paused, pause_until
     with _lock:
         paused = True
@@ -2607,6 +2614,8 @@ async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏸ <b>Bot paused.</b>  /resume to restart.", parse_mode="HTML")
 
 async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _bot_ready:
+        await update.message.reply_text(_NOT_READY_MSG, parse_mode="HTML"); return
     global paused, pause_until, consecutive_losses
     with _lock:
         paused = False
@@ -2615,16 +2624,24 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("▶ <b>Bot resumed.</b>", parse_mode="HTML")
 
 async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _bot_ready:
+        await update.message.reply_text(_NOT_READY_MSG, parse_mode="HTML"); return
     await update.message.reply_text(_history_text(), reply_markup=_main_kb(), parse_mode="HTML")
 
 async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _bot_ready:
+        await update.message.reply_text(_NOT_READY_MSG, parse_mode="HTML"); return
     await update.message.reply_text(_live_session_report_text(), reply_markup=_main_kb(), parse_mode="HTML")
 
 async def cmd_alltime(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _bot_ready:
+        await update.message.reply_text(_NOT_READY_MSG, parse_mode="HTML"); return
     await update.message.reply_text(_alltime_text(), reply_markup=_main_kb(), parse_mode="HTML")
 
 async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Send full trades.db CSV on demand."""
+    if not _bot_ready:
+        await update.message.reply_text(_NOT_READY_MSG, parse_mode="HTML"); return
     await update.message.reply_text("⏳ Generating CSV export…", parse_mode="HTML")
     try:
         conn = sqlite3.connect("trades.db")
@@ -2654,13 +2671,8 @@ async def cmd_upload_csv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ema_fast_slope (supertrend_dir), ema_slow_slope (adx), ema_distance, win
     """
     doc = update.message.document
-    if not doc or not doc.file_name.endswith(".csv"):
-        await update.message.reply_text(
-            "📎 Send a <b>.csv</b> file with columns:\n"
-            "<code>score, wick_atr_ratio, atr, atr_ma, "
-            "ema_fast_slope, ema_slow_slope, ema_distance, win</code>",
-            parse_mode="HTML",
-        )
+    # Guard: we catch Document.ALL so non-CSV files reach here — ignore them silently.
+    if not doc or not (doc.file_name or "").lower().endswith(".csv"):
         return
 
     await update.message.reply_text("⏳ Downloading and processing your CSV…", parse_mode="HTML")
@@ -3318,12 +3330,11 @@ def _start_telegram():
         app.add_handler(CommandHandler("session", cmd_session))
         app.add_handler(CommandHandler("alltime", cmd_alltime))
         app.add_handler(CommandHandler("export",  cmd_export))
-        # CSV upload: handles document messages ending in .csv
+        # CSV upload: catch ALL document messages and check filename inside the
+        # handler — avoids MIME-type mismatches (mobile sends text/plain,
+        # desktop sends text/csv, some clients send application/octet-stream).
         app.add_handler(
-            MessageHandler(filters.Document.MimeType("text/csv"), cmd_upload_csv)
-        )
-        app.add_handler(
-            MessageHandler(filters.Document.FileExtension("csv"), cmd_upload_csv)
+            MessageHandler(filters.Document.ALL, cmd_upload_csv)
         )
         app.add_handler(CallbackQueryHandler(btn_handler))
 
@@ -3348,6 +3359,7 @@ def _start_telegram():
             await app.start()
             await app.updater.start_polling(
                 allowed_updates=["message", "callback_query"],
+                drop_pending_updates=True,   # discard stale updates from downtime
             )
             while True:
                 await asyncio.sleep(3600)
@@ -3423,7 +3435,13 @@ def main():
     for sym in SYMBOLS:
         _init_symbol(sym)
 
-    # Load candle history (batched, parallel within batch)
+    # ── Start Telegram & health server FIRST so the bot is responsive
+    # immediately even while candle history is still loading.
+    _watch_thread(_start_telegram,              name="Telegram")
+    _watch_thread(_start_health_server,         name="HealthServer")
+
+    # Load candle history (batched, parallel within batch).
+    # This blocks for up to ~3 min on cold start; Telegram is already up.
     BATCH = 5
     for i in range(0, len(SYMBOLS), BATCH):
         batch   = SYMBOLS[i:i + BATCH]
@@ -3447,19 +3465,22 @@ def main():
         daemon=True, name="MLBootstrap"
     ).start()
 
-    # Start core threads
+    # Start remaining core threads
     _watch_thread(_db_writer,                   name="DBWriter")
     for sym in SYMBOLS:
         _watch_thread(_ws_thread, args=(sym,),  name=f"WS-{sym}")
-
-    _watch_thread(_start_telegram,              name="Telegram")
     _watch_thread(_terminal_loop,               name="TermRefresh")
     _watch_thread(_scan_status_loop,            name="ScanStatus")
     _watch_thread(_score_sparkline_loop,        name="ScoreSparkline")
     _watch_thread(_pending_trade_timeout_loop,  name="PendingTimeout")
     _watch_thread(_stale_contract_watchdog,     name="StaleWatchdog")
     _watch_thread(_midnight_breakdown_loop,     name="MidnightBreakdown")
-    _watch_thread(_start_health_server,         name="HealthServer")
+    # HealthServer and Telegram are already started above (before history load)
+
+    # Mark bot as fully ready — commands that need DB/indicators are now safe
+    global _bot_ready
+    _bot_ready = True
+    _send_tg("✅ <b>Bot fully ready</b> — all history loaded, WS feeds live, trading active.")
 
     console.print("[green]✓ All threads started. Bot is live.[/green]")
 
