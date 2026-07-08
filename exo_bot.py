@@ -13,6 +13,23 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+
+# PostgreSQL support (optional – falls back to SQLite when DATABASE_URL is unset)
+DATABASE_URL = os.environ.get("DATABASE_URL")
+USE_PG = bool(DATABASE_URL)
+if USE_PG:
+    try:
+        import psycopg2
+        import psycopg2.extras
+    except ImportError:
+        # psycopg2 not installed — fall back to SQLite and warn
+        import logging as _lg
+        _lg.getLogger("sniper").warning(
+            "DATABASE_URL is set but psycopg2-binary is not installed. "
+            "Falling back to SQLite. Run: pip install psycopg2-binary"
+        )
+        DATABASE_URL = None
+        USE_PG = False
 import websocket
 from sklearn.ensemble import RandomForestClassifier
 
@@ -35,7 +52,7 @@ from telegram.ext import (
 #  CONFIG
 # ══════════════════════════════════════════════════════════════════════
 DERIV_APP_TOKEN    = os.environ.get("DERIV_TOKEN",    "m8MRwwwroJy6YQw")
-TELEGRAM_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN",   "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN",   "8908331931:AAHg-50KK8DLcYH1d2O7i9tIhredM-TIHnI")
 TELEGRAM_CHAT_ID   = os.environ.get("TG_CHAT_ID",     "6400145232")
 
 if not os.environ.get("DERIV_TOKEN"):
@@ -612,47 +629,109 @@ def _init_symbol(sym):
 # ══════════════════════════════════════════════════════════════════════
 db_queue: queue.Queue = queue.Queue()
 
+_CREATE_TABLE_SQLITE = """
+    CREATE TABLE IF NOT EXISTS trades (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp       TEXT,
+        symbol          TEXT,
+        direction       TEXT,
+        barrier         TEXT,
+        stake           REAL,    payout          REAL,
+        profit          REAL,    win             INTEGER,
+        score           REAL,    wick_atr_ratio  REAL,
+        atr             REAL,    atr_ma          REAL,
+        ema_fast_slope  REAL,    ema_slow_slope  REAL,
+        ema_distance    REAL,
+        market_session  TEXT
+    )
+"""
+
+_CREATE_TABLE_PG = """
+    CREATE TABLE IF NOT EXISTS trades (
+        id              SERIAL PRIMARY KEY,
+        timestamp       TEXT,
+        symbol          TEXT,
+        direction       TEXT,
+        barrier         TEXT,
+        stake           REAL,    payout          REAL,
+        profit          REAL,    win             INTEGER,
+        score           REAL,    wick_atr_ratio  REAL,
+        atr             REAL,    atr_ma          REAL,
+        ema_fast_slope  REAL,    ema_slow_slope  REAL,
+        ema_distance    REAL,
+        market_session  TEXT
+    )
+"""
+
+_INSERT_COLS = (
+    "timestamp,symbol,direction,barrier,stake,payout,profit,win,score,"
+    "wick_atr_ratio,atr,atr_ma,ema_fast_slope,ema_slow_slope,ema_distance,market_session"
+)
+
+
+def _db_fetch(sql: str, params: tuple = ()) -> list:
+    """Run a SELECT and return rows. sql uses ? placeholders (auto-converted for PG)."""
+    try:
+        if USE_PG:
+            conn = psycopg2.connect(DATABASE_URL)
+            cur  = conn.cursor()
+            cur.execute(sql.replace("?", "%s"), params)
+            rows = cur.fetchall()
+            cur.close(); conn.close()
+        else:
+            conn = sqlite3.connect("trades.db")
+            rows = conn.execute(sql, params).fetchall()
+            conn.close()
+        return rows
+    except Exception as e:
+        logger.error(f"DB fetch error: {e}")
+        return []
+
 
 def _db_writer():
-    conn = sqlite3.connect("trades.db")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp       TEXT,
-            symbol          TEXT,
-            direction       TEXT,
-            barrier         TEXT,
-            stake           REAL,    payout          REAL,
-            profit          REAL,    win             INTEGER,
-            score           REAL,    wick_atr_ratio  REAL,
-            atr             REAL,    atr_ma          REAL,
-            ema_fast_slope  REAL,    ema_slow_slope  REAL,
-            ema_distance    REAL,
-            market_session  TEXT
-        )
-    """)
-    # Migrate: add market_session column if it doesn't exist (older DBs)
-    try:
-        conn.execute("ALTER TABLE trades ADD COLUMN market_session TEXT")
-    except sqlite3.OperationalError:
-        pass  # column already exists
-    conn.commit()
+    if USE_PG:
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.autocommit = True
+        cur  = conn.cursor()
+        cur.execute(_CREATE_TABLE_PG)
+        # Add market_session column if missing (older PG schema)
+        cur.execute("""
+            DO $ BEGIN
+                ALTER TABLE trades ADD COLUMN market_session TEXT;
+            EXCEPTION WHEN duplicate_column THEN NULL;
+            END $;
+        """)
+        def _write(item):
+            cur.execute(
+                f"INSERT INTO trades ({_INSERT_COLS}) "
+                f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                item,
+            )
+            cur.execute("SELECT COUNT(*) FROM trades")
+            return cur.fetchone()[0]
+    else:
+        conn = sqlite3.connect("trades.db")
+        conn.execute(_CREATE_TABLE_SQLITE)
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN market_session TEXT")
+        except sqlite3.OperationalError:
+            pass
+        conn.commit()
+        def _write(item):
+            conn.execute(
+                f"INSERT INTO trades ({_INSERT_COLS}) "
+                f"VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                item,
+            )
+            conn.commit()
+            return conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
 
     while True:
         item = db_queue.get()
         if item is None:
             break
         try:
-            conn.execute(
-                "INSERT INTO trades "
-                "(timestamp,symbol,direction,barrier,stake,payout,profit,win,score,"
-                "wick_atr_ratio,atr,atr_ma,ema_fast_slope,ema_slow_slope,ema_distance,"
-                "market_session) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                item,
-            )
-            conn.commit()
-            total = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+            total = _write(item)
             _ml_maybe_retrain(total)
         except Exception as e:
             logger.error(f"DB write error: {e}")
@@ -675,93 +754,70 @@ def _watch_thread(target, args=(), name="Worker", restartable=True):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  DB QUERY HELPERS
+#  DB QUERY HELPERS  (SQLite + PostgreSQL via _db_fetch)
 # ══════════════════════════════════════════════════════════════════════
 def get_recent_trades(limit=8):
-    try:
-        conn = sqlite3.connect("trades.db")
-        rows = conn.execute(
-            "SELECT timestamp, symbol, direction, profit, win, score "
-            "FROM trades ORDER BY id DESC LIMIT ?", (limit,)
-        ).fetchall()
-        conn.close()
-        return rows
-    except Exception:
-        return []
+    return _db_fetch(
+        "SELECT timestamp, symbol, direction, profit, win, score "
+        "FROM trades ORDER BY id DESC LIMIT ?", (limit,)
+    )
 
 
 def get_db_summary():
-    try:
-        conn = sqlite3.connect("trades.db")
-        row = conn.execute(
-            "SELECT COUNT(*), SUM(profit), SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), "
-            "SUM(CASE WHEN win=0 THEN 1 ELSE 0 END) FROM trades"
-        ).fetchone()
-        conn.close()
-        return row
-    except Exception:
-        return (0, 0, 0, 0)
+    rows = _db_fetch(
+        "SELECT COUNT(*), SUM(profit), "
+        "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), "
+        "SUM(CASE WHEN win=0 THEN 1 ELSE 0 END) FROM trades"
+    )
+    return rows[0] if rows else (0, 0, 0, 0)
 
 
 def get_alltime_symbol_stats(limit=10):
-    try:
-        conn = sqlite3.connect("trades.db")
-        rows = conn.execute(
-            "SELECT symbol, COUNT(*), SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), SUM(profit) "
-            "FROM trades GROUP BY symbol ORDER BY SUM(profit) DESC LIMIT ?", (limit,)
-        ).fetchall()
-        conn.close()
-        return rows
-    except Exception:
-        return []
+    return _db_fetch(
+        "SELECT symbol, COUNT(*), SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), SUM(profit) "
+        "FROM trades GROUP BY symbol ORDER BY SUM(profit) DESC LIMIT ?", (limit,)
+    )
 
 
 def get_alltime_daily_stats(limit=7):
-    try:
-        conn = sqlite3.connect("trades.db")
-        rows = conn.execute(
-            "SELECT date(timestamp) as day, COUNT(*), "
-            "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), SUM(profit) "
-            "FROM trades GROUP BY day ORDER BY day DESC LIMIT ?", (limit,)
-        ).fetchall()
-        conn.close()
-        return rows
-    except Exception:
-        return []
+    return _db_fetch(
+        "SELECT date(timestamp) as day, COUNT(*), "
+        "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), SUM(profit) "
+        "FROM trades GROUP BY day ORDER BY day DESC LIMIT ?", (limit,)
+    )
 
 
 def get_7day_full_breakdown():
     """Return per-day, per-session breakdown for the last 7 days."""
-    try:
-        conn = sqlite3.connect("trades.db")
-        rows = conn.execute(
+    if USE_PG:
+        sql = (
+            "SELECT DATE(timestamp), market_session, COUNT(*), "
+            "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), SUM(profit) "
+            "FROM trades "
+            "WHERE DATE(timestamp) >= CURRENT_DATE - INTERVAL '7 days' "
+            "GROUP BY DATE(timestamp), market_session "
+            "ORDER BY DATE(timestamp) DESC, SUM(profit) DESC"
+        )
+    else:
+        sql = (
             "SELECT date(timestamp), market_session, COUNT(*), "
             "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), SUM(profit) "
             "FROM trades "
             "WHERE date(timestamp) >= date('now', '-7 days') "
             "GROUP BY date(timestamp), market_session "
             "ORDER BY date(timestamp) DESC, SUM(profit) DESC"
-        ).fetchall()
-        conn.close()
-        return rows
-    except Exception:
-        return []
+        )
+    return _db_fetch(sql)
 
 
 def get_session_alltime_stats():
     """Return per-market-session lifetime stats."""
-    try:
-        conn = sqlite3.connect("trades.db")
-        rows = conn.execute(
-            "SELECT market_session, COUNT(*), "
-            "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), SUM(profit) "
-            "FROM trades WHERE market_session IS NOT NULL "
-            "GROUP BY market_session ORDER BY SUM(profit) DESC"
-        ).fetchall()
-        conn.close()
-        return rows
-    except Exception:
-        return []
+    return _db_fetch(
+        "SELECT market_session, COUNT(*), "
+        "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), SUM(profit) "
+        "FROM trades WHERE market_session IS NOT NULL "
+        "GROUP BY market_session ORDER BY SUM(profit) DESC"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2880,11 +2936,16 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(_NOT_READY_MSG, parse_mode="HTML"); return
     await update.message.reply_text("⏳ Generating CSV export…", parse_mode="HTML")
     try:
-        conn = sqlite3.connect("trades.db")
-        rows = conn.execute("SELECT * FROM trades ORDER BY id").fetchall()
-        desc = conn.execute("PRAGMA table_info(trades)").fetchall()
-        conn.close()
-        cols = [d[1] for d in desc]
+        rows = _db_fetch("SELECT * FROM trades ORDER BY id")
+        if USE_PG:
+            cols = ["id","timestamp","symbol","direction","barrier","stake","payout",
+                    "profit","win","score","wick_atr_ratio","atr","atr_ma",
+                    "ema_fast_slope","ema_slow_slope","ema_distance","market_session"]
+        else:
+            conn = sqlite3.connect("trades.db")
+            desc = conn.execute("PRAGMA table_info(trades)").fetchall()
+            conn.close()
+            cols = [d[1] for d in desc]
         buf  = io.StringIO()
         w    = _csv.writer(buf)
         w.writerow(cols)
@@ -2898,6 +2959,32 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         await update.message.reply_text(f"❌ Export failed: <code>{e}</code>", parse_mode="HTML")
+
+
+async def cmd_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Send the raw trades.db file (SQLite) or a PG dump notice."""
+    if not _bot_ready:
+        await update.message.reply_text(_NOT_READY_MSG, parse_mode="HTML"); return
+    if USE_PG:
+        row = get_db_summary()
+        total = row[0] if row else 0
+        await update.message.reply_text(
+            f"☁️ <b>Trades stored in PostgreSQL</b>\n"
+            f"Total trades: <b>{total}</b>\n"
+            f"Use /export to download a CSV of all trades.",
+            parse_mode="HTML",
+        )
+    elif os.path.exists("trades.db"):
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
+        with open("trades.db", "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename=f"trades_{ts}.db",
+                caption="🗄️ <b>SQLite backup</b> — raw trades database",
+                parse_mode="HTML",
+            )
+    else:
+        await update.message.reply_text("⚠️ No trades database found yet.", parse_mode="HTML")
 
 
 async def cmd_upload_csv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -3765,6 +3852,7 @@ def _start_telegram():
         app.add_handler(CommandHandler("session", cmd_session))
         app.add_handler(CommandHandler("alltime", cmd_alltime))
         app.add_handler(CommandHandler("export",  cmd_export))
+        app.add_handler(CommandHandler("backup",  cmd_backup))
         # CSV upload: catch ALL document messages and check filename inside the
         # handler — avoids MIME-type mismatches (mobile sends text/plain,
         # desktop sends text/csv, some clients send application/octet-stream).
