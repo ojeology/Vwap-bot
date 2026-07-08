@@ -7,6 +7,7 @@
 """
 
 import json, time, sqlite3, threading, queue, logging, asyncio, os, sys, pickle, io, csv as _csv
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from collections import deque
 from typing import Optional
@@ -52,7 +53,7 @@ from telegram.ext import (
 #  CONFIG
 # ══════════════════════════════════════════════════════════════════════
 DERIV_APP_TOKEN    = os.environ.get("DERIV_TOKEN",    "m8MRwwwroJy6YQw")
-TELEGRAM_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN",   "8908331931:AAHg-50KK8DLcYH1d2O7i9tIhredM-TIHnI")
+TELEGRAM_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN",   "")
 TELEGRAM_CHAT_ID   = os.environ.get("TG_CHAT_ID",     "6400145232")
 
 if not os.environ.get("DERIV_TOKEN"):
@@ -144,6 +145,8 @@ _lock = threading.RLock()
 ohlcv, indicators, cooldown_until, current_candle, last_price = {}, {}, {}, {}, {}
 ohlcv_m5:     dict = {}    # 5-min resampled OHLCV per symbol
 indicators_m5: dict = {}   # M5 Supertrend direction per symbol
+ohlcv_m15:     dict = {}   # 15-min resampled OHLCV per symbol
+indicators_m15: dict = {}  # M15 Supertrend direction per symbol
 pending_signals, active_contracts = {}, {}
 locked_symbols: dict = {}
 unconfirmed_buys: dict = {}
@@ -193,6 +196,11 @@ ml_trained_per_class: dict = {cls: 0   for cls in ML_SYMBOL_CLASSES}
 
 # Tick momentum ─────────────────────────────────────────────────────────
 tick_history: dict = {}  # sym → deque(maxlen=10) of intra-candle close prices
+
+# ── Performance: indicator computation serialiser & tick throttle ────────
+_indicator_executor: Optional[ThreadPoolExecutor] = None  # initialised in main()
+_last_tick_score_time: dict = {}   # sym → float  – throttle intra-candle score_signal
+_last_computed_epoch:  dict = {}   # sym → int    – skip redundant indicator recomputes
 
 # ══════════════════════════════════════════════════════════════════════
 #  SESSION HELPERS
@@ -599,13 +607,15 @@ def _init_symbol(sym):
     ohlcv[sym]          = pd.DataFrame(columns=["Open", "High", "Low", "Close"])
     ohlcv_m5[sym]       = pd.DataFrame(columns=["Open", "High", "Low", "Close"])
     indicators_m5[sym]  = {"supertrend_dir": 0, "ready": False}
+    ohlcv_m15[sym]      = pd.DataFrame(columns=["Open", "High", "Low", "Close"])
+    indicators_m15[sym] = {"supertrend_dir": 0, "ready": False}
     current_candle[sym] = None
     last_price[sym]     = 0.0
     cooldown_until[sym] = datetime.min.replace(tzinfo=timezone.utc)
     tick_history[sym]   = deque(maxlen=10)
     indicators[sym] = {
-        "ema_slow": None,
-        # Supertrend (replaces EMA fast trend)
+        "ema_slow": None,       # EMA 200 value (direction fallback + confluence)
+        # Supertrend
         "supertrend_val":   None,
         "supertrend_dir":   0,     # 1=bullish, -1=bearish
         "supertrend_upper": None,
@@ -614,12 +624,16 @@ def _init_symbol(sym):
         "atr": None, "atr_ma": None, "atr_rising": False,
         # Momentum / oscillators
         "rsi": None,
+        "stochrsi_k": None, "stochrsi_d": None,   # StochRSI (K and D lines, 0-100)
         "macd_bullish": False, "macd_hist": None, "macd_hist_rising": False,
         # ADX / DI
         "adx": None, "di_bullish": False,
         # Bollinger Bands
-        "bb_upper": None, "bb_lower": None, "bb_mid": None,
-        "bb_squeeze": False, "bb_position": None,
+        "bb_upper": None, "bb_lower": None, "bb_mid": None, "bb_position": None,
+        # Candle quality
+        "body_ratio":     None,   # abs(close-open)/(high-low) — 0=doji, 1=full body
+        "upper_wick_atr": None,   # upper wick size in ATR units
+        "lower_wick_atr": None,   # lower wick size in ATR units
         "ready": False,
     }
 
@@ -717,24 +731,75 @@ def _db_writer():
         except sqlite3.OperationalError:
             pass
         conn.commit()
-        def _write(item):
-            conn.execute(
-                f"INSERT INTO trades ({_INSERT_COLS}) "
-                f"VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                item,
-            )
-            conn.commit()
+
+    # ── PostgreSQL path: write immediately (autocommit) ──────────────────
+    if USE_PG:
+        while True:
+            item = db_queue.get()
+            if item is None:
+                break
+            try:
+                total = _write(item)
+                _ml_maybe_retrain(total)
+            except Exception as e:
+                logger.error(f"DB write error: {e}")
+        return
+
+    # ── SQLite path: batch writes to reduce commit overhead ──────────────
+    _BATCH_MAX      = 5
+    _FLUSH_INTERVAL = 2.0      # seconds between forced flushes
+    _batch: list    = []
+    _last_flush     = [time.time()]
+
+    def _sqlite_flush() -> int:
+        """Commit pending batch; return new total row count (0 if nothing flushed)."""
+        if not _batch:
+            return 0
+        try:
+            with conn:
+                for it in _batch:
+                    conn.execute(
+                        f"INSERT INTO trades ({_INSERT_COLS}) "
+                        f"VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        it,
+                    )
+            _batch.clear()
+            _last_flush[0] = time.time()
             return conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        except Exception as exc:
+            logger.error(f"DB batch flush error: {exc}")
+            return 0
 
     while True:
-        item = db_queue.get()
-        if item is None:
-            break
         try:
-            total = _write(item)
-            _ml_maybe_retrain(total)
-        except Exception as e:
-            logger.error(f"DB write error: {e}")
+            item = db_queue.get(timeout=_FLUSH_INTERVAL)
+        except queue.Empty:
+            # Timeout — flush whatever has accumulated
+            try:
+                total = _sqlite_flush()
+                if total:
+                    _ml_maybe_retrain(total)
+            except Exception as e:
+                logger.error(f"DB flush error: {e}")
+            continue
+
+        if item is None:
+            # Shutdown sentinel — flush remaining rows and exit
+            try:
+                _sqlite_flush()
+            except Exception:
+                pass
+            break
+
+        _batch.append(item)
+        now = time.time()
+        if len(_batch) >= _BATCH_MAX or (now - _last_flush[0]) >= _FLUSH_INTERVAL:
+            try:
+                total = _sqlite_flush()
+                if total:
+                    _ml_maybe_retrain(total)
+            except Exception as e:
+                logger.error(f"DB write error: {e}")
 
 
 def _watch_thread(target, args=(), name="Worker", restartable=True):
@@ -908,9 +973,13 @@ def _compute_supertrend(df: pd.DataFrame, period: int = SUPERTREND_PERIOD,
 #  INDICATOR UPDATE
 # ══════════════════════════════════════════════════════════════════════
 def update_indicators(symbol: str) -> bool:
-    df = ohlcv[symbol]
-    if len(df) < max(500, SUPERTREND_PERIOD + 5):
-        return False
+    # Take a locked snapshot of OHLCV-only columns so we never hold the lock
+    # during heavy computation, and we don't pollute ohlcv with indicator columns.
+    with _lock:
+        raw = ohlcv[symbol]
+        if len(raw) < max(500, SUPERTREND_PERIOD + 5):
+            return False
+        df = raw[["Open", "High", "Low", "Close"]].copy()
 
     # EMA Slow (for fallback direction only)
     df["EMA_SLOW"] = df["Close"].ewm(span=EMA_SLOW, adjust=False).mean()
@@ -929,6 +998,13 @@ def update_indicators(symbol: str) -> bool:
     avg_loss = loss.ewm(alpha=1 / RSI_PERIOD, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
     df["RSI"] = (100 - (100 / (1 + rs))).fillna(100)
+
+    # StochRSI — (14-period) with K=3, D=3 smoothing
+    rsi_min = df["RSI"].rolling(14).min()
+    rsi_max = df["RSI"].rolling(14).max()
+    rsi_rng = (rsi_max - rsi_min).replace(0, np.nan)
+    df["SRSI_K"] = ((df["RSI"] - rsi_min) / rsi_rng).ewm(span=3, adjust=False).mean() * 100
+    df["SRSI_D"] = df["SRSI_K"].ewm(span=3, adjust=False).mean()
 
     # MACD
     ema12 = df["Close"].ewm(span=12, adjust=False).mean()
@@ -972,6 +1048,9 @@ def update_indicators(symbol: str) -> bool:
         ind["atr_ma"]           = df["ATR_MA"].iloc[-1]
         ind["atr_rising"]       = (df["ATR"].diff().iloc[-5:] > 0).sum() >= 3
         ind["rsi"]              = df["RSI"].iloc[-1]
+        srsi_k = df["SRSI_K"].iloc[-1]; srsi_d = df["SRSI_D"].iloc[-1]
+        ind["stochrsi_k"] = round(float(srsi_k), 1) if pd.notna(srsi_k) else None
+        ind["stochrsi_d"] = round(float(srsi_d), 1) if pd.notna(srsi_d) else None
 
         # Supertrend
         ind["supertrend_val"]   = df["ST"].iloc[-1]   if pd.notna(df["ST"].iloc[-1])   else None
@@ -994,12 +1073,20 @@ def update_indicators(symbol: str) -> bool:
         bb_u = df["BB_UPPER"].iloc[-1];  bb_l = df["BB_LOWER"].iloc[-1]
         bb_m = df["BB_MID"].iloc[-1]
         ind["bb_upper"] = bb_u;  ind["bb_lower"] = bb_l;  ind["bb_mid"] = bb_m
-        bw_now  = df["BB_WIDTH"].iloc[-1]
-        bw_avg  = df["BB_WIDTH"].rolling(50).mean().iloc[-1]
-        ind["bb_squeeze"]   = bool(pd.notna(bw_now) and pd.notna(bw_avg) and bw_now < bw_avg)
         band_rng = (bb_u - bb_l) if pd.notna(bb_u) and pd.notna(bb_l) and (bb_u - bb_l) > 0 else None
         last_close = df["Close"].iloc[-1]
         ind["bb_position"] = float((last_close - bb_l) / band_rng) if band_rng else None
+
+        # Candle quality: body ratio + wick sizes in ATR units
+        last_open  = df["Open"].iloc[-1]
+        last_high  = df["High"].iloc[-1]
+        last_low   = df["Low"].iloc[-1]
+        candle_rng = max(float(last_high - last_low), 1e-10)
+        atr_safe   = max(float(ind.get("atr") or df["ATR"].iloc[-1] or 1.0), 1e-10)
+        body_size  = abs(float(last_close) - float(last_open))
+        ind["body_ratio"]     = round(body_size / candle_rng, 3)
+        ind["upper_wick_atr"] = round((float(last_high) - max(float(last_open), float(last_close))) / atr_safe, 3)
+        ind["lower_wick_atr"] = round((min(float(last_open), float(last_close)) - float(last_low)) / atr_safe, 3)
 
         ind["ready"] = True
     return True
@@ -1051,17 +1138,53 @@ def score_signal(symbol: str, candle: dict) -> tuple:
     elif extension <= 2.0:
         entry_quality += 8
 
-    if rsi is not None:
+    # StochRSI oscillator scoring (15 pts) — falls back to plain RSI if not ready
+    srsi_k   = ind.get("stochrsi_k")
+    srsi_d   = ind.get("stochrsi_d")
+    if srsi_k is not None:
         if direction == "UP":
-            if 40 <= rsi <= 65:   entry_quality += 15
+            if srsi_k < 25:                  entry_quality += 15   # oversold → prime entry
+            elif srsi_k < 50:                entry_quality += 8    # neutral-bearish → ok
+            elif srsi_k < 70:                entry_quality += 4    # neutral-bullish → caution
+            # srsi_k >= 70: overbought → 0 pts
+        else:
+            if srsi_k > 75:                  entry_quality += 15   # overbought → prime entry
+            elif srsi_k > 50:                entry_quality += 8    # neutral-bullish → ok
+            elif srsi_k > 30:                entry_quality += 4    # neutral-bearish → caution
+            # srsi_k <= 30: oversold → 0 pts
+    elif rsi is not None:
+        # Fallback: plain RSI while StochRSI warms up
+        if direction == "UP":
+            if 40 <= rsi <= 65:              entry_quality += 15
             elif 30 <= rsi < 40 or 65 < rsi <= 75: entry_quality += 7
         else:
-            if 35 <= rsi <= 60:   entry_quality += 15
+            if 35 <= rsi <= 60:              entry_quality += 15
             elif 25 <= rsi < 35 or 60 < rsi <= 70: entry_quality += 7
+
+    # Wick rejection scoring (max 8 pts) — strong rejection wick confirms direction
+    uw = ind.get("upper_wick_atr") or 0.0
+    lw = ind.get("lower_wick_atr") or 0.0
+    wick_pts = 0
+    if direction == "UP":
+        if lw >= 0.5:   wick_pts = 8    # strong bullish rejection (buyers stepped in)
+        elif lw >= 0.25: wick_pts = 4
+    else:
+        if uw >= 0.5:   wick_pts = 8    # strong bearish rejection (sellers stepped in)
+        elif uw >= 0.25: wick_pts = 4
+    entry_quality += wick_pts
+
+    # Candle body quality gate — doji/spinning-top candles are unreliable
+    body_r = ind.get("body_ratio")
+    if body_r is not None and body_r < 0.20:
+        entry_quality = int(entry_quality * 0.6)   # weak candle: penalise entry score
+
     score += entry_quality
     details["entry_quality"]  = entry_quality
     details["extension_atr"]  = round(extension, 2)
     details["rsi"]            = round(rsi, 1) if rsi is not None else None
+    details["stochrsi_k"]     = round(srsi_k, 1) if srsi_k is not None else None
+    details["wick_pts"]       = wick_pts
+    details["body_ratio"]     = round(body_r, 2) if body_r is not None else None
 
     # ─── Volatility (max 15 pts) ──────────────────────────────────────
     vol_ok = ind.get("atr_rising") and (ind.get("atr") or 0) > (ind.get("atr_ma") or 0)
@@ -1079,7 +1202,7 @@ def score_signal(symbol: str, candle: dict) -> tuple:
     score += mom
     details["momentum"] = mom
 
-    # ─── Confluence: MACD + ADX + BB (max 20 pts) ────────────────────
+    # ─── Confluence: MACD + ADX + BB + EMA200 (max 25 pts) ──────────
     macd_agree = ind.get("macd_bullish") if direction == "UP" else not ind.get("macd_bullish")
     macd_agree = bool(macd_agree) and bool(ind.get("macd_hist_rising"))
 
@@ -1095,15 +1218,21 @@ def score_signal(symbol: str, candle: dict) -> tuple:
     else:
         bb_agree = bb_pos >= 0.25
 
-    confluence_count = int(macd_agree) + int(adx_agree) + int(bb_agree)
+    # EMA 200 confluence: price on the correct side of the long-term trend
+    ema200_agree = (direction == "UP"   and price > ema_slow) or \
+                   (direction == "DOWN" and price < ema_slow)
+
+    confluence_count = int(macd_agree) + int(adx_agree) + int(bb_agree) + int(ema200_agree)
     confluence = 0
-    if macd_agree: confluence += 8
-    if adx_agree:  confluence += 6
-    if bb_agree:   confluence += 6
+    if macd_agree:    confluence += 8
+    if adx_agree:     confluence += 6
+    if bb_agree:      confluence += 5
+    if ema200_agree:  confluence += 6   # EMA 200 alignment bonus
     score += confluence
-    details["confluence"]            = confluence
-    details["confluence_count"]      = confluence_count
+    details["confluence"]             = confluence
+    details["confluence_count"]       = confluence_count
     details["confluence_gate_passed"] = confluence_count >= 2
+    details["ema200_agree"]           = ema200_agree
 
     # Gate: need ≥2 confluence OR very strong ST + volatility
     if confluence_count < 2:
@@ -1175,13 +1304,94 @@ def update_m5_indicators(symbol: str) -> bool:
                                                  multiplier=SUPERTREND_ATR_MULT)
         m5_dir = int(st_dir_s.iloc[-1]) if len(st_dir_s) > 0 else 0
         with _lock:
-            ohlcv_m5[symbol]                     = df_m5
+            ohlcv_m5[symbol]                        = df_m5
             indicators_m5[symbol]["supertrend_dir"] = m5_dir
             indicators_m5[symbol]["ready"]          = True
         return True
     except Exception as e:
         logger.debug(f"update_m5_indicators {symbol}: {e}")
         return False
+
+
+def update_m15_indicators(symbol: str) -> bool:
+    """Resample M1 candles → 15-min OHLCV and compute M15 Supertrend direction.
+    Stores result in indicators_m15[symbol]. Returns True when M15 is ready.
+    With 500 M1 bars this yields ~33 M15 bars — enough for Supertrend(10)."""
+    try:
+        with _lock:
+            df_m1 = ohlcv[symbol].copy()
+        if len(df_m1) < 15:          # absolute minimum
+            return False
+        df_m15 = (
+            df_m1
+            .resample("15min")
+            .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"})
+            .dropna()
+        )
+        if len(df_m15) < 15:         # need enough bars for Supertrend period
+            return False
+        _, st_dir_s, _, _ = _compute_supertrend(df_m15, period=SUPERTREND_PERIOD,
+                                                  multiplier=SUPERTREND_ATR_MULT)
+        m15_dir = int(st_dir_s.iloc[-1]) if len(st_dir_s) > 0 else 0
+        with _lock:
+            ohlcv_m15[symbol]                        = df_m15
+            indicators_m15[symbol]["supertrend_dir"] = m15_dir
+            indicators_m15[symbol]["ready"]          = True
+        return True
+    except Exception as e:
+        logger.debug(f"update_m15_indicators {symbol}: {e}")
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  CLOSED-CANDLE PROCESSOR  (runs in _indicator_executor, max 2 at once)
+# ══════════════════════════════════════════════════════════════════════
+def _process_closed_candle(symbol: str, closed: dict, ws) -> None:
+    """
+    Heavy indicator computation + signal evaluation for a just-closed candle.
+    Submitted to _indicator_executor so at most 2 symbols compute simultaneously,
+    preventing CPU spikes when all 15 candles close at the same time.
+    """
+    try:
+        update_m5_indicators(symbol)
+        update_m15_indicators(symbol)
+        if not update_indicators(symbol):
+            return
+        now = datetime.now(timezone.utc)
+        row_c = {
+            "Close": float(closed["close"]),
+            "Open":  float(closed["open"]),
+            "High":  float(closed["high"]),
+            "Low":   float(closed["low"]),
+        }
+        score, direction, details = score_signal(symbol, row_c)
+        details["direction"] = direction
+
+        if score >= SCORE_THRESHOLD:
+            with _lock:
+                already_locked = symbol in locked_symbols
+                cooldown_left  = max(0, int((cooldown_until[symbol] - now).total_seconds() // 60))
+                locked_symbols[symbol] = {
+                    "score": score, "details": details,
+                    "direction": direction,
+                    "lock_price": float(closed["close"]),
+                    "lock_time": now,
+                }
+            if not already_locked:
+                _send_tg(
+                    f"🔒 <b>LOCKED</b> — {symbol}\n"
+                    f"Score <b>{score}/100</b> {direction}  |  "
+                    f"Entry {details.get('entry_quality',0)}/30 "
+                    f"(ext {details.get('extension_atr',0):.2f}×ATR)  |  "
+                    f"{('cooldown ' + str(cooldown_left) + 'm' if cooldown_left else 'armed')}"
+                )
+        else:
+            with _lock:
+                old_lock = locked_symbols.pop(symbol, None)
+            if old_lock:
+                _send_tg(f"🔓 {symbol} unlocked — score dropped to {score}/100")
+    except Exception as e:
+        logger.exception(f"_process_closed_candle {symbol}: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1947,47 +2157,24 @@ def _on_message(ws, message: str, symbol: str):
                     index=[pd.to_datetime(closed["epoch"], unit="s", utc=True)],
                 )
                 with _lock:
-                    ohlcv[symbol] = pd.concat([ohlcv[symbol], new_row]).iloc[-5000:]
+                    ohlcv[symbol] = pd.concat([ohlcv[symbol], new_row]).iloc[-500:]
                     # Reset intra-candle tick history for fresh momentum window
                     tick_history.setdefault(symbol, deque(maxlen=10)).clear()
-                update_m5_indicators(symbol)   # always resample M1→M5 on every candle close
-                if update_indicators(symbol):
-                    now = datetime.now(timezone.utc)
-                    row_c = {
-                        "Close": float(closed["close"]),
-                        "Open":  float(closed["open"]),
-                        "High":  float(closed["high"]),
-                        "Low":   float(closed["low"]),
-                    }
-                    score, direction, details = score_signal(symbol, row_c)
-                    details["direction"] = direction
-
-                    if score >= SCORE_THRESHOLD:
-                        with _lock:
-                            already_locked = symbol in locked_symbols
-                            cooldown_left  = max(0, int((cooldown_until[symbol] - now).total_seconds() // 60))
-                            locked_symbols[symbol] = {
-                                "score": score, "details": details,
-                                "direction": direction,
-                                "lock_price": float(closed["close"]),
-                                "lock_time": now,
-                            }
-                        if not already_locked:
-                            _send_tg(
-                                f"🔒 <b>LOCKED</b> — {symbol}\n"
-                                f"Score <b>{score}/100</b> {direction}  |  "
-                                f"Entry {details.get('entry_quality',0)}/30 "
-                                f"(ext {details.get('extension_atr',0):.2f}×ATR)  |  "
-                                f"{('cooldown ' + str(cooldown_left) + 'm' if cooldown_left else 'armed')}"
-                            )
-                    else:
-                        with _lock:
-                            old_lock = locked_symbols.pop(symbol, None)
-                        if old_lock:
-                            _send_tg(f"🔓 {symbol} unlocked — score dropped to {score}/100")
-
+                # Clear any existing lock immediately on candle close so that the
+                # intra-candle path never acts on a stale pre-close lock while
+                # the executor worker is still recomputing indicators.
                 with _lock:
+                    locked_symbols.pop(symbol, None)
                     current_candle[symbol] = dict(c)
+
+                # Submit heavy indicator computation (+re-arming lock) to the
+                # serialising executor so at most 2 symbols compute simultaneously,
+                # preventing CPU spikes when all 15 candles close at the same time.
+                _closed_snap = dict(closed)
+                if _indicator_executor is not None:
+                    _indicator_executor.submit(_process_closed_candle, symbol, _closed_snap, ws)
+                else:
+                    _process_closed_candle(symbol, _closed_snap, ws)
 
             else:
                 # ── Intra-candle tick: track velocity + check locked entries ──
@@ -2010,6 +2197,15 @@ def _on_message(ws, message: str, symbol: str):
                         )
                         lock = None
                 if lock:
+                    # Throttle: at most one score_signal call per 2 s per symbol
+                    # to avoid burning CPU on rapid-fire 1HZ* tick streams.
+                    _now_t = time.time()
+                    if _now_t - _last_tick_score_time.get(symbol, 0) < 2.0:
+                        with _lock:
+                            current_candle[symbol] = dict(c)
+                        return
+                    _last_tick_score_time[symbol] = _now_t
+
                     row_c = {
                         "Close": float(c["close"]),
                         "Open":  float(c["open"]),
@@ -2033,16 +2229,25 @@ def _on_message(ws, message: str, symbol: str):
                             with _lock:
                                 locked_symbols.pop(symbol, None)
 
-                            # ── M5 multi-timeframe gate ────────────────────────────
-                            m5_ind   = indicators_m5.get(symbol, {})
-                            m5_ready = m5_ind.get("ready", False)
-                            m5_dir   = m5_ind.get("supertrend_dir", 0)
+                            # ── M5 + M15 multi-timeframe gates ────────────────────
+                            m5_ind    = indicators_m5.get(symbol, {})
+                            m5_ready  = m5_ind.get("ready", False)
+                            m5_dir    = m5_ind.get("supertrend_dir", 0)
+                            m15_ind   = indicators_m15.get(symbol, {})
+                            m15_ready = m15_ind.get("ready", False)
+                            m15_dir   = m15_ind.get("supertrend_dir", 0)
                             if (m5_ready and m5_dir != 0
                                     and ((direction == "UP" and m5_dir != 1)
                                          or (direction == "DOWN" and m5_dir != -1))):
                                 _send_rejection(symbol, direction, score,
                                                 f"M5 Supertrend disagrees "
                                                 f"({'↑' if m5_dir==1 else '↓'} on M5 vs {direction} on M1)")
+                            elif (m15_ready and m15_dir != 0
+                                    and ((direction == "UP" and m15_dir != 1)
+                                         or (direction == "DOWN" and m15_dir != -1))):
+                                _send_rejection(symbol, direction, score,
+                                                f"M15 Supertrend disagrees "
+                                                f"({'↑' if m15_dir==1 else '↓'} on M15 vs {direction} on M1)")
                             elif not _ml_should_trade(details, symbol):
                                 conf = details.get("ml_confidence", 0)
                                 _send_rejection(symbol, direction, score,
@@ -2175,7 +2380,8 @@ def _main_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("⏭ Skip Symbol",     callback_data="skip_menu")],
         [InlineKeyboardButton("🔄 Refresh",         callback_data="refresh"),
          InlineKeyboardButton("🧪 Test Trade",      callback_data="test_menu")],
-        [InlineKeyboardButton(_ml_conf_label(),     callback_data="ml_conf_toggle")],
+        [InlineKeyboardButton("📦 Backup",           callback_data="backup"),
+         InlineKeyboardButton(_ml_conf_label(),     callback_data="ml_conf_toggle")],
     ])
 
 
@@ -2989,13 +3195,55 @@ async def cmd_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_upload_csv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
-    Handle a CSV file upload from the user.
-    The file must have columns: score, wick_atr_ratio, atr, atr_ma,
-    ema_fast_slope (supertrend_dir), ema_slow_slope (adx), ema_distance, win
+    Handle a file upload from the user:
+    • .csv  — trades backup  → restore rows to DB, then retrain ML
+    • .csv  — ML-only CSV   → train ML model (legacy path, no timestamp col)
+    • .pkl  — ML model      → restore model directly
     """
     doc = update.message.document
-    # Guard: we catch Document.ALL so non-CSV files reach here — ignore them silently.
-    if not doc or not (doc.file_name or "").lower().endswith(".csv"):
+    fname = (doc.file_name or "").lower() if doc else ""
+
+    # ── .pkl upload: restore ML model (admin chat only — pickle is unsafe from unknown senders) ──
+    if fname.endswith(".pkl"):
+        # Only accept from the configured chat to prevent arbitrary code execution via pickle
+        if str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID):
+            await update.message.reply_text("⛔ Model restore is only available from the admin chat.")
+            return
+        await update.message.reply_text("⏳ Loading ML model from file…", parse_mode="HTML")
+        try:
+            file    = await doc.get_file()
+            raw     = await file.download_as_bytearray()
+            payload = pickle.loads(bytes(raw))
+            global ml_model, ml_trained_on, ml_models_per_class, ml_trained_per_class
+            if isinstance(payload, dict):
+                with ml_lock:
+                    ml_model             = payload.get("model")
+                    ml_trained_on        = payload.get("trained_on", 0)
+                    ml_models_per_class  = payload.get("per_class_models",  ml_models_per_class)
+                    ml_trained_per_class = payload.get("per_class_trained", ml_trained_per_class)
+            else:
+                with ml_lock:
+                    ml_model      = payload
+                    ml_trained_on = 0
+            _ml_save()
+            with ml_lock:
+                trained = ml_trained_on
+            await update.message.reply_text(
+                f"🤖 <b>ML Model Restored</b> ✅\n"
+                f"Trained on <b>{trained}</b> trades.\n"
+                f"Confidence gate: ≥ <b>{ML_CONFIDENCE_MIN*100:.0f}%</b> — ACTIVE now",
+                parse_mode="HTML",
+            )
+            logger.info(f"ML model restored from pkl upload (trained_on={trained})")
+        except Exception as e:
+            logger.exception(f"pkl upload error: {e}")
+            await update.message.reply_text(
+                f"❌ <b>Model restore failed</b>\n<code>{e}</code>", parse_mode="HTML"
+            )
+        return
+
+    # Guard: we catch Document.ALL so non-CSV/pkl files reach here — ignore silently.
+    if not fname.endswith(".csv"):
         return
 
     await update.message.reply_text("⏳ Downloading and processing your CSV…", parse_mode="HTML")
@@ -3009,14 +3257,111 @@ async def cmd_upload_csv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ CSV is empty.", parse_mode="HTML")
             return
 
-        # Map columns flexibly
+        col_keys = set(rows[0].keys())
+
+        # ── Trades backup restore path ──────────────────────────────────
+        # Detected when CSV has the core trade columns (exported by 📦 Backup).
+        _TRADE_RESTORE_REQUIRED = {"timestamp", "symbol", "direction", "profit", "win"}
+        if _TRADE_RESTORE_REQUIRED.issubset(col_keys):
+            await update.message.reply_text(
+                f"📂 Detected <b>trades backup</b> ({len(rows)} rows).\n"
+                f"⏳ Restoring to database…",
+                parse_mode="HTML",
+            )
+            inserted = skipped = errors = 0
+            try:
+                if USE_PG:
+                    import psycopg2 as _pg2
+                    _rc = _pg2.connect(DATABASE_URL)
+                    _rc.autocommit = False
+                else:
+                    _rc = sqlite3.connect("trades.db")
+
+                _db_cols = [
+                    "timestamp", "symbol", "direction", "barrier",
+                    "stake", "payout", "profit", "win", "score",
+                    "wick_atr_ratio", "atr", "atr_ma",
+                    "ema_fast_slope", "ema_slow_slope", "ema_distance", "market_session",
+                ]
+                for row in rows:
+                    try:
+                        ts_val     = row.get("timestamp", "")
+                        sym_val    = row.get("symbol", "")
+                        dir_val    = row.get("direction", "")
+                        stake_val  = float(row.get("stake") or 0)
+                        # Deduplication: skip if exact (timestamp, symbol, direction, stake) exists
+                        if USE_PG:
+                            dup = _rc.cursor()
+                            dup.execute(
+                                "SELECT 1 FROM trades WHERE timestamp=%s AND symbol=%s "
+                                "AND direction=%s AND stake=%s LIMIT 1",
+                                (ts_val, sym_val, dir_val, stake_val),
+                            )
+                        else:
+                            dup = _rc.execute(
+                                "SELECT 1 FROM trades WHERE timestamp=? AND symbol=? "
+                                "AND direction=? AND stake=? LIMIT 1",
+                                (ts_val, sym_val, dir_val, stake_val),
+                            )
+                        if dup.fetchone():
+                            skipped += 1
+                            continue
+
+                        def _cast(c, v):
+                            if c in ("timestamp","symbol","direction","barrier","market_session"):
+                                return v or None
+                            if c == "win":
+                                return int(float(v)) if v not in (None, "") else 0
+                            return float(v) if v not in (None, "") else None
+                        vals = tuple(_cast(c, row.get(c)) for c in _db_cols)
+                        ph = ",".join(["%s" if USE_PG else "?"] * len(_db_cols))
+                        _ins = (
+                            f"INSERT INTO trades ({','.join(_db_cols)}) VALUES ({ph})"
+                        )
+                        if USE_PG:
+                            cur = _rc.cursor(); cur.execute(_ins, vals)
+                        else:
+                            _rc.execute(_ins, vals)
+                        inserted += 1
+                    except Exception as row_err:
+                        errors += 1
+                        logger.debug(f"restore row skip: {row_err}")
+                if USE_PG:
+                    _rc.commit()
+                else:
+                    _rc.commit()
+                _rc.close()
+            except Exception as db_err:
+                logger.error(f"trades restore DB error: {db_err}")
+                await update.message.reply_text(
+                    f"⚠️ DB error during restore: <code>{db_err}</code>", parse_mode="HTML"
+                )
+                return
+
+            await update.message.reply_text(
+                f"✅ <b>Trades Restored</b>\n"
+                f"Inserted : <b>{inserted}</b> trades\n"
+                f"Skipped  : {skipped} (already in DB)\n"
+                f"Errors   : {errors}\n\n"
+                f"<i>ML model will retrain automatically once enough trades are recorded.</i>",
+                parse_mode="HTML",
+            )
+            logger.info(f"Trades restore: inserted={inserted} skipped={skipped} errors={errors}")
+
+            # Trigger ML retrain if we now have enough data (guard against concurrent runs)
+            total_now = _db_fetch("SELECT COUNT(*) FROM trades")
+            if total_now and total_now[0][0] >= ML_MIN_TRADES:
+                if not ml_training_active:
+                    threading.Thread(target=_ml_train, daemon=True, name="MLRetrain").start()
+            return
+
+        # ── ML-only CSV path (legacy: no timestamp column) ──────────────
         req_cols = ML_FEATURE_COLS + ["win"]
-        # Try to find the columns
-        found = [c for c in req_cols if c in rows[0]]
+        found = [c for c in req_cols if c in col_keys]
         if "win" not in found or len(found) < len(ML_FEATURE_COLS):
             await update.message.reply_text(
                 f"❌ CSV must contain columns: {', '.join(req_cols)}\n"
-                f"Found: {list(rows[0].keys())}",
+                f"Found: {list(col_keys)}",
                 parse_mode="HTML",
             )
             return
@@ -3031,15 +3376,16 @@ async def cmd_upload_csv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         if len(X) < 10 or len(set(y)) < 2:
             await update.message.reply_text(
-                f"❌ Need ≥10 rows with both win=0 and win=1. Got {len(X)} rows.", parse_mode="HTML"
+                f"❌ Need ≥10 rows with both win=0 and win=1. Got {len(X)} rows.",
+                parse_mode="HTML",
             )
             return
 
         clf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
         clf.fit(X, y)
         wins = sum(y)
+        # global already declared at top of function (pkl path); no re-declaration needed
         with ml_lock:
-            global ml_model, ml_trained_on
             ml_model      = clf
             ml_trained_on = len(X)
         _ml_save()
@@ -3053,6 +3399,59 @@ async def cmd_upload_csv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception(f"CSV upload error: {e}")
         await update.message.reply_text(f"❌ Processing failed: <code>{e}</code>", parse_mode="HTML")
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  BACKUP HELPER  (runs in a background thread — safe to call from btn_handler)
+# ══════════════════════════════════════════════════════════════════════
+def _do_backup(what: str) -> None:
+    """Send trades CSV and/or ML model to Telegram.  Runs in a daemon thread."""
+    try:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
+
+        if what in ("backup_csv", "backup_all"):
+            rows = _db_fetch("SELECT * FROM trades ORDER BY id")
+            if USE_PG:
+                cols = ["id","timestamp","symbol","direction","barrier","stake","payout",
+                        "profit","win","score","wick_atr_ratio","atr","atr_ma",
+                        "ema_fast_slope","ema_slow_slope","ema_distance","market_session"]
+            else:
+                conn = sqlite3.connect("trades.db")
+                desc = conn.execute("PRAGMA table_info(trades)").fetchall()
+                conn.close()
+                cols = [d[1] for d in desc]
+            buf = io.StringIO()
+            w   = _csv.writer(buf)
+            w.writerow(cols)
+            w.writerows(rows)
+            csv_bytes = buf.getvalue().encode("utf-8")
+            _send_tg_document(
+                csv_bytes,
+                f"trades_backup_{ts}.csv",
+                f"📊 <b>Trades Backup</b> — {len(rows)} trade(s)\n"
+                f"<i>After a redeploy: send this file back to this chat and the bot will "
+                f"restore all trades automatically.</i>",
+            )
+
+        if what in ("backup_ml", "backup_all"):
+            if os.path.exists(MODEL_PATH):
+                with open(MODEL_PATH, "rb") as f:
+                    pkl_bytes = f.read()
+                with ml_lock:
+                    trained = ml_trained_on
+                _send_tg_document(
+                    pkl_bytes,
+                    f"ml_model_{ts}.pkl",
+                    f"🤖 <b>ML Model Backup</b> — trained on {trained} trades\n"
+                    f"<i>Send this .pkl file back to this chat to restore the ML model "
+                    f"after a redeploy.</i>",
+                )
+            else:
+                _send_tg("⚠️ No ML model file yet — bot needs more trades to train first.")
+
+    except Exception as exc:
+        logger.error(f"_do_backup error: {exc}")
+        _send_tg(f"❌ <b>Backup failed</b>\n<code>{exc}</code>")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -3180,6 +3579,34 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 target=_run_test_trade, args=(sym,),
                 daemon=True, name=f"TestTrade-{sym}"
             ).start()
+        elif d == "backup":
+            await q.edit_message_text(
+                "📦 <b>Backup & Restore</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+                "Export your trade history and ML model as files.\n\n"
+                "<b>To restore after a redeploy:</b>\n"
+                "• Send a <code>trades_backup_*.csv</code> file here → trades are "
+                "re-inserted into the database automatically\n"
+                "• Send a <code>ml_model_*.pkl</code> file here → ML model is restored\n\n"
+                "<i>Files are sent directly to this Telegram chat — no cloud storage needed.</i>",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📊 Export Trades CSV",  callback_data="backup_csv")],
+                    [InlineKeyboardButton("🤖 Export ML Model",    callback_data="backup_ml")],
+                    [InlineKeyboardButton("📦 Export Both",        callback_data="backup_all")],
+                    [InlineKeyboardButton("🔙 Back",               callback_data="main_menu")],
+                ]),
+                parse_mode="HTML",
+            )
+        elif d in ("backup_csv", "backup_ml", "backup_all"):
+            await q.edit_message_text(
+                "⏳ Preparing files — you'll receive them in a moment…",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back", callback_data="backup")]
+                ]),
+                parse_mode="HTML",
+            )
+            threading.Thread(
+                target=_do_backup, args=(d,), daemon=True, name="BotBackup"
+            ).start()
         else:
             await q.edit_message_text(
                 "🤖 <b>Deriv Sniper Bot v3</b>  –  Select an option:",
@@ -3251,9 +3678,11 @@ async def heartbeat_job(ctx: ContextTypes.DEFAULT_TYPE):
     hot_lines = ""
     for s, sym, d in scored[:5]:
         heat = "🔥🔥" if s >= SCORE_THRESHOLD else "🔥" if s >= SCORE_THRESHOLD - 15 else "  "
-        m5d  = indicators_m5.get(sym, {}).get("supertrend_dir", 0)
-        m5ic = ("↑" if m5d == 1 else "↓" if m5d == -1 else "→") + "M5"
-        hot_lines += f"  {heat}<code>{sym:<10}</code> {s:>3}/100 {d} {m5ic}\n"
+        m5d   = indicators_m5.get(sym,  {}).get("supertrend_dir", 0)
+        m15d  = indicators_m15.get(sym, {}).get("supertrend_dir", 0)
+        m5ic  = ("↑" if m5d  == 1 else "↓" if m5d  == -1 else "→") + "M5"
+        m15ic = ("↑" if m15d == 1 else "↓" if m15d == -1 else "→") + "M15"
+        hot_lines += f"  {heat}<code>{sym:<10}</code> {s:>3}/100 {d} {m5ic} {m15ic}\n"
     if not hot_lines:
         hot_lines = "  — no data yet —\n"
 
@@ -3528,19 +3957,26 @@ def _scan_status_loop():
                 f"📡 <b>SCAN STATUS</b>  {now.strftime('%H:%M')} UTC  "
                 f"{SESSION_EMOJIS.get(mkt_s,'')} {mkt_s}\n━━━━━━━━━━━━━━━━━━━━"
             ]
+
+            # ── Single lock acquisition: snapshot all shared state ──────────
+            with _lock:
+                ind_snap     = {s: dict(indicators[s]) for s in SYMBOLS}
+                cc_snap      = {s: dict(current_candle[s]) if current_candle.get(s) else None
+                                for s in SYMBOLS}
+                cd_snap      = dict(cooldown_until)
+                psd          = paused
+                ppnl         = total_pnl
+                ohlcv_lens   = {s: len(ohlcv[s]) for s in SYMBOLS}
+                locked_syms  = set(locked_symbols.keys())   # snapshot for lock-free read below
+            # ────────────────────────────────────────────────────────────────
+
             for sym in SYMBOLS:
-                with _lock:
-                    ind   = dict(indicators[sym])
-                    cc    = current_candle[sym]
-                    cd    = cooldown_until[sym]
-                    psd   = paused
-                    dtrd  = daily_trades
-                    ppnl  = total_pnl
+                ind   = ind_snap[sym]
+                cc    = cc_snap.get(sym)
+                cd    = cd_snap.get(sym, datetime.min.replace(tzinfo=timezone.utc))
 
                 if not ind.get("ready"):
-                    with _lock:
-                        nrows = len(ohlcv[sym])
-                    lines.append(f"⏳ <code>{sym:<10}</code>  loading… ({nrows}/500 candles)")
+                    lines.append(f"⏳ <code>{sym:<10}</code>  loading… ({ohlcv_lens.get(sym,0)}/500 candles)")
                     continue
 
                 if cc:
@@ -3559,7 +3995,7 @@ def _scan_status_loop():
                         symbol_score_history[sym] = deque([score], maxlen=20)
 
                 heat   = "🔥🔥" if score >= SCORE_THRESHOLD else "🔥" if score >= SCORE_THRESHOLD - 20 else "  "
-                locked = " 🔒" if sym in locked_symbols else ""
+                locked = " 🔒" if sym in locked_syms else ""
                 blocked = ""
                 if score >= SCORE_THRESHOLD:
                     if psd:
@@ -3716,10 +4152,12 @@ def _pinned_dashboard_loop():
                     scored.sort(reverse=True)
                     hot = ""
                     for s, sym, d in scored[:5]:
-                        m5d  = indicators_m5.get(sym, {}).get("supertrend_dir", 0)
-                        m5ic = "↑" if m5d == 1 else ("↓" if m5d == -1 else "→")
-                        heat = "🔥🔥" if s >= SCORE_THRESHOLD else ("🔥" if s >= SCORE_THRESHOLD - 15 else "  ")
-                        hot += f"  {heat}<code>{sym:<10}</code> {s:>3}/100 {d} (M5:{m5ic})\n"
+                        m5d   = indicators_m5.get(sym,  {}).get("supertrend_dir", 0)
+                        m15d  = indicators_m15.get(sym, {}).get("supertrend_dir", 0)
+                        m5ic  = "↑" if m5d  == 1 else ("↓" if m5d  == -1 else "→")
+                        m15ic = "↑" if m15d == 1 else ("↓" if m15d == -1 else "→")
+                        heat  = "🔥🔥" if s >= SCORE_THRESHOLD else ("🔥" if s >= SCORE_THRESHOLD - 15 else "  ")
+                        hot  += f"  {heat}<code>{sym:<10}</code> {s:>3}/100 {d} (M5:{m5ic} M15:{m15ic})\n"
                     if not hot:
                         hot = "  — no hot signals —\n"
 
@@ -3904,6 +4342,20 @@ class _HealthHandler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        # Fast /ping path — minimal JSON for UptimeRobot / health checks
+        if self.path in ("/ping", "/ping/"):
+            body = b'{"ping":"pong","status":"ok"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except Exception:
+                pass
+            return
+
+        # Full status JSON for /  /health  /status  (and any other path)
         with _lock:
             pnl, wc, lc, is_paused = total_pnl, win_count, loss_count, paused
             peak, mdd = peak_equity, max_drawdown
@@ -3937,7 +4389,10 @@ def _start_health_server():
     port = int(os.environ.get("PORT", "8099"))
     try:
         server = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
-        _log(f"🩺 Health check server listening on :{port}")
+        _log(
+            f"🩺 Health server on :{port}  —  "
+            f"UptimeRobot URL: https://<your-render-url>/ping"
+        )
         server.serve_forever()
     except Exception as e:
         logger.error(f"Health server failed on :{port}: {e}")
@@ -4000,11 +4455,20 @@ def main():
         daemon=True, name="MLBootstrap"
     ).start()
 
+    # ── Indicator computation executor: serialises heavy pandas work across
+    # all 15 symbols so they don't all spike CPU simultaneously at candle-close.
+    global _indicator_executor
+    _indicator_executor = ThreadPoolExecutor(
+        max_workers=2, thread_name_prefix="IndComp"
+    )
+
     # Start remaining core threads
     _watch_thread(_db_writer,                   name="DBWriter")
     for sym in SYMBOLS:
         _watch_thread(_ws_thread, args=(sym,),  name=f"WS-{sym}")
-    _watch_thread(_terminal_loop,               name="TermRefresh")
+    # Terminal dashboard only makes sense in a real TTY (Render/headless = skip)
+    if is_tty:
+        _watch_thread(_terminal_loop,           name="TermRefresh")
     _watch_thread(_scan_status_loop,            name="ScanStatus")
     _watch_thread(_score_sparkline_loop,        name="ScoreSparkline")
     _watch_thread(_pending_trade_timeout_loop,  name="PendingTimeout")
