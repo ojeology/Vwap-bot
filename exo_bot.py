@@ -52,8 +52,10 @@ ALL_TOUCH_SYMBOLS = SYMBOLS
 
 # ── Risk parameters ───────────────────────────────────────────────────
 STAKE                  = 3.0          # $3 per trade
-TARGET_PROFIT          = 0.80         # display only
-ATR_BARRIER_MULT       = 0.40
+TARGET_PROFIT          = 0.70         # display only
+PROFIT_MIN             = 0.55         # reject proposal if profit-per-trade < this
+PROFIT_MAX             = 0.90         # reject proposal if profit-per-trade > this
+ATR_BARRIER_MULT       = 0.60        # tuned for ~$0.60-0.90 profit/trade across all symbols
 DURATION               = 15
 CONTRACT_TYPE          = "ONETOUCH"
 COOLDOWN_MINUTES       = 20
@@ -71,7 +73,7 @@ RSI_PERIOD             = 14
 SUPERTREND_PERIOD      = 10
 SUPERTREND_ATR_MULT    = 3.0
 SCORE_THRESHOLD        = 93           # minimum score to trade (raised from 80)
-HEARTBEAT_INTERVAL_SEC = 900
+HEARTBEAT_INTERVAL_SEC = 3600      # richer hourly heartbeat
 
 # ── Market sessions (UTC hours) ───────────────────────────────────────
 # Maps session name → (start_hour_utc, end_hour_utc).
@@ -92,12 +94,21 @@ SESSION_EMOJIS = {
 # ── ML filter ────────────────────────────────────────────────────────
 MODEL_PATH        = "ml_model.pkl"
 ML_MIN_TRADES     = 100
-ML_RETRAIN_EVERY  = 100
-ML_CONFIDENCE_MIN = 0.93              # require ≥93% confidence
+ML_RETRAIN_EVERY  = 50           # retrain every 50 trades (continuous rolling)
+ML_CONFIDENCE_MIN = 0.75              # require ≥75% confidence (adjustable via Telegram)
 ML_FEATURE_COLS   = [
     "score", "wick_atr_ratio", "atr", "atr_ma",
     "ema_fast_slope", "ema_slow_slope", "ema_distance",
 ]
+
+# ── Per-class ML: separate model per volatility family ───────────────
+ML_SYMBOL_CLASSES = {
+    "standard_vol": ["R_100", "R_75", "R_50", "R_25", "R_10"],
+    "tick_vol":     ["1HZ100V", "1HZ90V", "1HZ75V", "1HZ50V",
+                     "1HZ30V", "1HZ25V", "1HZ15V", "1HZ10V"],
+    "range_break":  ["RDBULL", "RDBEAR"],
+}
+TICK_MOMENTUM_MIN = 3   # consecutive confirming ticks required before entry
 # Note: DB columns keep original names for compat; we store:
 #   ema_fast_slope  → supertrend direction (1 or -1)
 #   ema_slow_slope  → ADX value
@@ -114,6 +125,8 @@ logger = logging.getLogger("sniper")
 # ══════════════════════════════════════════════════════════════════════
 _lock = threading.RLock()
 ohlcv, indicators, cooldown_until, current_candle, last_price = {}, {}, {}, {}, {}
+ohlcv_m5:     dict = {}    # 5-min resampled OHLCV per symbol
+indicators_m5: dict = {}   # M5 Supertrend direction per symbol
 pending_signals, active_contracts = {}, {}
 locked_symbols: dict = {}
 unconfirmed_buys: dict = {}
@@ -144,17 +157,25 @@ symbol_score_history: dict = {sym: deque(maxlen=20) for sym in SYMBOLS}
 
 telegram_app = None
 _tg_loop = None
+_tg_ready = threading.Event()   # set only after app.start() + polling confirmed up
 _auto_resume_active = False
 _bot_ready = False          # set True after history + DB + WS threads are up
+_pinned_msg_id: Optional[int] = None   # ID of the auto-pinned dashboard message
+_current_session_name: str = ""        # for session-change auto-reports
 _test_trade_sem = threading.Semaphore(1)
 _test_trade_active: dict = {}
 
 # ML state ─────────────────────────────────────────────────────────────
-ml_model = None
+ml_model = None          # global combined model (all symbols)
 ml_trained_on = 0
 ml_total_trades = 0
 ml_lock = threading.Lock()
 ml_training_active = False
+ml_models_per_class: dict = {cls: None for cls in ML_SYMBOL_CLASSES}   # per-class models
+ml_trained_per_class: dict = {cls: 0   for cls in ML_SYMBOL_CLASSES}
+
+# Tick momentum ─────────────────────────────────────────────────────────
+tick_history: dict = {}  # sym → deque(maxlen=10) of intra-candle close prices
 
 # ══════════════════════════════════════════════════════════════════════
 #  SESSION HELPERS
@@ -204,15 +225,30 @@ def _roll_market_session_stats_if_needed():
 # ══════════════════════════════════════════════════════════════════════
 #  ML HELPERS
 # ══════════════════════════════════════════════════════════════════════
+def _get_symbol_class(symbol: str) -> str:
+    for cls, syms in ML_SYMBOL_CLASSES.items():
+        if symbol in syms:
+            return cls
+    return "standard_vol"
+
+
 def _ml_load():
-    global ml_model, ml_trained_on
+    global ml_model, ml_trained_on, ml_models_per_class, ml_trained_per_class
     if os.path.exists(MODEL_PATH):
         try:
             with open(MODEL_PATH, "rb") as f:
                 payload = pickle.load(f)
-            ml_model = payload.get("model")
-            ml_trained_on = payload.get("trained_on", 0)
-            logger.info(f"ML model loaded (trained_on={ml_trained_on})")
+            if isinstance(payload, dict):
+                ml_model = payload.get("model")
+                ml_trained_on = payload.get("trained_on", 0)
+                ml_models_per_class  = payload.get("per_class_models",  ml_models_per_class)
+                ml_trained_per_class = payload.get("per_class_trained", ml_trained_per_class)
+            else:
+                # Legacy: bare model object saved without wrapper dict
+                ml_model = payload
+                ml_trained_on = 0
+            logger.info(f"ML model loaded (trained_on={ml_trained_on}, "
+                        f"classes={[k for k,v in ml_models_per_class.items() if v]})")
         except Exception as e:
             logger.error(f"Failed to load ML model: {e}")
 
@@ -220,26 +256,33 @@ def _ml_load():
 def _ml_save():
     try:
         with open(MODEL_PATH, "wb") as f:
-            pickle.dump({"model": ml_model, "trained_on": ml_trained_on}, f)
+            pickle.dump({
+                "model":              ml_model,
+                "trained_on":         ml_trained_on,
+                "per_class_models":   ml_models_per_class,
+                "per_class_trained":  ml_trained_per_class,
+            }, f)
     except Exception as e:
         logger.error(f"Failed to save ML model: {e}")
 
 
-def _ml_get_confidence(details: dict) -> float:
-    """Return ML win-probability (0.0–1.0). Returns 1.0 if no model yet."""
+def _ml_get_confidence(details: dict, symbol: str = "") -> float:
+    """Return ML win-probability (0.0–1.0) using the best available model for this symbol."""
+    cls = _get_symbol_class(symbol) if symbol else "standard_vol"
     with ml_lock:
-        model = ml_model
+        # Prefer per-class model; fall back to global model
+        model = ml_models_per_class.get(cls) or ml_model
     if model is None:
         return 1.0
     try:
         feats = [[
             details.get("total_score", 0),
-            details.get("wick_atr_ratio", 0),      # ML_FEATURE_COLS[1] = wick_atr_ratio (candle range / ATR)
+            details.get("wick_atr_ratio", 0),
             details.get("atr", 0) or 0,
             details.get("atr_ma", 0) or 0,
-            details.get("ema_fast_sl", 0) or 0,    # stores supertrend_dir  → ema_fast_slope
-            details.get("ema_slow_sl", 0) or 0,    # stores adx             → ema_slow_slope
-            details.get("ema_distance", 0) or 0,   # stores st_distance/ATR → ema_distance
+            details.get("ema_fast_sl", 0) or 0,
+            details.get("ema_slow_sl", 0) or 0,
+            details.get("ema_distance", 0) or 0,
         ]]
         proba = model.predict_proba(feats)[0]
         classes = list(model.classes_)
@@ -250,13 +293,14 @@ def _ml_get_confidence(details: dict) -> float:
         return 1.0
 
 
-def _ml_should_trade(details: dict) -> bool:
+def _ml_should_trade(details: dict, symbol: str = "") -> bool:
     """Filter trade by ML confidence. Stores 'ml_confidence' in details for display."""
-    conf = _ml_get_confidence(details)
+    conf = _ml_get_confidence(details, symbol)
     details["ml_confidence"] = conf
+    cls = _get_symbol_class(symbol) if symbol else "standard_vol"
     with ml_lock:
-        model = ml_model
-    if model is None:
+        has_model = (ml_models_per_class.get(cls) or ml_model) is not None
+    if not has_model:
         return True   # observe-only until first model
     return conf >= ML_CONFIDENCE_MIN
 
@@ -307,23 +351,25 @@ def _ml_progress_bar(pct: float, width: int = 12) -> str:
 
 
 def _ml_train():
-    """Train / retrain RandomForest. Sets ml_training_active before spawn, clears in finally."""
-    global ml_model, ml_trained_on, ml_training_active
+    """Train / retrain RandomForest (global + per-class). Sets ml_training_active; clears in finally."""
+    global ml_model, ml_trained_on, ml_training_active, ml_models_per_class, ml_trained_per_class
     try:
         try:
             conn = sqlite3.connect("trades.db")
-            rows = conn.execute(
-                f"SELECT {', '.join(ML_FEATURE_COLS)}, win FROM trades"
+            # Fetch with symbol so we can split by class
+            rows_sym = conn.execute(
+                f"SELECT symbol, {', '.join(ML_FEATURE_COLS)}, win FROM trades"
             ).fetchall()
             conn.close()
         except Exception as e:
             logger.error(f"ML training query failed: {e}")
             return
 
+        rows  = [r[1:] for r in rows_sym]   # drop symbol column for global model
         total = len(rows)
         _send_tg(
             f"🤖 <b>ML RETRAINING</b> — started\n"
-            f"Training on <b>{total}</b> real trades…\n"
+            f"Training on <b>{total}</b> real trades (global + 3 class models)…\n"
             f"<code>[{_ml_progress_bar(0.0)}]   0%</code>"
         )
 
@@ -344,17 +390,45 @@ def _ml_train():
             return
 
         try:
+            # ── Global model (all symbols) ─────────────────────────────────
             clf = RandomForestClassifier(n_estimators=150, max_depth=6, random_state=42)
             clf.fit(X, y)
             with ml_lock:
                 ml_model = clf
                 ml_trained_on = total
+
+            # ── Per-class models ───────────────────────────────────────────
+            new_cls_models   = {}
+            new_cls_trained  = {}
+            cls_lines = []
+            for cls, syms in ML_SYMBOL_CLASSES.items():
+                cls_rows = [r for r in rows_sym if r[0] in syms]
+                if len(cls_rows) < 20:
+                    cls_lines.append(f"  {cls}: only {len(cls_rows)} trades — skipped")
+                    continue
+                Xc = [[r[i+1] if r[i+1] is not None else 0.0 for i in range(len(ML_FEATURE_COLS))]
+                      for r in cls_rows]
+                yc = [r[-1] for r in cls_rows]
+                if len(set(yc)) < 2:
+                    cls_lines.append(f"  {cls}: need both outcomes — skipped")
+                    continue
+                clf_c = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
+                clf_c.fit(Xc, yc)
+                new_cls_models[cls]  = clf_c
+                new_cls_trained[cls] = len(cls_rows)
+                wr_c = sum(yc) / len(yc) * 100
+                cls_lines.append(f"  {cls}: {len(cls_rows)} trades  {wr_c:.0f}%WR ✅")
+
+            with ml_lock:
+                ml_models_per_class.update(new_cls_models)
+                ml_trained_per_class.update(new_cls_trained)
+
             _ml_save()
             _send_tg(
                 f"🤖 <b>ML RETRAINING COMPLETE</b> ✅\n"
                 f"<code>[{_ml_progress_bar(1.0)}] 100%</code>\n"
-                f"Trained on <b>{total}</b> real trades.\n"
-                f"Confidence gate: ≥ <b>{ML_CONFIDENCE_MIN*100:.0f}%</b>"
+                f"Global: <b>{total}</b> trades  |  Gate ≥<b>{ML_CONFIDENCE_MIN*100:.0f}%</b>\n"
+                f"Per-class:\n" + "\n".join(cls_lines)
             )
             _ml_export_csv(total)
         except Exception as e:
@@ -473,7 +547,8 @@ def _ml_bootstrap_from_history():
             f"🤖 <b>ML Bootstrap Complete</b> ✅\n"
             f"Trained on <b>{total}</b> historical candle simulations\n"
             f"Simulated win rate: <b>{100*wins/total:.1f}%</b>\n"
-            f"Confidence gate: ≥ <b>{ML_CONFIDENCE_MIN*100:.0f}%</b> — ACTIVE now"
+            f"Confidence gate: ≥ <b>{ML_CONFIDENCE_MIN*100:.0f}%</b> — ACTIVE now\n"
+            f"<i>Per-class models activate after {ML_MIN_TRADES} real trades each.</i>"
         )
     except Exception as e:
         logger.error(f"ML bootstrap failed: {e}")
@@ -505,9 +580,12 @@ def _ml_progress_text() -> str:
 # ══════════════════════════════════════════════════════════════════════
 def _init_symbol(sym):
     ohlcv[sym]          = pd.DataFrame(columns=["Open", "High", "Low", "Close"])
+    ohlcv_m5[sym]       = pd.DataFrame(columns=["Open", "High", "Low", "Close"])
+    indicators_m5[sym]  = {"supertrend_dir": 0, "ready": False}
     current_candle[sym] = None
     last_price[sym]     = 0.0
     cooldown_until[sym] = datetime.min.replace(tzinfo=timezone.utc)
+    tick_history[sym]   = deque(maxlen=10)
     indicators[sym] = {
         "ema_slow": None,
         # Supertrend (replaces EMA fast trend)
@@ -976,6 +1054,9 @@ def score_signal(symbol: str, candle: dict) -> tuple:
         if not (trend >= 25 and vol >= 10):
             score = int(score * 0.5)
 
+    # Cap at 100 — max theoretical is 105, display always shows /100
+    score = min(score, 100)
+
     # Build ML feature values (stored in DB compat column names)
     st_dir_f  = float(st_dir)
     st_dist_f = abs(price - (st_val or price)) / atr
@@ -998,6 +1079,56 @@ def score_signal(symbol: str, candle: dict) -> tuple:
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  TICK MOMENTUM HELPER
+# ══════════════════════════════════════════════════════════════════════
+def _has_tick_momentum(symbol: str, direction: str) -> bool:
+    """Return True if the last TICK_MOMENTUM_MIN intra-candle closes confirm direction.
+    Returns True (allow) when there isn't enough data yet — we never block on uncertainty."""
+    with _lock:
+        hist = list(tick_history.get(symbol, []))
+    n = TICK_MOMENTUM_MIN
+    if len(hist) < n:
+        return True   # not enough ticks accumulated — don't block
+    recent = hist[-n:]
+    if direction == "UP":
+        return all(recent[i] <= recent[i + 1] for i in range(len(recent) - 1))
+    else:
+        return all(recent[i] >= recent[i + 1] for i in range(len(recent) - 1))
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  M5 MULTI-TIMEFRAME INDICATORS
+# ══════════════════════════════════════════════════════════════════════
+def update_m5_indicators(symbol: str) -> bool:
+    """Resample M1 candles → 5-min OHLCV and compute M5 Supertrend direction.
+    Stores result in indicators_m5[symbol]. Returns True when M5 is ready."""
+    try:
+        with _lock:
+            df_m1 = ohlcv[symbol].copy()
+        if len(df_m1) < 60:          # need at least 60 M1 bars (1 h) to form useful M5
+            return False
+        df_m5 = (
+            df_m1
+            .resample("5min")
+            .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"})
+            .dropna()
+        )
+        if len(df_m5) < 20:          # need enough M5 bars for Supertrend
+            return False
+        _, st_dir_s, _, _ = _compute_supertrend(df_m5, period=SUPERTREND_PERIOD,
+                                                 multiplier=SUPERTREND_ATR_MULT)
+        m5_dir = int(st_dir_s.iloc[-1]) if len(st_dir_s) > 0 else 0
+        with _lock:
+            ohlcv_m5[symbol]                     = df_m5
+            indicators_m5[symbol]["supertrend_dir"] = m5_dir
+            indicators_m5[symbol]["ready"]          = True
+        return True
+    except Exception as e:
+        logger.debug(f"update_m5_indicators {symbol}: {e}")
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  BARRIER HELPER
 # ══════════════════════════════════════════════════════════════════════
 def _compute_barrier(symbol: str, direction: str = "UP") -> str:
@@ -1013,6 +1144,15 @@ def _compute_barrier(symbol: str, direction: str = "UP") -> str:
 # ══════════════════════════════════════════════════════════════════════
 #  TELEGRAM HELPERS
 # ══════════════════════════════════════════════════════════════════════
+def _tg_loop_ok() -> bool:
+    """Return True only when the Telegram event loop exists and is still running."""
+    return (
+        telegram_app is not None
+        and _tg_loop is not None
+        and not _tg_loop.is_closed()
+    )
+
+
 def _send_tg(text: str, reply_markup=None, parse_mode: str = "HTML"):
     async def _inner():
         try:
@@ -1022,8 +1162,11 @@ def _send_tg(text: str, reply_markup=None, parse_mode: str = "HTML"):
             )
         except Exception as e:
             logger.error(f"send_tg failed: {e}")
-    if telegram_app and _tg_loop:
-        asyncio.run_coroutine_threadsafe(_inner(), _tg_loop)
+    if _tg_loop_ok():
+        try:
+            asyncio.run_coroutine_threadsafe(_inner(), _tg_loop)
+        except RuntimeError as e:
+            logger.error(f"send_tg schedule failed: {e}")
 
 
 def _send_tg_document(file_bytes: bytes, filename: str, caption: str = ""):
@@ -1037,12 +1180,14 @@ def _send_tg_document(file_bytes: bytes, filename: str, caption: str = ""):
             )
         except Exception as e:
             logger.error(f"send_tg_document failed: {e}")
-    if telegram_app and _tg_loop:
-        asyncio.run_coroutine_threadsafe(_inner(), _tg_loop)
+    if _tg_loop_ok():
+        try:
+            asyncio.run_coroutine_threadsafe(_inner(), _tg_loop)
+        except RuntimeError as e:
+            logger.error(f"send_tg_document schedule failed: {e}")
 
 
 def _send_tg_wait(text: str, reply_markup=None, parse_mode: str = "HTML", timeout: float = 8.0):
-    fut = None
     async def _inner():
         try:
             await telegram_app.bot.send_message(
@@ -1051,12 +1196,22 @@ def _send_tg_wait(text: str, reply_markup=None, parse_mode: str = "HTML", timeou
             )
         except Exception as e:
             logger.error(f"send_tg_wait failed: {e}")
-    if telegram_app and _tg_loop:
-        fut = asyncio.run_coroutine_threadsafe(_inner(), _tg_loop)
+    if _tg_loop_ok():
         try:
+            fut = asyncio.run_coroutine_threadsafe(_inner(), _tg_loop)
             fut.result(timeout=timeout)
         except Exception as e:
             logger.debug(f"send_tg_wait timeout/error: {e}")
+
+
+def _send_rejection(symbol: str, direction: str, score: int, reason: str):
+    """Send a concise trade-rejected card to Telegram and write to log."""
+    _log(f"❌ {symbol} {direction} rejected — {reason}")
+    _send_tg(
+        f"🚫 <b>REJECTED</b> — <code>{symbol}</code> {direction}\n"
+        f"Score: <b>{score}/100</b>\n"
+        f"Reason: <i>{reason}</i>"
+    )
 
 
 def _score_bar_str(score: int, width: int = 10) -> str:
@@ -1156,10 +1311,12 @@ def _result_card(sym: str, profit: float, win: bool, details: dict) -> str:
 
 def _session_summary_text(snap: dict) -> str:
     reason = snap.get("reason", "MANUAL")
+    ses    = snap.get("market_session", "")
     header = {
-        "TP":     f"🎯 <b>SESSION TP HIT</b>  (target ${DAILY_PROFIT_TARGET:.2f})",
-        "SL":     f"🛑 <b>SESSION SL HIT</b>  (floor ${DAILY_LOSS_LIMIT:.2f})",
-        "MANUAL": "📄 <b>SESSION REPORT</b>",
+        "TP":          f"🎯 <b>SESSION TP HIT</b>  (target ${DAILY_PROFIT_TARGET:.2f})",
+        "SL":          f"🛑 <b>SESSION SL HIT</b>  (floor ${DAILY_LOSS_LIMIT:.2f})",
+        "MANUAL":      "📄 <b>SESSION REPORT</b>",
+        "SESSION_END": f"🔔 <b>SESSION ENDED</b> — {SESSION_EMOJIS.get(ses,'')} {ses}",
     }.get(reason, "🔁 <b>SESSION LIMIT REACHED</b>")
 
     pnl  = snap["pnl"]
@@ -1288,11 +1445,35 @@ def on_proposal(ws, msg: dict, symbol: str):
         if pending_signals[symbol].get("proposal_id"):
             return
         pending_signals[symbol]["proposal_id"] = pid
-    if pid:
-        ws.send(json.dumps({"buy": pid, "price": STAKE}))
+    if not pid:
+        return
+
+    # ── Payout quality gate ────────────────────────────────────────────
+    try:
+        offered_payout = float(prop.get("payout", 0))
+        offered_profit = round(offered_payout - STAKE, 4)
+    except (TypeError, ValueError):
+        offered_profit = 0.0
+
+    if offered_profit < PROFIT_MIN or offered_profit > PROFIT_MAX:
+        # Payout outside band — cancel cleanly
         with _lock:
-            if symbol in pending_signals:
-                pending_signals[symbol]["buy_sent_at"] = datetime.now(timezone.utc)
+            pending_signals.pop(symbol, None)
+        _release_trade_slot(symbol)
+        _send_tg(
+            f"💸 <b>Payout rejected</b> — <code>{symbol}</code>\n"
+            f"Offered profit: <b>${offered_profit:.2f}</b>  "
+            f"(target ${PROFIT_MIN:.2f}–${PROFIT_MAX:.2f})\n"
+            f"Barrier too {'close' if offered_profit < PROFIT_MIN else 'far'} — skipping."
+        )
+        _log(f"💸 {symbol} proposal rejected — profit ${offered_profit:.2f} outside "
+             f"[${PROFIT_MIN}–${PROFIT_MAX}]")
+        return
+
+    ws.send(json.dumps({"buy": pid, "price": STAKE}))
+    with _lock:
+        if symbol in pending_signals:
+            pending_signals[symbol]["buy_sent_at"] = datetime.now(timezone.utc)
 
 
 def on_buy(ws, msg: dict, symbol: str):
@@ -1711,6 +1892,9 @@ def _on_message(ws, message: str, symbol: str):
                 )
                 with _lock:
                     ohlcv[symbol] = pd.concat([ohlcv[symbol], new_row]).iloc[-5000:]
+                    # Reset intra-candle tick history for fresh momentum window
+                    tick_history.setdefault(symbol, deque(maxlen=10)).clear()
+                update_m5_indicators(symbol)   # always resample M1→M5 on every candle close
                 if update_indicators(symbol):
                     now = datetime.now(timezone.utc)
                     row_c = {
@@ -1750,13 +1934,24 @@ def _on_message(ws, message: str, symbol: str):
                     current_candle[symbol] = dict(c)
 
             else:
+                # ── Intra-candle tick: track velocity + check locked entries ──
+                close_px = float(c["close"]) if c.get("close") else None
+                if close_px is not None:
+                    with _lock:
+                        tick_history.setdefault(symbol, deque(maxlen=10)).append(close_px)
+
                 with _lock:
                     lock = locked_symbols.get(symbol)
                 if lock:
                     now = datetime.now(timezone.utc)
-                    if (now - lock["lock_time"]).total_seconds() > 120:
+                    age = (now - lock["lock_time"]).total_seconds()
+                    if age > 120:
                         with _lock:
                             locked_symbols.pop(symbol, None)
+                        _send_tg(
+                            f"⏰ <b>Lock expired</b> — <code>{symbol}</code> {lock['direction']}\n"
+                            f"Score held but tick momentum never confirmed in 120 s"
+                        )
                         lock = None
                 if lock:
                     row_c = {
@@ -1769,26 +1964,44 @@ def _on_message(ws, message: str, symbol: str):
                     details["direction"] = direction
 
                     if score >= SCORE_THRESHOLD and direction == lock["direction"]:
-                        atr        = (indicators.get(symbol) or {}).get("atr") or 0.0
-                        lock_price = lock["lock_price"]
-                        price      = row_c["Close"]
-                        pullback   = False
-                        if direction == "UP"   and lock_price - price >= 0.1 * atr: pullback = True
-                        elif direction == "DOWN" and price - lock_price >= 0.1 * atr: pullback = True
-                        entry_passed = pullback or details.get("entry_quality", 0) >= 15
-
-                        if entry_passed:
+                        # ── Tick momentum gate (soft: skip this tick, retry next) ───
+                        if not _has_tick_momentum(symbol, direction):
+                            _log(f"⏳ {symbol} {direction} waiting for tick momentum "
+                                 f"({len(tick_history.get(symbol,[]))} ticks so far)…")
+                            # lock stays — will re-check on next OHLC update
+                        else:
+                            # Confirmed momentum: attempt entry
+                            # entry_passed is always True for ONETOUCH contracts —
+                            # a pullback gate hurts ONETOUCH (price moves AWAY from barrier);
+                            # real quality control is the M5 + ML gates below.
                             with _lock:
                                 locked_symbols.pop(symbol, None)
-                            if not _ml_should_trade(details):
+
+                            # ── M5 multi-timeframe gate ────────────────────────────
+                            m5_ind   = indicators_m5.get(symbol, {})
+                            m5_ready = m5_ind.get("ready", False)
+                            m5_dir   = m5_ind.get("supertrend_dir", 0)
+                            if (m5_ready and m5_dir != 0
+                                    and ((direction == "UP" and m5_dir != 1)
+                                         or (direction == "DOWN" and m5_dir != -1))):
+                                _send_rejection(symbol, direction, score,
+                                                f"M5 Supertrend disagrees "
+                                                f"({'↑' if m5_dir==1 else '↓'} on M5 vs {direction} on M1)")
+                            elif not _ml_should_trade(details, symbol):
                                 conf = details.get("ml_confidence", 0)
-                                _log(f"🤖 {symbol} {direction} skipped — ML conf {conf*100:.1f}% < {ML_CONFIDENCE_MIN*100:.0f}%")
+                                _send_rejection(symbol, direction, score,
+                                                f"ML confidence {conf*100:.1f}% < "
+                                                f"{ML_CONFIDENCE_MIN*100:.0f}% gate "
+                                                f"[{_get_symbol_class(symbol)}]")
                             elif _reserve_trade_slot(symbol, datetime.now(timezone.utc)):
                                 request_proposal(ws, symbol, details, direction)
                                 _log(f"🎯 {symbol} {direction} TICK-ENTRY  score={score}/100  "
-                                     f"conf={details.get('ml_confidence',1.0)*100:.0f}%")
+                                     f"momentum={len(tick_history.get(symbol,[]))}ticks  "
+                                     f"conf={details.get('ml_confidence',1.0)*100:.0f}%  "
+                                     f"class={_get_symbol_class(symbol)}")
                             else:
-                                _send_tg(f"⚠️ {symbol} tick-entry passed but risk gate closed — skipped")
+                                _send_rejection(symbol, direction, score,
+                                                "Risk gate closed (paused / cooldown / daily limit)")
 
                 with _lock:
                     current_candle[symbol] = dict(c)
@@ -1880,6 +2093,11 @@ def _log(msg: str):
 # ══════════════════════════════════════════════════════════════════════
 #  TELEGRAM KEYBOARD BUILDERS
 # ══════════════════════════════════════════════════════════════════════
+def _ml_conf_label() -> str:
+    pct = int(ML_CONFIDENCE_MIN * 100)
+    return f"🤖 ML Gate: {pct}%  →  {'90%' if pct == 75 else '75%'}"
+
+
 def _main_kb() -> InlineKeyboardMarkup:
     with _lock:
         is_paused = paused
@@ -1901,6 +2119,7 @@ def _main_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("⏭ Skip Symbol",     callback_data="skip_menu")],
         [InlineKeyboardButton("🔄 Refresh",         callback_data="refresh"),
          InlineKeyboardButton("🧪 Test Trade",      callback_data="test_menu")],
+        [InlineKeyboardButton(_ml_conf_label(),     callback_data="ml_conf_toggle")],
     ])
 
 
@@ -2503,12 +2722,29 @@ def _run_test_trade(symbol: str):
         prop    = prop_msg["proposal"]
         pid     = prop["id"]
         ask     = prop.get("ask_price", STAKE)
-        payout  = prop.get("payout", "?")
+        payout  = prop.get("payout", 0)
+        try:
+            offered_profit = round(float(payout) - STAKE, 4)
+        except (TypeError, ValueError):
+            offered_profit = 0.0
+
+        # ── Payout gate (same rule as live trading) ───────────────────
+        if offered_profit < PROFIT_MIN or offered_profit > PROFIT_MAX:
+            tg(
+                f"🧪 <b>Test Trade</b>  –  💸 Payout rejected\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"Offered payout : ${payout}  (profit ${offered_profit:.2f})\n"
+                f"Target band    : ${PROFIT_MIN:.2f} – ${PROFIT_MAX:.2f}\n"
+                f"Barrier too {'close (easy touch → low payout)' if offered_profit < PROFIT_MIN else 'far (hard touch → high payout)'}.\n"
+                f"<i>Tune ATR_BARRIER_MULT ({ATR_BARRIER_MULT}) to move into band.</i>"
+            )
+            return
+
         tg(
             f"🧪 <b>Test Trade</b>  –  ✅ Proposal OK\n"
             f"Proposal ID : <code>{pid}</code>\n"
             f"Ask Price   : ${ask}\n"
-            f"Payout      : ${payout}\n"
+            f"Payout      : ${payout}  (profit <b>${offered_profit:.2f}</b>)\n"
             f"<i>Step 3/4 – Buying contract…</i>"
         )
         ws.send(json.dumps({"buy": pid, "price": STAKE}))
@@ -2774,6 +3010,17 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(_market_sessions_text(), reply_markup=_main_kb(), parse_mode="HTML")
         elif d == "seven_day_pnl":
             await q.edit_message_text(_7day_pnl_text(),  reply_markup=_main_kb(), parse_mode="HTML")
+        elif d == "ml_conf_toggle":
+            global ML_CONFIDENCE_MIN
+            ML_CONFIDENCE_MIN = 0.90 if ML_CONFIDENCE_MIN < 0.85 else 0.75
+            pct = int(ML_CONFIDENCE_MIN * 100)
+            await q.edit_message_text(
+                f"🤖 <b>ML Gate → {pct}%</b>\n"
+                f"Trades now require ≥{pct}% ML confidence.\n"
+                f"{'More selective — fewer but higher-quality trades.' if pct == 90 else 'More permissive — more trades, model still learning.'}",
+                reply_markup=_main_kb(), parse_mode="HTML",
+            )
+            _log(f"🤖 ML_CONFIDENCE_MIN set to {pct}% via Telegram")
         elif d == "settings":
             await q.edit_message_text(
                 _settings_text(),
@@ -2888,17 +3135,54 @@ async def heartbeat_job(ctx: ContextTypes.DEFAULT_TYPE):
     else:
         session_line = ""
 
+    # ML status line
+    with ml_lock:
+        ml_m, ml_t, ml_act = ml_model, ml_trained_on, ml_training_active
+    ml_total = ml_total_trades
+    if ml_act:
+        ml_line = "⏳ Retraining in progress…"
+    elif ml_m is None:
+        ml_line = f"🔄 Warming up ({ml_total}/{ML_MIN_TRADES} trades needed)"
+    else:
+        nxt = max(0, ML_RETRAIN_EVERY - (ml_total - ml_t))
+        ml_line = f"✅ Active · trained on {ml_t} · next retrain in {nxt} trades"
+
+    # Top 5 hottest symbols right now
+    scored = []
+    for sym in SYMBOLS:
+        with _lock:
+            cc = current_candle.get(sym)
+        if cc:
+            try:
+                row_c = {"Close": float(cc.get("close", 0)), "Open": float(cc.get("open", 0)),
+                         "High":  float(cc.get("high",  0)), "Low":  float(cc.get("low",  0))}
+                s, d, _ = score_signal(sym, row_c)
+                scored.append((s, sym, d))
+            except Exception:
+                pass
+    scored.sort(reverse=True)
+    hot_lines = ""
+    for s, sym, d in scored[:5]:
+        heat = "🔥🔥" if s >= SCORE_THRESHOLD else "🔥" if s >= SCORE_THRESHOLD - 15 else "  "
+        m5d  = indicators_m5.get(sym, {}).get("supertrend_dir", 0)
+        m5ic = ("↑" if m5d == 1 else "↓" if m5d == -1 else "→") + "M5"
+        hot_lines += f"  {heat}<code>{sym:<10}</code> {s:>3}/100 {d} {m5ic}\n"
+    if not hot_lines:
+        hot_lines = "  — no data yet —\n"
+
     msg = (
-        f"❤ <b>Heartbeat  –  {now.strftime('%H:%M UTC')}</b>\n"
+        f"❤️ <b>Hourly Heartbeat  –  {now.strftime('%H:%M UTC')}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"State   : {'⏸ PAUSED' if is_paused else '▶ RUNNING'}\n"
         f"Market  : {SESSION_EMOJIS.get(mkt_s,'')} {mkt_s}\n"
-        f"P&L     : {'+' if pnl >= 0 else ''}${pnl:.2f}\n"
+        f"P&L     : <b>{'+' if pnl >= 0 else ''}${pnl:.2f}</b>\n"
         f"Trades  : {total}  ({wc}W / {lc}L  {wr:.1f}%)\n"
-        f"Active  : {ac}\n"
-        f"Streak  : {'🔴' * cl if cl else '🟢 None'}\n"
+        f"Active  : {ac}  |  Streak: {'🔴×' + str(cl) if cl else '🟢 None'}\n"
         f"Drawdown: -${cur_dd:.2f}  (max -${mdd:.2f})\n"
         f"{session_line}"
+        f"🤖 ML: {ml_line}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Top Symbols:</b>\n{hot_lines}"
         f"{_best_worst_line()}"
     )
     _send_tg(msg, reply_markup=_main_kb())
@@ -3300,11 +3584,162 @@ def _midnight_breakdown_loop():
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  PINNED TELEGRAM DASHBOARD  (auto-updated every 5 min)
+# ══════════════════════════════════════════════════════════════════════
+def _pinned_dashboard_loop():
+    """Send/edit a pinned Telegram message with live scores & P&L every 5 min."""
+    global _pinned_msg_id
+    time.sleep(90)   # let WS feeds connect first
+    while True:
+        try:
+            if not _tg_loop_ok():
+                time.sleep(30)
+                continue
+
+            async def _do_update():
+                global _pinned_msg_id
+                try:
+                    now   = datetime.now(timezone.utc)
+                    mkt_s = _get_session_name(now)
+                    with _lock:
+                        pnl        = total_pnl
+                        wc_        = win_count
+                        lc_        = loss_count
+                        is_paused_ = paused
+                    tot = wc_ + lc_
+                    wr  = wc_ / tot * 100 if tot else 0
+
+                    # Hot signals
+                    scored = []
+                    for sym in SYMBOLS:
+                        with _lock:
+                            cc = current_candle.get(sym)
+                        if cc:
+                            try:
+                                row_c = {
+                                    "Close": float(cc.get("close", 0)),
+                                    "Open":  float(cc.get("open",  0)),
+                                    "High":  float(cc.get("high",  0)),
+                                    "Low":   float(cc.get("low",   0)),
+                                }
+                                s, d, _ = score_signal(sym, row_c)
+                                scored.append((s, sym, d))
+                            except Exception:
+                                pass
+                    scored.sort(reverse=True)
+                    hot = ""
+                    for s, sym, d in scored[:5]:
+                        m5d  = indicators_m5.get(sym, {}).get("supertrend_dir", 0)
+                        m5ic = "↑" if m5d == 1 else ("↓" if m5d == -1 else "→")
+                        heat = "🔥🔥" if s >= SCORE_THRESHOLD else ("🔥" if s >= SCORE_THRESHOLD - 15 else "  ")
+                        hot += f"  {heat}<code>{sym:<10}</code> {s:>3}/100 {d} (M5:{m5ic})\n"
+                    if not hot:
+                        hot = "  — no hot signals —\n"
+
+                    with ml_lock:
+                        ml_m_ = ml_model; ml_t_ = ml_trained_on
+                    ml_s = f"✅ trained on {ml_t_}" if ml_m_ else "⏳ warming up"
+
+                    text = (
+                        f"📌 <b>LIVE DASHBOARD</b>  ·  {now.strftime('%H:%M UTC')}\n"
+                        f"{'⏸ PAUSED' if is_paused_ else '▶ RUNNING'}  ·  "
+                        f"{SESSION_EMOJIS.get(mkt_s,'')} {mkt_s}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"💵 P&L  : <b>{'+' if pnl >= 0 else ''}${pnl:.2f}</b>  "
+                        f"({tot} trades  {wc_}W/{lc_}L  {wr:.0f}%)\n"
+                        f"🤖 ML   : {ml_s}\n"
+                        f"🎯 Gate : score≥{SCORE_THRESHOLD}  |  ML≥{ML_CONFIDENCE_MIN*100:.0f}%  "
+                        f"|  ATR×{ATR_BARRIER_MULT}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"<b>🔥 Hot Signals:</b>\n{hot}"
+                        f"<i>↻ updates every 5 min</i>"
+                    )
+
+                    async def _pin_msg(msg_id):
+                        try:
+                            await telegram_app.bot.pin_chat_message(
+                                chat_id=TELEGRAM_CHAT_ID,
+                                message_id=msg_id,
+                                disable_notification=True,
+                            )
+                        except Exception:
+                            pass   # pin may fail in groups without admin rights — that's OK
+
+                    if _pinned_msg_id:
+                        try:
+                            await telegram_app.bot.edit_message_text(
+                                chat_id=TELEGRAM_CHAT_ID,
+                                message_id=_pinned_msg_id,
+                                text=text,
+                                parse_mode="HTML",
+                            )
+                        except Exception:
+                            # Message too old or deleted — send fresh and re-pin
+                            m = await telegram_app.bot.send_message(
+                                chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML"
+                            )
+                            _pinned_msg_id = m.message_id
+                            await _pin_msg(_pinned_msg_id)
+                    else:
+                        m = await telegram_app.bot.send_message(
+                            chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML"
+                        )
+                        _pinned_msg_id = m.message_id
+                        await _pin_msg(_pinned_msg_id)
+
+                except Exception as e:
+                    logger.error(f"pinned_dashboard update: {e}")
+
+            asyncio.run_coroutine_threadsafe(_do_update(), _tg_loop)
+        except Exception as e:
+            logger.error(f"pinned_dashboard_loop: {e}")
+        time.sleep(300)   # every 5 minutes
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  SESSION-CHANGE MONITOR  (auto end-of-session report)
+# ══════════════════════════════════════════════════════════════════════
+def _session_change_monitor_loop():
+    """Detect market-session boundaries and send a full end-of-session report."""
+    global _current_session_name
+    time.sleep(120)   # let indicators & WS settle first
+    _current_session_name = _get_session_name(datetime.now(timezone.utc))
+    while True:
+        try:
+            time.sleep(60)
+            now     = datetime.now(timezone.utc)
+            new_ses = _get_session_name(now)
+            if _current_session_name and new_ses != _current_session_name:
+                # Snapshot stats BEFORE updating _current_session_name
+                with _lock:
+                    snap = {
+                        "reason":         "SESSION_END",
+                        "market_session": _current_session_name,
+                        "pnl":            total_pnl,
+                        "wins":           win_count,
+                        "losses":         loss_count,
+                        "peak":           peak_equity,
+                        "max_dd":         max_drawdown,
+                        "duration":       now - session_start,
+                        "symbols":        {s: dict(v) for s, v in session_symbol_stats.items()},
+                    }
+                logger.info(f"Session boundary: {_current_session_name} → {new_ses}")
+                _send_tg(_session_summary_text(snap))
+                _current_session_name = new_ses
+            else:
+                _current_session_name = new_ses
+        except Exception as e:
+            logger.error(f"session_change_monitor_loop: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  TELEGRAM STARTUP
 # ══════════════════════════════════════════════════════════════════════
 def _start_telegram():
     async def _run():
         global telegram_app, _tg_loop
+        # Clear readiness in case this is a restart
+        _tg_ready.clear()
         _tg_loop = asyncio.get_running_loop()
         app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         telegram_app = app
@@ -3361,6 +3796,9 @@ def _start_telegram():
                 allowed_updates=["message", "callback_query"],
                 drop_pending_updates=True,   # discard stale updates from downtime
             )
+            # Signal readiness only after polling is confirmed up — any
+            # thread calling _send_tg will now find a stable, open loop.
+            _tg_ready.set()
             while True:
                 await asyncio.sleep(3600)
 
@@ -3435,13 +3873,13 @@ def main():
     for sym in SYMBOLS:
         _init_symbol(sym)
 
-    # ── Start Telegram & health server FIRST so the bot is responsive
-    # immediately even while candle history is still loading.
-    _watch_thread(_start_telegram,              name="Telegram")
+    # ── Health server starts immediately (no async loop dependency)
     _watch_thread(_start_health_server,         name="HealthServer")
 
     # Load candle history (batched, parallel within batch).
-    # This blocks for up to ~3 min on cold start; Telegram is already up.
+    # Telegram is started AFTER history so the async event loop is fully
+    # stable before any thread calls _send_tg (avoids "Event loop is closed"
+    # RuntimeError that occurs when MLBootstrap fires _send_tg too early).
     BATCH = 5
     for i in range(0, len(SYMBOLS), BATCH):
         batch   = SYMBOLS[i:i + BATCH]
@@ -3459,6 +3897,15 @@ def main():
     # Load existing ML model
     _ml_load()
 
+    # ── Start Telegram NOW — history is loaded so the loop is stable before
+    # MLBootstrap (or any other thread) calls _send_tg.
+    _watch_thread(_start_telegram,              name="Telegram")
+
+    # Block until the Telegram polling loop confirms it is fully up.
+    # _tg_ready is set inside _run() only after app.start() + start_polling()
+    # succeed, so any subsequent _send_tg call is guaranteed a live loop.
+    _tg_ready.wait(timeout=30)
+
     # Bootstrap ML from candle history (runs in background thread)
     threading.Thread(
         target=_ml_bootstrap_from_history,
@@ -3475,7 +3922,8 @@ def main():
     _watch_thread(_pending_trade_timeout_loop,  name="PendingTimeout")
     _watch_thread(_stale_contract_watchdog,     name="StaleWatchdog")
     _watch_thread(_midnight_breakdown_loop,     name="MidnightBreakdown")
-    # HealthServer and Telegram are already started above (before history load)
+    _watch_thread(_pinned_dashboard_loop,       name="PinnedDashboard")
+    _watch_thread(_session_change_monitor_loop, name="SessionMonitor")
 
     # Mark bot as fully ready — commands that need DB/indicators are now safe
     global _bot_ready
