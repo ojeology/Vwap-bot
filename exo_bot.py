@@ -77,6 +77,11 @@ ATR_BARRIER_MULT       = 0.60        # tuned for ~$0.60-0.90 profit/trade across
 DURATION               = 10
 CONTRACT_TYPE          = "ONETOUCH"
 COOLDOWN_MINUTES       = 20
+# ── Second entry (re-entry on same symbol after a win) ────────────────
+ALLOW_SECOND_ENTRY     = True     # enable controlled re-entry after a win
+SECOND_ENTRY_COOLDOWN  = 5        # shortened cooldown (min) after a win
+SECOND_ENTRY_ML_MIN    = 0.90     # stricter ML gate for re-entry (90%)
+SECOND_ENTRY_WINDOW    = 15       # window (min) to wait for re-entry signal after win
 MAX_CONSECUTIVE_LOSSES = 3
 PAUSE_MINUTES          = 30
 DAILY_LOSS_LIMIT       = -10.0        # session SL
@@ -103,16 +108,29 @@ STRATEGY_VERSION = "V2.5"
 # Maps session name → (start_hour_utc, end_hour_utc).
 # Midnight wraps across 00:00, handled in _get_session_name().
 MARKET_SESSIONS = {
-    "Midnight": (22, 2),
-    "Asian":    (2,  10),
-    "London":   (10, 13),
-    "New York": (13, 22),
+    "Midnight":       (22, 2),
+    "Early Asian":    (2,  6),
+    "Late Asian":     (6,  10),
+    "London":         (10, 13),
+    "Early New York": (13, 18),
+    "Late New York":  (18, 22),
 }
 SESSION_EMOJIS = {
-    "Midnight": "🌙",
-    "Asian":    "🌏",
-    "London":   "🇬🇧",
-    "New York": "🗽",
+    "Midnight":       "🌙",
+    "Early Asian":    "🌏",
+    "Late Asian":     "🌏",
+    "London":         "🇬🇧",
+    "Early New York": "🗽",
+    "Late New York":  "🌆",
+}
+# Broad session group mapping (for DB backward-compat display)
+SESSION_GROUP = {
+    "Midnight":       "Midnight",
+    "Early Asian":    "Asian",
+    "Late Asian":     "Asian",
+    "London":         "London",
+    "Early New York": "New York",
+    "Late New York":  "New York",
 }
 
 # ── ML filter ────────────────────────────────────────────────────────
@@ -167,6 +185,10 @@ session_start = datetime.now(timezone.utc)
 signal_log: deque[str] = deque(maxlen=20)
 session_symbol_stats: dict = {}   # symbol → {wins, losses, pnl}
 
+# Second-entry tracking ───────────────────────────────────────────────
+# Maps symbol → expiry datetime while a re-entry window is open after a win
+second_entry_eligible: dict = {}   # symbol → window_expiry datetime
+
 # Daily session log (TP/SL hits) ──────────────────────────────────────
 daily_session_log: list = []
 _daily_session_log_date: str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -217,27 +239,39 @@ _last_computed_epoch:  dict = {}   # sym → int    – skip redundant indicator
 #  SESSION HELPERS
 # ══════════════════════════════════════════════════════════════════════
 def _get_session_name(dt: Optional[datetime] = None) -> str:
-    """Return the market session name for a given UTC datetime."""
+    """Return the detailed market session name (Early/Late sub-splits) for a UTC datetime."""
     if dt is None:
         dt = datetime.now(timezone.utc)
     h = dt.hour
     if h >= 22 or h < 2:
         return "Midnight"
+    elif h < 6:
+        return "Early Asian"
     elif h < 10:
-        return "Asian"
+        return "Late Asian"
     elif h < 13:
         return "London"
+    elif h < 18:
+        return "Early New York"
     else:
-        return "New York"
+        return "Late New York"
+
+
+def _get_session_group(session_name: str) -> str:
+    """Return the broad session group for a sub-session (e.g. Early Asian → Asian)."""
+    return SESSION_GROUP.get(session_name, session_name)
 
 
 def _next_session_start(dt: Optional[datetime] = None) -> datetime:
-    """Return the UTC datetime when the NEXT market session begins."""
+    """Return the UTC datetime when the NEXT market sub-session begins."""
     if dt is None:
         dt = datetime.now(timezone.utc)
     current = _get_session_name(dt)
-    # Each session ends (next session starts) at this UTC hour
-    next_start_hour = {"Midnight": 2, "Asian": 10, "London": 13, "New York": 22}
+    # Each sub-session ends at this UTC hour
+    next_start_hour = {
+        "Midnight": 2, "Early Asian": 6, "Late Asian": 10,
+        "London": 13, "Early New York": 18, "Late New York": 22,
+    }
     h = next_start_hour[current]
     candidate = dt.replace(hour=h, minute=0, second=0, microsecond=0)
     if candidate <= dt:
@@ -256,6 +290,12 @@ def _roll_market_session_stats_if_needed():
                 for name in MARKET_SESSIONS
             }
             _market_session_date = today
+        else:
+            # Ensure any new sub-session key exists (e.g. after config update)
+            for name in MARKET_SESSIONS:
+                market_session_stats.setdefault(
+                    name, {"wins": 0, "losses": 0, "pnl": 0.0, "trades": 0}
+                )
 
 
 def _roll_daily_funnel_if_needed_locked():
@@ -369,8 +409,9 @@ def _ml_get_confidence(details: dict, symbol: str = "") -> float:
         return 1.0
 
 
-def _ml_should_trade(details: dict, symbol: str = "") -> bool:
-    """Filter trade by ML confidence. Stores 'ml_confidence' in details for display."""
+def _ml_should_trade(details: dict, symbol: str = "", min_conf: float = None) -> bool:
+    """Filter trade by ML confidence. Stores 'ml_confidence' in details for display.
+    Pass min_conf to override the global gate (e.g. higher bar for second entries)."""
     conf = _ml_get_confidence(details, symbol)
     details["ml_confidence"] = conf
     cls = _get_symbol_class(symbol) if symbol else "standard_vol"
@@ -378,12 +419,12 @@ def _ml_should_trade(details: dict, symbol: str = "") -> bool:
         has_model = (ml_models_per_class.get(cls) or ml_model) is not None
     if not has_model:
         return True   # observe-only until first model
-    return conf >= ML_CONFIDENCE_MIN
+    gate = min_conf if min_conf is not None else ML_CONFIDENCE_MIN
+    return conf >= gate
 
 
 def _ml_export_csv(total: int):
     try:
-        conn = sqlite3.connect("trades.db")
         cols = [
             "id", "timestamp", "symbol", "direction", "barrier",
             "stake", "payout", "profit", "win", "score",
@@ -391,17 +432,12 @@ def _ml_export_csv(total: int):
             "ema_fast_slope", "ema_slow_slope", "ema_distance",
             "market_session",
         ]
-        # Gracefully handle missing market_session column in older DBs
-        try:
-            rows = conn.execute(
-                f"SELECT {', '.join(cols)} FROM trades ORDER BY id"
-            ).fetchall()
-        except sqlite3.OperationalError:
-            cols = cols[:-1]  # drop market_session
-            rows = conn.execute(
-                f"SELECT {', '.join(cols)} FROM trades ORDER BY id"
-            ).fetchall()
-        conn.close()
+        # Use _db_fetch for PostgreSQL + SQLite compatibility
+        rows = _db_fetch(f"SELECT {', '.join(cols)} FROM trades ORDER BY id")
+        if not rows:
+            # Fallback: try without market_session (older schema)
+            cols = cols[:-1]
+            rows = _db_fetch(f"SELECT {', '.join(cols)} FROM trades ORDER BY id")
         buf = io.StringIO()
         writer = _csv.writer(buf)
         writer.writerow(cols)
@@ -431,15 +467,14 @@ def _ml_train():
     global ml_model, ml_trained_on, ml_training_active, ml_models_per_class, ml_trained_per_class
     try:
         try:
-            conn = sqlite3.connect("trades.db")
-            # Fetch with symbol so we can split by class
-            rows_sym = conn.execute(
+            # Use _db_fetch so training works with both SQLite and PostgreSQL
+            rows_sym = _db_fetch(
                 f"SELECT symbol, {', '.join(ML_FEATURE_COLS)}, win FROM trades "
                 f"WHERE win IN (0, 1)"   # exclude VOID/unresolved contracts (win=-1)
-            ).fetchall()
-            conn.close()
+            )
         except Exception as e:
             logger.error(f"ML training query failed: {e}")
+            _send_tg(f"🤖 <b>ML Training Error</b>\n<code>{e}</code>\nWill retry on next trade.")
             return
 
         rows  = [r[1:] for r in rows_sym]   # drop symbol column for global model
@@ -518,7 +553,10 @@ def _ml_train():
 
 def _ml_maybe_retrain(total_trades: int):
     global ml_total_trades, ml_training_active
-    ml_total_trades = total_trades
+    # Use max() so an instant +1 increment from on_contract_update is never
+    # overwritten by a stale DB count flushed milliseconds later.
+    with ml_lock:
+        ml_total_trades = max(ml_total_trades, total_trades)
     spawn = False
     with ml_lock:
         if not ml_training_active:
@@ -630,6 +668,51 @@ def _ml_bootstrap_from_history():
     except Exception as e:
         logger.error(f"ML bootstrap failed: {e}")
         _send_tg(f"⚠️ ML bootstrap failed: <code>{e}</code>")
+
+
+def _ml_confidence_perf_text() -> str:
+    """ML Confidence Performance — score buckets vs real P&L from DB."""
+    rows = get_ml_confidence_buckets()
+    lines = [
+        "🤖 <b>ML Confidence Performance</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "<i>Score buckets (higher = stronger signal + higher ML confidence)</i>",
+        "",
+    ]
+    bucket_order = ["95-100", "90-94", "85-89", "75-84", "<75"]
+    bucket_data  = {r[0]: r for r in rows} if rows else {}
+
+    for bucket in bucket_order:
+        r = bucket_data.get(bucket)
+        if r:
+            _, cnt, wins, pnl = r[0], r[1], r[2], r[3]
+            wins = wins or 0; pnl = pnl or 0.0; cnt = cnt or 0
+            wr   = wins / cnt * 100 if cnt else 0
+            sign = "+" if pnl >= 0 else ""
+            bar_w = 8
+            bar_f = max(0, min(bar_w, int(wr / 100 * bar_w)))
+            bar   = "█" * bar_f + "░" * (bar_w - bar_f)
+            lines.append(
+                f"<b>{bucket:>6}%</b>  ·  {cnt:>3} trades  "
+                f"{wins}W ({wr:.0f}%WR) [{bar}]  "
+                f"P&L: <b>{sign}${pnl:.2f}</b>"
+            )
+        else:
+            lines.append(f"  {bucket:>6}%  ·  — no trades yet —")
+
+    # Current session totals for context
+    with _lock:
+        wc, lc, pnl_s = win_count, loss_count, total_pnl
+    tot = wc + lc
+    wr_s = wc / tot * 100 if tot else 0
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Session: {tot} trades  {wc}W/{lc}L  {wr_s:.0f}%WR  "
+        f"P&L: {'+' if pnl_s >= 0 else ''}${pnl_s:.2f}",
+        f"<i>Buckets based on signal score. ML gate: ≥{ML_CONFIDENCE_MIN*100:.0f}%  "
+        f"(2nd entry: ≥{SECOND_ENTRY_ML_MIN*100:.0f}%)</i>",
+    ]
+    return "\n".join(lines)
 
 
 def _ml_progress_text() -> str:
@@ -940,6 +1023,29 @@ def get_session_alltime_stats():
         "FROM trades WHERE market_session IS NOT NULL AND win IN (0,1) "
         "GROUP BY market_session ORDER BY SUM(profit) DESC"
     )
+
+
+def get_ml_confidence_buckets():
+    """Return P&L and win-rate grouped by ML confidence buckets (from score column proxy)."""
+    # Confidence isn't stored directly in DB, but we can approximate using score
+    # and return lifetime performance segmented by score ranges.
+    # Buckets: 95-100, 90-94, 85-89, 75-84, <75
+    rows = _db_fetch(
+        "SELECT "
+        "  CASE "
+        "    WHEN score >= 95 THEN '95-100' "
+        "    WHEN score >= 90 THEN '90-94' "
+        "    WHEN score >= 85 THEN '85-89' "
+        "    WHEN score >= 75 THEN '75-84' "
+        "    ELSE '<75' "
+        "  END as bucket, "
+        "  COUNT(*) as trades, "
+        "  SUM(CASE WHEN win=1 THEN 1 ELSE 0 END) as wins, "
+        "  SUM(profit) as pnl "
+        "FROM trades WHERE win IN (0,1) "
+        "GROUP BY bucket ORDER BY MIN(score) DESC"
+    )
+    return rows
 
 
 def _compute_advanced_stats(rows) -> dict:
@@ -2058,9 +2164,21 @@ def on_contract_update(ws, msg: dict, symbol: str):
         if win:
             win_count += 1
             consecutive_losses = 0
+            # Second-entry: shorten cooldown so a re-entry can fire within 5 min
+            if ALLOW_SECOND_ENTRY:
+                cooldown_until[symbol] = datetime.now(timezone.utc) + timedelta(
+                    minutes=SECOND_ENTRY_COOLDOWN
+                )
+                second_entry_eligible[symbol] = datetime.now(timezone.utc) + timedelta(
+                    minutes=SECOND_ENTRY_WINDOW
+                )
+                _log(f"🔁 {symbol} WIN → second-entry window open for {SECOND_ENTRY_WINDOW} min "
+                     f"(cooldown ↓{SECOND_ENTRY_COOLDOWN} min, ML gate ≥{SECOND_ENTRY_ML_MIN*100:.0f}%)")
         else:
             loss_count += 1
             consecutive_losses += 1
+            # Clear any open second-entry window on a loss
+            second_entry_eligible.pop(symbol, None)
 
         total_pnl   += profit
         peak_equity  = max(peak_equity, total_pnl)
@@ -2150,6 +2268,11 @@ def on_contract_update(ws, msg: dict, symbol: str):
             if needs_resume_thread:
                 _auto_resume_active = True
         resume_at = pause_until
+
+    # Instantly bump ML trade counter so status display stays accurate.
+    # The DB batch may not flush for ~2 s; this eliminates the display lag.
+    with ml_lock:
+        ml_total_trades += 1
 
     # DB write — includes market_session
     db_queue.put((
@@ -2531,23 +2654,54 @@ def _on_message(ws, message: str, symbol: str):
                                 _send_rejection(symbol, direction, score,
                                                 f"M15 Supertrend disagrees "
                                                 f"({'↑' if m15_dir==1 else '↓'} on M15 vs {direction} on M1)")
-                            elif not _ml_should_trade(details, symbol):
-                                conf = details.get("ml_confidence", 0)
-                                _record_funnel_rejection("ML confidence below gate")
-                                _send_rejection(symbol, direction, score,
-                                                f"ML confidence {conf*100:.1f}% < "
-                                                f"{ML_CONFIDENCE_MIN*100:.0f}% gate "
-                                                f"[{_get_symbol_class(symbol)}]")
-                            elif _reserve_trade_slot(symbol, datetime.now(timezone.utc)):
-                                request_proposal(ws, symbol, details, direction)
-                                _log(f"🎯 {symbol} {direction} TICK-ENTRY  score={score}/100  "
-                                     f"momentum={len(tick_history.get(symbol,[]))}ticks  "
-                                     f"conf={details.get('ml_confidence',1.0)*100:.0f}%  "
-                                     f"class={_get_symbol_class(symbol)}")
                             else:
-                                _record_funnel_rejection("Risk gate closed (paused/cooldown/daily limit)")
-                                _send_rejection(symbol, direction, score,
-                                                "Risk gate closed (paused / cooldown / daily limit)")
+                                # ── ML gate: second-entry requires higher confidence ────
+                                now_t = datetime.now(timezone.utc)
+                                # Expire stale second-entry windows first (under lock for safety)
+                                with _lock:
+                                    _se_expiry = second_entry_eligible.get(symbol)
+                                    if _se_expiry is not None and now_t >= _se_expiry:
+                                        second_entry_eligible.pop(symbol, None)
+                                        _se_expiry = None
+                                _is_second = _se_expiry is not None  # expiry already validated
+                                _ml_gate   = SECOND_ENTRY_ML_MIN if _is_second else None
+                                _gate_lbl  = (f"{SECOND_ENTRY_ML_MIN*100:.0f}% (2nd entry)"
+                                              if _is_second else f"{ML_CONFIDENCE_MIN*100:.0f}%")
+                                if not _ml_should_trade(details, symbol, min_conf=_ml_gate):
+                                    conf = details.get("ml_confidence", 0)
+                                    _record_funnel_rejection("ML confidence below gate")
+                                    _send_rejection(symbol, direction, score,
+                                                    f"ML confidence {conf*100:.1f}% < {_gate_lbl} gate "
+                                                    f"[{_get_symbol_class(symbol)}]")
+                                elif _is_second:
+                                    if _reserve_trade_slot(symbol, now_t):
+                                        # Success — consume the second-entry window now
+                                        with _lock:
+                                            second_entry_eligible.pop(symbol, None)
+                                        request_proposal(ws, symbol, details, direction)
+                                        _log(f"🔁 {symbol} {direction} SECOND-ENTRY  score={score}/100  "
+                                             f"conf={details.get('ml_confidence',1.0)*100:.0f}%  "
+                                             f"class={_get_symbol_class(symbol)}")
+                                        _send_tg(
+                                            f"🔁 <b>SECOND ENTRY</b> — <code>{symbol}</code> {direction}\n"
+                                            f"Score: <b>{score}/100</b>  ML: {details.get('ml_confidence',1.0)*100:.0f}%\n"
+                                            f"<i>Re-entry after win — trend still confirmed.</i>"
+                                        )
+                                    else:
+                                        # Gate blocked this tick — window stays open, retry next tick
+                                        _record_funnel_rejection("Risk gate closed (paused/cooldown/daily limit)")
+                                        _send_rejection(symbol, direction, score,
+                                                        "Risk gate closed for 2nd entry (paused / daily limit)")
+                                elif _reserve_trade_slot(symbol, now_t):
+                                    request_proposal(ws, symbol, details, direction)
+                                    _log(f"🎯 {symbol} {direction} TICK-ENTRY  score={score}/100  "
+                                         f"momentum={len(tick_history.get(symbol,[]))}ticks  "
+                                         f"conf={details.get('ml_confidence',1.0)*100:.0f}%  "
+                                         f"class={_get_symbol_class(symbol)}")
+                                else:
+                                    _record_funnel_rejection("Risk gate closed (paused/cooldown/daily limit)")
+                                    _send_rejection(symbol, direction, score,
+                                                    "Risk gate closed (paused / cooldown / daily limit)")
 
                 with _lock:
                     current_candle[symbol] = dict(c)
@@ -2651,26 +2805,34 @@ def _ml_conf_label() -> str:
 def _main_kb() -> InlineKeyboardMarkup:
     with _lock:
         is_paused = paused
-    pause_lbl = "▶ Resume" if is_paused else "⏸ Pause"
+    pause_lbl = "▶ Resume Bot" if is_paused else "⏸ Pause Bot"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Status",          callback_data="status"),
-         InlineKeyboardButton("💰 P&L",             callback_data="pnl")],
-        [InlineKeyboardButton("📜 History",         callback_data="history"),
-         InlineKeyboardButton("📋 Log",             callback_data="signals")],
-        [InlineKeyboardButton("📄 Session Report",  callback_data="session_report"),
-         InlineKeyboardButton("🏆 All-Time",        callback_data="alltime")],
-        [InlineKeyboardButton("📅 Day History",     callback_data="daily_history"),
-         InlineKeyboardButton("🏅 Best/Worst",      callback_data="best_worst")],
-        [InlineKeyboardButton("📈 Scores",          callback_data="score_sparklines"),
-         InlineKeyboardButton("🌏 Sessions",        callback_data="market_sessions")],
-        [InlineKeyboardButton("📆 7-Day P&L",       callback_data="seven_day_pnl"),
-         InlineKeyboardButton("⚙ Settings",        callback_data="settings")],
-        [InlineKeyboardButton(pause_lbl,            callback_data="toggle_pause"),
-         InlineKeyboardButton("⏭ Skip Symbol",     callback_data="skip_menu")],
-        [InlineKeyboardButton("🔄 Refresh",         callback_data="refresh"),
-         InlineKeyboardButton("🧪 Test Trade",      callback_data="test_menu")],
-        [InlineKeyboardButton("📦 Backup",           callback_data="backup"),
-         InlineKeyboardButton(_ml_conf_label(),     callback_data="ml_conf_toggle")],
+        # ── Live Status ──────────────────────────────────────────────────
+        [InlineKeyboardButton("📊 Bot Status · Trades",     callback_data="status"),
+         InlineKeyboardButton("💰 P&L · Win Rate",          callback_data="pnl")],
+        # ── Trade History ────────────────────────────────────────────────
+        [InlineKeyboardButton("📜 Recent Trades",           callback_data="history"),
+         InlineKeyboardButton("📋 Signal Log",              callback_data="signals")],
+        # ── Session Reporting ─────────────────────────────────────────────
+        [InlineKeyboardButton("📄 This Session Report",     callback_data="session_report"),
+         InlineKeyboardButton("🏆 All-Time Stats",          callback_data="alltime")],
+        [InlineKeyboardButton("📅 Today's Session Log",     callback_data="daily_history"),
+         InlineKeyboardButton("🏅 Best / Worst Symbol",     callback_data="best_worst")],
+        # ── Analysis ─────────────────────────────────────────────────────
+        [InlineKeyboardButton("📈 Signal Score Charts",     callback_data="score_sparklines"),
+         InlineKeyboardButton("🌏 Sessions Breakdown",      callback_data="market_sessions")],
+        [InlineKeyboardButton("📆 7-Day P&L",               callback_data="seven_day_pnl"),
+         InlineKeyboardButton("🤖 ML Confidence Perf",      callback_data="ml_conf_perf")],
+        # ── Control ──────────────────────────────────────────────────────
+        [InlineKeyboardButton(pause_lbl,                    callback_data="toggle_pause"),
+         InlineKeyboardButton("⏭ Skip a Symbol",           callback_data="skip_menu")],
+        [InlineKeyboardButton("⚙ Settings & Config",       callback_data="settings"),
+         InlineKeyboardButton(_ml_conf_label(),             callback_data="ml_conf_toggle")],
+        # ── Tools ────────────────────────────────────────────────────────
+        [InlineKeyboardButton("🔄 Refresh Dashboard",       callback_data="refresh"),
+         InlineKeyboardButton("🧪 Fire Test Trade",         callback_data="test_menu")],
+        [InlineKeyboardButton("📦 Backup · Restore",        callback_data="backup"),
+         InlineKeyboardButton("📤 Export Trades CSV",       callback_data="export_csv_quick")],
     ])
 
 
@@ -3081,22 +3243,45 @@ def _market_sessions_text() -> str:
         "<b>Today (in-memory)</b>",
     ]
 
-    for name in ["Midnight", "Asian", "London", "New York"]:
-        s    = ms_snap.get(name, {"wins": 0, "losses": 0, "pnl": 0.0, "trades": 0})
-        tot  = s["wins"] + s["losses"]
-        wr   = s["wins"] / tot * 100 if tot else 0
-        sign = "+" if s["pnl"] >= 0 else ""
-        tag  = " ◄ LIVE" if name == current else ""
+    # ── Sub-session breakdown (today) ──────────────────────────────────
+    # Group into broad sessions for readability
+    broad_groups = {
+        "Midnight":   ["Midnight"],
+        "Asian":      ["Early Asian", "Late Asian"],
+        "London":     ["London"],
+        "New York":   ["Early New York", "Late New York"],
+    }
+    for broad, subs in broad_groups.items():
+        # Compute broad group totals
+        btot_w = btot_l = btot_pnl = 0
+        for sub in subs:
+            s = ms_snap.get(sub, {"wins": 0, "losses": 0, "pnl": 0.0, "trades": 0})
+            btot_w   += s["wins"];  btot_l += s["losses"]; btot_pnl += s["pnl"]
+        btot  = btot_w + btot_l
+        bwr   = btot_w / btot * 100 if btot else 0
+        bsign = "+" if btot_pnl >= 0 else ""
+        broad_em = SESSION_EMOJIS.get(broad, "")
         lines.append(
-            f"  {SESSION_EMOJIS.get(name,'')} <b>{name:<10}</b>"
-            f"{tag}\n"
-            f"    Trades: {tot}  {s['wins']}W/{s['losses']}L ({wr:.0f}%WR)  "
-            f"P&L: <b>{sign}${s['pnl']:.2f}</b>"
+            f"\n{broad_em} <b>{broad}</b>  "
+            f"[{btot} trades  {btot_w}W/{btot_l}L  {bwr:.0f}%WR  {bsign}${btot_pnl:.2f}]"
         )
+        for sub in subs:
+            s   = ms_snap.get(sub, {"wins": 0, "losses": 0, "pnl": 0.0, "trades": 0})
+            tot = s["wins"] + s["losses"]
+            wr  = s["wins"] / tot * 100 if tot else 0
+            sign = "+" if s["pnl"] >= 0 else ""
+            tag  = " ◄ LIVE" if sub == current else ""
+            sub_em = SESSION_EMOJIS.get(sub, "")
+            lines.append(
+                f"  {sub_em} <b>{sub:<16}</b>{tag}\n"
+                f"    {tot} trades  {s['wins']}W/{s['losses']}L ({wr:.0f}%WR)  "
+                f"P&L: <b>{sign}${s['pnl']:.2f}</b>"
+            )
 
-    lines += ["", "<b>All-Time (DB)</b>"]
+    lines += ["", "<b>All-Time (DB — broad sessions)</b>"]
     if at_rows:
-        for name in ["Midnight", "Asian", "London", "New York"]:
+        for name in ["Midnight", "Asian", "London", "New York", "Early Asian", "Late Asian",
+                      "Early New York", "Late New York"]:
             row = at_rows.get(name)
             if row:
                 _, cnt, wins, pnl = row
@@ -3104,7 +3289,7 @@ def _market_sessions_text() -> str:
                 wr   = wins / cnt * 100 if cnt else 0
                 sign = "+" if pnl >= 0 else ""
                 lines.append(
-                    f"  {SESSION_EMOJIS.get(name,'')} {name:<10}  "
+                    f"  {SESSION_EMOJIS.get(name,'')} {name:<18}  "
                     f"{cnt} trades  {wins}W ({wr:.0f}%)  {sign}${pnl:.2f}"
                 )
     else:
@@ -3281,24 +3466,75 @@ def _score_sparklines_text() -> str:
 
 
 def _settings_text():
+    se_status = "✅ ENABLED" if ALLOW_SECOND_ENTRY else "❌ OFF"
     return (
-        f"⚙ <b>Settings</b>\n━━━━━━━━━━━━━━━━━━━━\n"
-        f"Stake           : ${STAKE}  (fixed risk per trade)\n"
-        f"Barrier         : ATR × {ATR_BARRIER_MULT}  (auto-scales per symbol)\n"
-        f"Duration        : {DURATION} min\n"
-        f"Contract        : {CONTRACT_TYPE}\n"
-        f"Min Score       : {SCORE_THRESHOLD}/100  (93+ gate)\n"
-        f"ML Confidence   : ≥{ML_CONFIDENCE_MIN*100:.0f}%  (hard filter)\n"
-        f"Cooldown        : {COOLDOWN_MINUTES} min\n"
-        f"Max Consec Loss : {MAX_CONSECUTIVE_LOSSES}\n"
-        f"Pause Duration  : {PAUSE_MINUTES} min\n"
-        f"Session TP      : ${DAILY_PROFIT_TARGET:.2f}\n"
-        f"Session SL      : ${DAILY_LOSS_LIMIT}\n"
-        f"Trend Engine    : Supertrend (period={SUPERTREND_PERIOD}, mult={SUPERTREND_ATR_MULT})\n"
-        f"{_ml_progress_text()}\n"
+        f"⚙ <b>Settings &amp; Config</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Risk</b>\n"
+        f"  Stake          : <b>${STAKE}</b>  per trade\n"
+        f"  Duration       : <b>{DURATION} min</b>  contract expiry\n"
+        f"  Cooldown       : <b>{COOLDOWN_MINUTES} min</b>  between trades\n"
+        f"  Session TP     : <b>${DAILY_PROFIT_TARGET:.2f}</b>\n"
+        f"  Session SL     : <b>${DAILY_LOSS_LIMIT:.2f}</b>\n"
+        f"  Max Consec Los : <b>{MAX_CONSECUTIVE_LOSSES}</b>  then pause {PAUSE_MINUTES} min\n"
+        f"\n<b>Signal Gates</b>\n"
+        f"  Min Score      : <b>{SCORE_THRESHOLD}/100</b>  (Supertrend + ADX + confluences)\n"
+        f"  ML Gate        : <b>≥{ML_CONFIDENCE_MIN*100:.0f}%</b>  confidence required\n"
+        f"  ML Min Trades  : <b>{ML_MIN_TRADES}</b>  before model activates\n"
+        f"  ML Retrain     : every <b>{ML_RETRAIN_EVERY}</b> trades\n"
+        f"\n<b>Second Entry</b>  {se_status}\n"
+        f"  ML Gate (2nd)  : <b>≥{SECOND_ENTRY_ML_MIN*100:.0f}%</b>  stricter re-entry bar\n"
+        f"  Cooldown (2nd) : <b>{SECOND_ENTRY_COOLDOWN} min</b>  after win\n"
+        f"  Window         : <b>{SECOND_ENTRY_WINDOW} min</b>  re-entry window\n"
+        f"\n<b>Engine</b>\n"
+        f"  Supertrend     : period={SUPERTREND_PERIOD}  mult={SUPERTREND_ATR_MULT}\n"
+        f"  Barrier        : ATR × {ATR_BARRIER_MULT}\n"
+        f"\n{_ml_progress_text()}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<i>TP/SL auto-resets session and keeps trading.</i>"
+        f"<i>Tap ⚙ Adjust to change any value live. Or: /set &lt;param&gt; &lt;value&gt;</i>\n"
+        f"<i>E.g. /set ml_gate 85  ·  /set score 91  ·  /set stake 5</i>"
     )
+
+
+def _settings_adj_kb() -> InlineKeyboardMarkup:
+    """Inline +/- keyboard — auto-generated from _ADJ_PARAMS so it never drifts."""
+    import sys as _sys
+    _mod = _sys.modules[__name__]
+
+    # Friendly labels for each key (order matters for display)
+    _LABELS = [
+        ("ml_gate",    "ML Gate"),
+        ("ml2_gate",   "ML 2nd Gate"),
+        ("score",      "Score Gate"),
+        ("stake",      "Stake $"),
+        ("duration",   "Duration"),
+        ("cooldown",   "Cooldown"),
+        ("tp",         "Session TP"),
+        ("sl",         "Session SL"),
+        ("max_loss",   "Max C.Loss"),
+        ("retrain",    "ML Retrain"),
+        ("ml_min",     "ML Min Trades"),
+        ("pause_min",  "Pause Min"),
+        ("second_cd",  "2nd Cooldown"),
+        ("second_win", "2nd Window"),
+    ]
+
+    def _row(key: str, label: str) -> list:
+        cfg   = _ADJ_PARAMS.get(key)
+        cur   = getattr(_mod, cfg[0]) if cfg else "?"
+        val_s = cfg[5](cur) if cfg else str(cur)
+        return [
+            InlineKeyboardButton(f"−",         callback_data=f"adj_{key}_down"),
+            InlineKeyboardButton(f"{label}: {val_s}", callback_data="noop"),
+            InlineKeyboardButton(f"+",         callback_data=f"adj_{key}_up"),
+        ]
+
+    rows = [[InlineKeyboardButton("⚙ ADJUST LIVE PARAMETERS", callback_data="noop")]]
+    rows += [_row(k, lbl) for k, lbl in _LABELS if k in _ADJ_PARAMS]
+    rows.append([
+        InlineKeyboardButton("🔙 Settings", callback_data="settings"),
+        InlineKeyboardButton("🏠 Menu",     callback_data="main_menu"),
+    ])
+    return InlineKeyboardMarkup(rows)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -3631,6 +3867,56 @@ async def cmd_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ No trades database found yet.", parse_mode="HTML")
 
 
+async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /set <param> <value>  — change any live config parameter on the fly.
+
+    Examples:
+      /set ml_gate 85       → ML gate ≥85%
+      /set ml2_gate 90      → Second-entry ML gate ≥90%
+      /set score 91         → Signal score threshold 91/100
+      /set stake 5          → $5 per trade
+      /set duration 10      → 10-min contracts
+      /set cooldown 15      → 15 min between trades
+      /set tp 8             → Session take-profit $8
+      /set sl 15            → Session stop-loss $15
+      /set max_loss 3       → Max 3 consecutive losses before pause
+      /set retrain 30       → Retrain ML every 30 trades
+      /set ml_min 80        → ML activates after 80 trades
+      /set pause_min 20     → Pause 20 min after consec-loss trigger
+      /set second_cd 5      → 2nd-entry cooldown 5 min after win
+      /set second_win 15    → 2nd-entry window open 15 min after win
+    """
+    args = (ctx.args or [])
+    if len(args) < 2:
+        import sys as _sys_help
+        _mod = _sys_help.modules[__name__]
+        params_help = "\n".join(
+            f"  <code>/set {k:<12}</code>  now: <b>{_ADJ_PARAMS[k][5](getattr(_mod, _ADJ_PARAMS[k][0]))}</b>"
+            for k in _ADJ_PARAMS
+        )
+        await update.message.reply_text(
+            f"⚙ <b>/set — Live Parameter Editor</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Usage: <code>/set &lt;param&gt; &lt;value&gt;</code>\n\n"
+            f"<b>Current values</b>:\n{params_help}\n\n"
+            f"<i>Changes take effect immediately with no restart needed.</i>",
+            parse_mode="HTML",
+        )
+        return
+
+    key, raw = args[0].lower(), args[1]
+    ok, msg = _apply_param(key, raw)
+    emoji = "✅" if ok else "❌"
+    await update.message.reply_text(
+        f"{emoji} {msg}\n\n{_settings_text()}" if ok else f"{emoji} {msg}",
+        parse_mode="HTML",
+        reply_markup=_settings_adj_kb() if ok else None,
+    )
+    if ok:
+        _log(f"⚙ /set {key} {raw} → applied")
+
+
 async def cmd_upload_csv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     Handle a file upload from the user:
@@ -3895,6 +4181,98 @@ def _do_backup(what: str) -> None:
 # ══════════════════════════════════════════════════════════════════════
 #  TELEGRAM BUTTON HANDLER
 # ══════════════════════════════════════════════════════════════════════
+# ── Shared parameter map for /set command and adj_ inline buttons ──────
+_ADJ_PARAMS = {
+    # key          : (global_var_name,      min,     max,   step,  is_pct,  display_fn)
+    "ml_gate"      : ("ML_CONFIDENCE_MIN",  0.60,    0.99,  0.01,  True,   lambda v: f"{v*100:.0f}%"),
+    "ml2_gate"     : ("SECOND_ENTRY_ML_MIN",0.75,    0.99,  0.01,  True,   lambda v: f"{v*100:.0f}%"),
+    "score"        : ("SCORE_THRESHOLD",    70,      99,    1,     False,  lambda v: f"{v}/100"),
+    "stake"        : ("STAKE",              0.35,    500,   0.5,   False,  lambda v: f"${v:.2f}"),
+    "duration"     : ("DURATION",           1,       60,    1,     False,  lambda v: f"{v} min"),
+    "cooldown"     : ("COOLDOWN_MINUTES",   1,       120,   5,     False,  lambda v: f"{v} min"),
+    "tp"           : ("DAILY_PROFIT_TARGET",1,       9999,  1,     False,  lambda v: f"${v:.2f}"),
+    "sl"           : ("DAILY_LOSS_LIMIT",   -9999,  -1,    -1,    False,  lambda v: f"${v:.2f}"),
+    "max_loss"     : ("MAX_CONSECUTIVE_LOSSES", 1,   20,    1,     False,  lambda v: f"{int(v)}"),
+    "retrain"      : ("ML_RETRAIN_EVERY",   5,       5000,  10,    False,  lambda v: f"{int(v)} trades"),
+    "ml_min"       : ("ML_MIN_TRADES",      20,      5000,  10,    False,  lambda v: f"{int(v)} trades"),
+    "pause_min"    : ("PAUSE_MINUTES",      1,       1440,  5,     False,  lambda v: f"{int(v)} min"),
+    "second_cd"    : ("SECOND_ENTRY_COOLDOWN", 1,    60,    1,     False,  lambda v: f"{int(v)} min"),
+    "second_win"   : ("SECOND_ENTRY_WINDOW",   2,    120,   5,     False,  lambda v: f"{int(v)} min"),
+}
+
+
+def _apply_param(key: str, raw_val) -> tuple[bool, str]:
+    """Apply a parameter change. Returns (ok, message)."""
+    import sys as _sys
+    global ML_CONFIDENCE_MIN, SECOND_ENTRY_ML_MIN, SCORE_THRESHOLD, STAKE
+    global DURATION, COOLDOWN_MINUTES, DAILY_PROFIT_TARGET, DAILY_LOSS_LIMIT
+    global MAX_CONSECUTIVE_LOSSES, ML_RETRAIN_EVERY, ML_MIN_TRADES, PAUSE_MINUTES
+    global SECOND_ENTRY_COOLDOWN, SECOND_ENTRY_WINDOW
+
+    if key not in _ADJ_PARAMS:
+        return False, f"Unknown param '{key}'. Valid: {', '.join(_ADJ_PARAMS)}"
+
+    var_name, lo, hi, _, is_pct, fmt = _ADJ_PARAMS[key]
+    try:
+        val = float(raw_val)
+        if is_pct and val > 1:        # user typed 85 instead of 0.85
+            val = val / 100.0
+        if key == "sl":               # user types 15 → stored as -15
+            val = -abs(val)
+    except ValueError:
+        return False, f"Value must be a number. Got: {raw_val!r}"
+
+    val = max(lo, min(hi, val))
+
+    # Map key → global variable assignment
+    _MAP = {
+        "ml_gate":    lambda v: setattr(_sys.modules[__name__], "ML_CONFIDENCE_MIN",   v),
+        "ml2_gate":   lambda v: setattr(_sys.modules[__name__], "SECOND_ENTRY_ML_MIN", v),
+        "score":      lambda v: setattr(_sys.modules[__name__], "SCORE_THRESHOLD",     int(v)),
+        "stake":      lambda v: setattr(_sys.modules[__name__], "STAKE",               v),
+        "duration":   lambda v: setattr(_sys.modules[__name__], "DURATION",            int(v)),
+        "cooldown":   lambda v: setattr(_sys.modules[__name__], "COOLDOWN_MINUTES",    int(v)),
+        "tp":         lambda v: setattr(_sys.modules[__name__], "DAILY_PROFIT_TARGET", v),
+        "sl":         lambda v: setattr(_sys.modules[__name__], "DAILY_LOSS_LIMIT",    -abs(v)),
+        "max_loss":   lambda v: setattr(_sys.modules[__name__], "MAX_CONSECUTIVE_LOSSES", int(v)),
+        "retrain":    lambda v: setattr(_sys.modules[__name__], "ML_RETRAIN_EVERY",    int(v)),
+        "ml_min":     lambda v: setattr(_sys.modules[__name__], "ML_MIN_TRADES",       int(v)),
+        "pause_min":  lambda v: setattr(_sys.modules[__name__], "PAUSE_MINUTES",       int(v)),
+        "second_cd":  lambda v: setattr(_sys.modules[__name__], "SECOND_ENTRY_COOLDOWN", int(v)),
+        "second_win": lambda v: setattr(_sys.modules[__name__], "SECOND_ENTRY_WINDOW", int(v)),
+    }
+    _MAP[key](val)
+
+    # Re-read after set for accurate display
+    var_name2, lo2, hi2, _, is_pct2, fmt2 = _ADJ_PARAMS[key]
+    new_val = getattr(_sys.modules[__name__], var_name2)
+    return True, f"✅ <b>{var_name2}</b> → <b>{fmt2(new_val)}</b>"
+
+
+async def _handle_adj_callback(q, d: str):
+    """Handle adj_<key>_up / adj_<key>_down inline button presses."""
+    import sys as _sys
+    parts = d.split("_")            # adj, <key>, up/down
+    if len(parts) < 3:
+        await q.answer("Bad callback")
+        return
+    direction = parts[-1]          # "up" or "down"
+    key = "_".join(parts[1:-1])    # everything between adj_ and _up/_down
+
+    if key not in _ADJ_PARAMS:
+        await q.answer("Unknown parameter")
+        return
+
+    var_name, lo, hi, step, is_pct, fmt = _ADJ_PARAMS[key]
+    cur_val = getattr(_sys.modules[__name__], var_name)
+    delta = step if direction == "up" else -step
+    new_val = max(lo, min(hi, cur_val + delta))
+    ok, msg = _apply_param(key, new_val * 100 if is_pct else new_val)
+    await q.answer(msg[:200])
+    await q.edit_message_text(_settings_text(), reply_markup=_settings_adj_kb(), parse_mode="HTML")
+    _log(f"⚙ {var_name} adjusted to {getattr(_sys.modules[__name__], var_name)} via Telegram button")
+
+
 async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global paused, pause_until, consecutive_losses
     q = update.callback_query
@@ -3934,6 +4312,43 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(_market_sessions_text(), reply_markup=_main_kb(), parse_mode="HTML")
         elif d == "seven_day_pnl":
             await q.edit_message_text(_7day_pnl_text(),  reply_markup=_main_kb(), parse_mode="HTML")
+        elif d == "ml_conf_perf":
+            await q.edit_message_text(_ml_confidence_perf_text(), reply_markup=_main_kb(), parse_mode="HTML")
+        elif d == "export_csv_quick":
+            await q.edit_message_text(
+                "⏳ Generating CSV export…",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]),
+                parse_mode="HTML",
+            )
+            # Reuse existing export logic via a thread
+            async def _do_export_quick():
+                try:
+                    rows = _db_fetch("SELECT * FROM trades ORDER BY id")
+                    if USE_PG:
+                        cols = ["id","timestamp","symbol","direction","barrier","stake","payout",
+                                "profit","win","score","wick_atr_ratio","atr","atr_ma",
+                                "ema_fast_slope","ema_slow_slope","ema_distance","market_session"]
+                    else:
+                        import sqlite3 as _sl
+                        conn2 = _sl.connect("trades.db")
+                        desc2 = conn2.execute("PRAGMA table_info(trades)").fetchall()
+                        conn2.close()
+                        cols = [d2[1] for d2 in desc2]
+                    buf = io.StringIO()
+                    w   = _csv.writer(buf)
+                    w.writerow(cols)
+                    w.writerows(rows)
+                    csv_bytes = buf.getvalue().encode("utf-8")
+                    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
+                    await q.message.reply_document(
+                        document=csv_bytes,
+                        filename=f"trades_{ts}.csv",
+                        caption=f"📊 <b>Trades Export</b> — {len(rows)} trades",
+                        parse_mode="HTML",
+                    )
+                except Exception as exc:
+                    await q.message.reply_text(f"❌ Export failed: <code>{exc}</code>", parse_mode="HTML")
+            asyncio.ensure_future(_do_export_quick())
         elif d == "ml_conf_toggle":
             global ML_CONFIDENCE_MIN
             ML_CONFIDENCE_MIN = 0.90 if ML_CONFIDENCE_MIN < 0.85 else 0.75
@@ -3945,12 +4360,16 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 reply_markup=_main_kb(), parse_mode="HTML",
             )
             _log(f"🤖 ML_CONFIDENCE_MIN set to {pct}% via Telegram")
+        elif d == "noop" or d == "settings_adj":
+            await q.answer()   # acknowledge silently — spacer / no-op buttons
         elif d == "settings":
             await q.edit_message_text(
                 _settings_text(),
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]),
+                reply_markup=_settings_adj_kb(),
                 parse_mode="HTML",
             )
+        elif d.startswith("adj_"):
+            await _handle_adj_callback(q, d)
         elif d == "toggle_pause":
             with _lock:
                 paused = not paused
@@ -4513,9 +4932,11 @@ def _midnight_breakdown_loop():
                 "<b>By Market Session</b>",
             ]
 
-            for name in ["Asian", "London", "New York", "Midnight"]:
+            for name in ["Midnight", "Early Asian", "Late Asian", "London", "Early New York", "Late New York"]:
                 s    = ms_snap.get(name, {"wins": 0, "losses": 0, "pnl": 0.0, "trades": 0})
                 tot  = s["wins"] + s["losses"]
+                if tot == 0:
+                    continue
                 wr   = s["wins"] / tot * 100 if tot else 0
                 sign = "+" if s["pnl"] >= 0 else ""
                 tag  = "  🏆 BEST" if name == best_s else ("  💔 WORST" if name == worst_s else "")
@@ -4729,6 +5150,7 @@ def _start_telegram():
         app.add_handler(CommandHandler("alltime", cmd_alltime))
         app.add_handler(CommandHandler("export",  cmd_export))
         app.add_handler(CommandHandler("backup",  cmd_backup))
+        app.add_handler(CommandHandler("set",     cmd_set))
         # CSV upload: catch ALL document messages and check filename inside the
         # handler — avoids MIME-type mismatches (mobile sends text/plain,
         # desktop sends text/csv, some clients send application/octet-stream).
