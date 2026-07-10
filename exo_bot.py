@@ -6,7 +6,7 @@
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
-import json, time, sqlite3, threading, queue, logging, asyncio, os, sys, pickle, io, csv as _csv
+import json, time, sqlite3, threading, queue, logging, asyncio, os, sys, pickle, io, csv as _csv, html as _html, signal
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from collections import deque
@@ -132,6 +132,15 @@ SESSION_GROUP = {
     "Early New York": "New York",
     "Late New York":  "New York",
 }
+# UTC time-range labels shown in session breakdown reports
+SESSION_TIMES = {
+    "Midnight":       "22:00–02:00 UTC",
+    "Early Asian":    "02:00–06:00 UTC",
+    "Late Asian":     "06:00–10:00 UTC",
+    "London":         "10:00–13:00 UTC",
+    "Early New York": "13:00–18:00 UTC",
+    "Late New York":  "18:00–22:00 UTC",
+}
 
 # ── ML filter ────────────────────────────────────────────────────────
 MODEL_PATH        = "ml_model.pkl"
@@ -226,6 +235,9 @@ ml_lock = threading.Lock()
 ml_training_active = False
 ml_models_per_class: dict = {cls: None for cls in ML_SYMBOL_CLASSES}   # per-class models
 ml_trained_per_class: dict = {cls: 0   for cls in ML_SYMBOL_CLASSES}
+# Live in-memory ML confidence performance tracker (actual ML probability, not score proxy)
+# bucket → {wins, losses, pnl}  — reset only on restart, not on session reset
+_ml_conf_live_stats: dict = {}
 
 # Tick momentum ─────────────────────────────────────────────────────────
 tick_history: dict = {}  # sym → deque(maxlen=10) of intra-candle close prices
@@ -454,7 +466,7 @@ def _ml_export_csv(total: int):
         logger.info(f"ML CSV export sent ({len(rows)} rows)")
     except Exception as e:
         logger.error(f"ML CSV export failed: {e}")
-        _send_tg(f"⚠️ <b>ML CSV export failed</b>\n<code>{e}</code>")
+        _send_tg(f"⚠️ <b>ML CSV export failed</b>\n<code>{_html.escape(str(e))}</code>")
 
 
 def _ml_progress_bar(pct: float, width: int = 12) -> str:
@@ -474,7 +486,7 @@ def _ml_train():
             )
         except Exception as e:
             logger.error(f"ML training query failed: {e}")
-            _send_tg(f"🤖 <b>ML Training Error</b>\n<code>{e}</code>\nWill retry on next trade.")
+            _send_tg(f"🤖 <b>ML Training Error</b>\n<code>{_html.escape(str(e))}</code>\nWill retry on next trade.")
             return
 
         rows  = [r[1:] for r in rows_sym]   # drop symbol column for global model
@@ -545,7 +557,7 @@ def _ml_train():
             _ml_export_csv(total)
         except Exception as e:
             logger.error(f"ML training failed: {e}")
-            _send_tg(f"🤖 <b>ML RETRAINING FAILED</b>\n<code>{e}</code>")
+            _send_tg(f"🤖 <b>ML RETRAINING FAILED</b>\n<code>{_html.escape(str(e))}</code>")
     finally:
         with ml_lock:
             ml_training_active = False
@@ -667,38 +679,94 @@ def _ml_bootstrap_from_history():
         )
     except Exception as e:
         logger.error(f"ML bootstrap failed: {e}")
-        _send_tg(f"⚠️ ML bootstrap failed: <code>{e}</code>")
+        _send_tg(f"⚠️ ML bootstrap failed: <code>{_html.escape(str(e))}</code>")
+
+
+def _ml_conf_bucket(conf: float) -> str:
+    """Return the display bucket label for a raw ML probability 0.0–1.0."""
+    pct = conf * 100
+    if pct >= 95:   return "95-100"
+    if pct >= 90:   return "90-94"
+    if pct >= 85:   return "85-89"
+    if pct >= 75:   return "75-84"
+    return "<75"
 
 
 def _ml_confidence_perf_text() -> str:
-    """ML Confidence Performance — score buckets vs real P&L from DB."""
-    rows = get_ml_confidence_buckets()
+    """ML Confidence Performance — live in-memory ML probability buckets + DB score proxy."""
+    bucket_order = ["95-100", "90-94", "85-89", "75-84", "<75"]
+    bar_w = 8
+
+    # ── Section 1: Live ML confidence (actual model probability) ────────────
+    with ml_lock:
+        live_snap = {k: dict(v) for k, v in _ml_conf_live_stats.items()}
+
+    live_total = sum(v["wins"] + v["losses"] for v in live_snap.values())
     lines = [
         "🤖 <b>ML Confidence Performance</b>",
         "━━━━━━━━━━━━━━━━━━━━",
-        "<i>Score buckets (higher = stronger signal + higher ML confidence)</i>",
+        f"<b>Live Session  —  actual ML probability</b>  ({live_total} trades)",
+        "<i>Real confidence scores from the RandomForest model</i>",
         "",
     ]
-    bucket_order = ["95-100", "90-94", "85-89", "75-84", "<75"]
-    bucket_data  = {r[0]: r for r in rows} if rows else {}
 
+    any_live = False
     for bucket in bucket_order:
+        blabel = _html.escape(bucket)   # "<75" → "&lt;75" so Telegram HTML is valid
+        bst = live_snap.get(bucket)
+        if bst and (bst["wins"] + bst["losses"]) > 0:
+            cnt  = bst["wins"] + bst["losses"]
+            wr   = bst["wins"] / cnt * 100
+            sign = "+" if bst["pnl"] >= 0 else ""
+            bar_f = max(0, min(bar_w, int(wr / 100 * bar_w)))
+            bar   = "█" * bar_f + "░" * (bar_w - bar_f)
+            lines.append(
+                f"  <b>{blabel:>6}%</b>  {cnt:>3} trades  "
+                f"{bst['wins']}W/{bst['losses']}L  ({wr:.0f}%WR)  [{bar}]  "
+                f"<b>{sign}${bst['pnl']:.2f}</b>"
+            )
+            any_live = True
+        else:
+            lines.append(f"  <b>{blabel:>6}%</b>  — no trades yet —")
+
+    if not any_live:
+        lines.append("<i>No ML-gated trades this session yet. Takes effect after model trains.</i>")
+
+    # ── Section 2: DB lifetime — score proxy ─────────────────────────────────
+    rows = get_ml_confidence_buckets()
+    bucket_data = {r[0]: r for r in rows} if rows else {}
+    db_total = sum((r[1] or 0) for r in rows) if rows else 0
+
+    lines += [
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"<b>All-Time DB  —  signal score proxy</b>  ({db_total} trades)",
+        "<i>Higher score = stronger signal, correlates with ML confidence</i>",
+        "",
+    ]
+
+    any_db = False
+    for bucket in bucket_order:
+        blabel = _html.escape(bucket)   # safe for Telegram HTML
         r = bucket_data.get(bucket)
         if r:
             _, cnt, wins, pnl = r[0], r[1], r[2], r[3]
             wins = wins or 0; pnl = pnl or 0.0; cnt = cnt or 0
             wr   = wins / cnt * 100 if cnt else 0
             sign = "+" if pnl >= 0 else ""
-            bar_w = 8
             bar_f = max(0, min(bar_w, int(wr / 100 * bar_w)))
             bar   = "█" * bar_f + "░" * (bar_w - bar_f)
             lines.append(
-                f"<b>{bucket:>6}%</b>  ·  {cnt:>3} trades  "
-                f"{wins}W ({wr:.0f}%WR) [{bar}]  "
-                f"P&L: <b>{sign}${pnl:.2f}</b>"
+                f"  <b>{blabel:>6}%</b>  {cnt:>3} trades  "
+                f"{wins}W ({wr:.0f}%WR)  [{bar}]  "
+                f"<b>{sign}${pnl:.2f}</b>"
             )
+            any_db = True
         else:
-            lines.append(f"  {bucket:>6}%  ·  — no trades yet —")
+            lines.append(f"  <b>{blabel:>6}%</b>  — no trades yet —")
+
+    if not any_db:
+        lines.append("<i>No trades in DB yet. Data accumulates as the bot runs.</i>")
 
     # Current session totals for context
     with _lock:
@@ -706,10 +774,11 @@ def _ml_confidence_perf_text() -> str:
     tot = wc + lc
     wr_s = wc / tot * 100 if tot else 0
     lines += [
+        "",
         "━━━━━━━━━━━━━━━━━━━━",
         f"Session: {tot} trades  {wc}W/{lc}L  {wr_s:.0f}%WR  "
-        f"P&L: {'+' if pnl_s >= 0 else ''}${pnl_s:.2f}",
-        f"<i>Buckets based on signal score. ML gate: ≥{ML_CONFIDENCE_MIN*100:.0f}%  "
+        f"P&amp;L: {'+' if pnl_s >= 0 else ''}${pnl_s:.2f}",
+        f"<i>ML gate: ≥{ML_CONFIDENCE_MIN*100:.0f}%  "
         f"(2nd entry: ≥{SECOND_ENTRY_ML_MIN*100:.0f}%)</i>",
     ]
     return "\n".join(lines)
@@ -717,8 +786,7 @@ def _ml_confidence_perf_text() -> str:
 
 def _ml_progress_text() -> str:
     with ml_lock:
-        trained_on, model, training = ml_trained_on, ml_model, ml_training_active
-    total = ml_total_trades
+        trained_on, model, training, total = ml_trained_on, ml_model, ml_training_active, ml_total_trades
     bar_len = 10
     if training:
         bar = _ml_progress_bar(0.5, bar_len)
@@ -1826,28 +1894,42 @@ def _make_footer_text() -> str:
     )
 
 
-def _result_card(sym: str, profit: float, win: bool, details: dict) -> str:
-    with _lock:
-        wc, lc, pnl, cl = win_count, loss_count, total_pnl, consecutive_losses
-    total  = wc + lc
-    wr     = wc / total * 100 if total else 0
+def _result_card(sym: str, profit: float, win: bool, details: dict,
+                 _wc: int = None, _lc: int = None, _pnl: float = None, _cl: int = None) -> str:
+    """Build a trade-result Telegram card.
+    Pass _wc/_lc/_pnl/_cl snapshots captured *before* any session reset so the
+    card always shows the stats that include this trade.
+    """
+    if _wc is None:
+        with _lock:
+            _wc, _lc, _pnl, _cl = win_count, loss_count, total_pnl, consecutive_losses
+    total  = _wc + _lc
+    wr     = _wc / total * 100 if total else 0
     pnl_str = f"+${profit:.2f}" if profit > 0 else f"${profit:.2f}"
     conf    = details.get("ml_confidence")
     conf_line = f"🤖 ML Conf : <b>{_conf_str(conf)}</b>\n" if conf is not None else ""
+    mkt_sess = _get_session_name()
+    score    = details.get("total_score", 0)
+    direction = details.get("direction", "")
+    dir_icon  = "📈" if direction == "UP" else "📉"
 
     if win:
-        header = f"🎊 <b>Ibrahim congratulations 🎊</b>  <code>{sym}</code>"
+        header = f"🎊 <b>WIN!</b>  <code>{sym}</code>  {dir_icon} {direction}"
     else:
-        header = f"💀 <b>Lost bryme</b>  <code>{sym}</code>"
+        header = f"💀 <b>LOSS</b>  <code>{sym}</code>  {dir_icon} {direction}"
+
+    streak_str = ("🔴 " * min(_cl, 5)).strip() if _cl else "🟢 none"
 
     return (
         f"{header}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💵 <b>P&L     :</b> <b>{pnl_str}</b>\n"
-        f"📊 <b>Session :</b> {'+' if pnl >= 0 else ''}${pnl:.2f}  ({wc}W / {lc}L  {wr:.0f}%)\n"
-        f"🔴 <b>Streak  :</b> {'🔴' * cl if cl else '🟢 none'}\n"
-        f"🕐 Session : {SESSION_EMOJIS.get(_get_session_name(),'')} {_get_session_name()}\n"
+        f"💵 <b>Trade P&amp;L  :</b> <b>{pnl_str}</b>\n"
+        f"🎯 <b>Score      :</b> {score}/100\n"
         f"{conf_line}"
+        f"📊 <b>Session    :</b> {'+' if _pnl >= 0 else ''}${_pnl:.2f}  "
+        f"({_wc}W / {_lc}L  {wr:.0f}%WR)\n"
+        f"🔥 <b>Streak     :</b> {streak_str}\n"
+        f"🕐 <b>Session    :</b> {SESSION_EMOJIS.get(mkt_sess,'')} {mkt_sess}\n"
     )
 
 
@@ -2100,7 +2182,7 @@ def on_contract_update(ws, msg: dict, symbol: str):
     global total_pnl, win_count, loss_count, consecutive_losses, paused, pause_until
     global daily_trades, _auto_resume_active, peak_equity, max_drawdown, session_start
     global session_symbol_stats, daily_session_log, _daily_session_log_date
-    global market_session_stats, _market_session_date
+    global market_session_stats, _market_session_date, ml_total_trades
 
     contract = msg.get("proposal_open_contract", {})
     cid = contract.get("contract_id")
@@ -2204,6 +2286,12 @@ def on_contract_update(ws, msg: dict, symbol: str):
         cl        = consecutive_losses
         pnl_snap  = total_pnl
         dt_snap   = daily_trades
+        # ── Snapshot stats BEFORE any session reset so _result_card shows the
+        # correct cumulative figures that include this trade.
+        rc_wc  = win_count
+        rc_lc  = loss_count
+        rc_pnl = total_pnl
+        rc_cl  = consecutive_losses
 
         del active_contracts[cid]
 
@@ -2273,6 +2361,14 @@ def on_contract_update(ws, msg: dict, symbol: str):
     # The DB batch may not flush for ~2 s; this eliminates the display lag.
     with ml_lock:
         ml_total_trades += 1
+        # Update live ML confidence performance tracker (actual model probability, not score)
+        _conf_val = d.get("ml_confidence")
+        if _conf_val is not None:
+            _bkt = _ml_conf_bucket(_conf_val)
+            _bst = _ml_conf_live_stats.setdefault(_bkt, {"wins": 0, "losses": 0, "pnl": 0.0})
+            if win: _bst["wins"]   += 1
+            else:   _bst["losses"] += 1
+            _bst["pnl"] += profit
 
     # DB write — includes market_session
     db_queue.put((
@@ -2284,7 +2380,9 @@ def on_contract_update(ws, msg: dict, symbol: str):
         mkt_session,
     ))
 
-    _send_tg(_result_card(symbol, profit, win, d))
+    # Pass pre-reset stat snapshot so card always shows correct cumulative figures
+    _send_tg(_result_card(symbol, profit, win, d,
+                          _wc=rc_wc, _lc=rc_lc, _pnl=rc_pnl, _cl=rc_cl))
     _log(f"{'WIN' if win else 'LOSS'}  {symbol}  ${profit:+.2f}  total=${pnl_snap:+.2f}  "
          f"session={mkt_session}")
 
@@ -3068,11 +3166,35 @@ def _history_text():
 
 
 def _signals_text():
+    now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
     with _lock:
-        lines = list(signal_log)
-    if not lines:
-        return "📋 <b>No signals logged yet this session.</b>"
-    return "📋 <b>Recent Signal Log</b>\n━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines[:15])
+        raw_lines = list(signal_log)
+
+    out = [f"📋 <b>Signal Log</b>  [{now_str}]\n━━━━━━━━━━━━━━━━━━━━"]
+
+    if raw_lines:
+        # HTML-escape each line so '<' in rejection reasons doesn't break parse_mode=HTML
+        escaped = [_html.escape(ln) for ln in raw_lines[:15]]
+        out.append("<b>Live Session Activity</b>")
+        out += escaped
+    else:
+        out.append("<i>No signals in memory this session.</i>")
+
+    # Always append recent trades from DB for context
+    recent = get_recent_trades(8)
+    if recent:
+        out += ["", "━━━━━━━━━━━━━━━━━━━━", "<b>Recent Trades (DB)</b>"]
+        for ts, sym, direction, profit, win_flag, score in recent:
+            sign = "+" if profit > 0 else ""
+            icon = "🏆" if win_flag == 1 else ("💀" if win_flag == 0 else "⚪")
+            out.append(
+                f"{icon} {ts[11:16]}  <code>{sym:<7}</code> {direction} "
+                f"{sign}${profit:.2f}  score={score:.0f}"
+            )
+    else:
+        out += ["", "<i>No trades in DB yet.</i>"]
+
+    return "\n".join(out)
 
 
 def _funnel_report_lines(funnel: dict) -> list:
@@ -3224,7 +3346,7 @@ def _daily_history_text() -> str:
 
 
 def _market_sessions_text() -> str:
-    """Current-day per-market-session breakdown."""
+    """Current-day per-market-session breakdown with UTC time ranges."""
     _roll_market_session_stats_if_needed()
     now = datetime.now(timezone.utc)
     current = _get_session_name(now)
@@ -3234,17 +3356,24 @@ def _market_sessions_text() -> str:
     # All-time session stats from DB
     at_rows = {row[0]: row for row in get_session_alltime_stats()}
 
+    # Next session countdown
+    next_dt   = _next_session_start(now)
+    secs_left = max(0, int((next_dt - now).total_seconds()))
+    hh_l, rem = divmod(secs_left, 3600)
+    mm_l = rem // 60
+    next_in_str = f"{hh_l}h {mm_l}m" if hh_l else f"{mm_l}m"
+
     lines = [
         "🌏 <b>Market Session Performance</b>",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"Now: {SESSION_EMOJIS.get(current,'')} <b>{current}</b>  "
-        f"({now.strftime('%H:%M UTC')})",
+        f"Now  : {SESSION_EMOJIS.get(current,'')} <b>{current}</b>  "
+        f"({now.strftime('%H:%M UTC')})  <i>{SESSION_TIMES.get(current,'')}</i>",
+        f"Next : starts in <b>{next_in_str}</b>  ({next_dt.strftime('%H:%M UTC')})",
         "",
         "<b>Today (in-memory)</b>",
     ]
 
     # ── Sub-session breakdown (today) ──────────────────────────────────
-    # Group into broad sessions for readability
     broad_groups = {
         "Midnight":   ["Midnight"],
         "Asian":      ["Early Asian", "Late Asian"],
@@ -3252,11 +3381,10 @@ def _market_sessions_text() -> str:
         "New York":   ["Early New York", "Late New York"],
     }
     for broad, subs in broad_groups.items():
-        # Compute broad group totals
         btot_w = btot_l = btot_pnl = 0
         for sub in subs:
             s = ms_snap.get(sub, {"wins": 0, "losses": 0, "pnl": 0.0, "trades": 0})
-            btot_w   += s["wins"];  btot_l += s["losses"]; btot_pnl += s["pnl"]
+            btot_w += s["wins"]; btot_l += s["losses"]; btot_pnl += s["pnl"]
         btot  = btot_w + btot_l
         bwr   = btot_w / btot * 100 if btot else 0
         bsign = "+" if btot_pnl >= 0 else ""
@@ -3270,27 +3398,29 @@ def _market_sessions_text() -> str:
             tot = s["wins"] + s["losses"]
             wr  = s["wins"] / tot * 100 if tot else 0
             sign = "+" if s["pnl"] >= 0 else ""
-            tag  = " ◄ LIVE" if sub == current else ""
-            sub_em = SESSION_EMOJIS.get(sub, "")
+            live_tag  = " ◄ LIVE" if sub == current else ""
+            sub_em    = SESSION_EMOJIS.get(sub, "")
+            time_tag  = SESSION_TIMES.get(sub, "")
             lines.append(
-                f"  {sub_em} <b>{sub:<16}</b>{tag}\n"
+                f"  {sub_em} <b>{sub:<16}</b>  <i>{time_tag}</i>{live_tag}\n"
                 f"    {tot} trades  {s['wins']}W/{s['losses']}L ({wr:.0f}%WR)  "
-                f"P&L: <b>{sign}${s['pnl']:.2f}</b>"
+                f"P&amp;L: <b>{sign}${s['pnl']:.2f}</b>"
             )
 
-    lines += ["", "<b>All-Time (DB — broad sessions)</b>"]
+    lines += ["", "<b>All-Time (DB)</b>"]
     if at_rows:
-        for name in ["Midnight", "Asian", "London", "New York", "Early Asian", "Late Asian",
-                      "Early New York", "Late New York"]:
+        for name in ["Midnight", "Early Asian", "Late Asian",
+                     "London", "Early New York", "Late New York"]:
             row = at_rows.get(name)
             if row:
                 _, cnt, wins, pnl = row
                 wins = wins or 0; pnl = pnl or 0.0
                 wr   = wins / cnt * 100 if cnt else 0
                 sign = "+" if pnl >= 0 else ""
+                t_range = SESSION_TIMES.get(name, "")
                 lines.append(
-                    f"  {SESSION_EMOJIS.get(name,'')} {name:<18}  "
-                    f"{cnt} trades  {wins}W ({wr:.0f}%)  {sign}${pnl:.2f}"
+                    f"  {SESSION_EMOJIS.get(name,'')} {name:<18}  <i>{t_range}</i>\n"
+                    f"    {cnt} trades  {wins}W ({wr:.0f}%)  {sign}${pnl:.2f}"
                 )
     else:
         lines.append("  — no data in DB yet —")
@@ -5185,8 +5315,38 @@ def _start_telegram():
             # Signal readiness only after polling is confirmed up — any
             # thread calling _send_tg will now find a stable, open loop.
             _tg_ready.set()
-            while True:
-                await asyncio.sleep(3600)
+
+            # ── Graceful shutdown on SIGTERM / SIGINT ────────────────────────
+            # Without this, SIGTERM kills the process mid-poll; Telegram then
+            # holds the old getUpdates session open for ~60 s, causing the new
+            # instance to get 409 Conflict errors on every poll until it expires.
+            # Calling updater.stop() + app.stop() first sends a clean close so
+            # the new instance can start polling immediately after restart.
+            _shutdown_event = asyncio.Event()
+            loop = asyncio.get_event_loop()
+            for _sig in (signal.SIGTERM, signal.SIGINT):
+                try:
+                    loop.add_signal_handler(_sig, _shutdown_event.set)
+                except (NotImplementedError, OSError, ValueError):
+                    pass  # only works in the main thread; safe to skip
+
+            try:
+                await _shutdown_event.wait()
+            except asyncio.CancelledError:
+                pass  # loop closed externally (e.g. process killed)
+            finally:
+                # Always stop polling + workers before the async-with block
+                # exits so that PTB's app.shutdown() doesn't raise
+                # "This Application is still running!"
+                logger.info("Stopping Telegram polling cleanly…")
+                try:
+                    await app.updater.stop()
+                except Exception:
+                    pass
+                try:
+                    await app.stop()
+                except Exception:
+                    pass
 
     asyncio.run(_run())
 
@@ -5299,6 +5459,21 @@ def main():
 
     # Load existing ML model
     _ml_load()
+
+    # ── Sync ml_total_trades with the real DB row count so the "retrain in N"
+    # counter starts from the correct baseline instead of 0 after a restart.
+    # ml_trained_on is loaded from the pickle (e.g. 100) but ml_total_trades
+    # would otherwise be 0, making since=max(0,0-100)=0 → "retrain in 50".
+    global ml_total_trades  # must declare global here — we're in main(), not module scope
+    try:
+        _db_cnt_rows = _db_fetch("SELECT COUNT(*) FROM trades WHERE win IN (0,1)")
+        if _db_cnt_rows and _db_cnt_rows[0][0]:
+            with ml_lock:
+                ml_total_trades = max(ml_total_trades, int(_db_cnt_rows[0][0]))
+            logger.info(f"ml_total_trades initialised to {ml_total_trades} from DB "
+                        f"(ml_trained_on={ml_trained_on})")
+    except Exception as _e:
+        logger.warning(f"Failed to init ml_total_trades from DB: {_e}")
 
     # ── Start Telegram NOW — history is loaded so the loop is stable before
     # MLBootstrap (or any other thread) calls _send_tg.
