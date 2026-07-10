@@ -93,6 +93,12 @@ SUPERTREND_ATR_MULT    = 3.0
 SCORE_THRESHOLD        = 93           # minimum score to trade (raised from 80)
 HEARTBEAT_INTERVAL_SEC = 3600      # richer hourly heartbeat
 
+# ── Strategy version ────────────────────────────────────────────────────
+# Bump this any time DURATION / SCORE_THRESHOLD / ML_CONFIDENCE_MIN /
+# ATR_BARRIER_MULT (or the underlying strategy logic) changes, so reports
+# can be compared apples-to-apples across config revisions over time.
+STRATEGY_VERSION = "V2.5"
+
 # ── Market sessions (UTC hours) ───────────────────────────────────────
 # Maps session name → (start_hour_utc, end_hour_utc).
 # Midnight wraps across 00:00, handled in _get_session_name().
@@ -150,6 +156,7 @@ indicators_m15: dict = {}  # M15 Supertrend direction per symbol
 pending_signals, active_contracts = {}, {}
 locked_symbols: dict = {}
 unconfirmed_buys: dict = {}
+ws_registry: dict = {}   # symbol -> live WebSocketApp, used to re-query contracts before assuming a loss
 total_pnl = 0.0
 peak_equity = 0.0
 max_drawdown = 0.0
@@ -174,6 +181,10 @@ _market_session_date: str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 # Score sparklines ─────────────────────────────────────────────────────
 symbol_score_history: dict = {sym: deque(maxlen=20) for sym in SYMBOLS}
+
+# Signal funnel (scanned / executed / rejection reasons) — resets daily ──
+daily_funnel: dict = {"scanned": 0, "executed": 0, "rejections": {}}
+_funnel_date: str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 telegram_app = None
 _tg_loop = None
@@ -245,6 +256,46 @@ def _roll_market_session_stats_if_needed():
                 for name in MARKET_SESSIONS
             }
             _market_session_date = today
+
+
+def _roll_daily_funnel_if_needed_locked():
+    """Clear the signal funnel counters if UTC date has rolled over.
+    MUST be called while already holding _lock — the roll-check and the
+    counter mutation that follows must be one atomic critical section, or a
+    date rollover landing between them can wipe/misattribute an event."""
+    global daily_funnel, _funnel_date
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if today != _funnel_date:
+        daily_funnel = {"scanned": 0, "executed": 0, "rejections": {}}
+        _funnel_date = today
+
+
+def _record_scan():
+    """Count one signal that reached the entry-decision funnel (score + momentum confirmed)."""
+    with _lock:
+        _roll_daily_funnel_if_needed_locked()
+        daily_funnel["scanned"] += 1
+
+
+def _record_execution():
+    """Count one signal that actually got bought (passed all gates + broker confirmed)."""
+    with _lock:
+        _roll_daily_funnel_if_needed_locked()
+        daily_funnel["executed"] += 1
+
+
+def _record_funnel_rejection(reason_key: str):
+    """Count one signal rejected at the decision-funnel stage, bucketed by reason."""
+    with _lock:
+        _roll_daily_funnel_if_needed_locked()
+        daily_funnel["rejections"][reason_key] = daily_funnel["rejections"].get(reason_key, 0) + 1
+
+
+def _funnel_snapshot() -> dict:
+    with _lock:
+        _roll_daily_funnel_if_needed_locked()
+        return {"scanned": daily_funnel["scanned"], "executed": daily_funnel["executed"],
+                "rejections": dict(daily_funnel["rejections"])}
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -383,7 +434,8 @@ def _ml_train():
             conn = sqlite3.connect("trades.db")
             # Fetch with symbol so we can split by class
             rows_sym = conn.execute(
-                f"SELECT symbol, {', '.join(ML_FEATURE_COLS)}, win FROM trades"
+                f"SELECT symbol, {', '.join(ML_FEATURE_COLS)}, win FROM trades "
+                f"WHERE win IN (0, 1)"   # exclude VOID/unresolved contracts (win=-1)
             ).fetchall()
             conn.close()
         except Exception as e:
@@ -829,8 +881,10 @@ def get_recent_trades(limit=8):
 
 
 def get_db_summary():
+    # win=-1 rows are VOID/unresolved contracts (never confirmed win or loss) —
+    # excluded from the count so win-rate isn't diluted by unresolved trades.
     rows = _db_fetch(
-        "SELECT COUNT(*), SUM(profit), "
+        "SELECT SUM(CASE WHEN win IN (0,1) THEN 1 ELSE 0 END), SUM(profit), "
         "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), "
         "SUM(CASE WHEN win=0 THEN 1 ELSE 0 END) FROM trades"
     )
@@ -839,16 +893,19 @@ def get_db_summary():
 
 def get_alltime_symbol_stats(limit=10):
     return _db_fetch(
-        "SELECT symbol, COUNT(*), SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), SUM(profit) "
-        "FROM trades GROUP BY symbol ORDER BY SUM(profit) DESC LIMIT ?", (limit,)
+        "SELECT symbol, SUM(CASE WHEN win IN (0,1) THEN 1 ELSE 0 END), "
+        "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), SUM(profit) "
+        "FROM trades WHERE win IN (0,1) GROUP BY symbol ORDER BY SUM(profit) DESC LIMIT ?", (limit,)
     )
 
 
 def get_alltime_daily_stats(limit=7):
+    # win=-1 rows are VOID/unresolved contracts — excluded so day totals and
+    # win-rate aren't diluted by trades that never got a confirmed result.
     return _db_fetch(
-        "SELECT date(timestamp) as day, COUNT(*), "
+        "SELECT date(timestamp) as day, SUM(CASE WHEN win IN (0,1) THEN 1 ELSE 0 END), "
         "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), SUM(profit) "
-        "FROM trades GROUP BY day ORDER BY day DESC LIMIT ?", (limit,)
+        "FROM trades WHERE win IN (0,1) GROUP BY day ORDER BY day DESC LIMIT ?", (limit,)
     )
 
 
@@ -859,7 +916,7 @@ def get_7day_full_breakdown():
             "SELECT DATE(timestamp), market_session, COUNT(*), "
             "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), SUM(profit) "
             "FROM trades "
-            "WHERE DATE(timestamp) >= CURRENT_DATE - INTERVAL '7 days' "
+            "WHERE DATE(timestamp) >= CURRENT_DATE - INTERVAL '7 days' AND win IN (0,1) "
             "GROUP BY DATE(timestamp), market_session "
             "ORDER BY DATE(timestamp) DESC, SUM(profit) DESC"
         )
@@ -868,7 +925,7 @@ def get_7day_full_breakdown():
             "SELECT date(timestamp), market_session, COUNT(*), "
             "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), SUM(profit) "
             "FROM trades "
-            "WHERE date(timestamp) >= date('now', '-7 days') "
+            "WHERE date(timestamp) >= date('now', '-7 days') AND win IN (0,1) "
             "GROUP BY date(timestamp), market_session "
             "ORDER BY date(timestamp) DESC, SUM(profit) DESC"
         )
@@ -880,8 +937,119 @@ def get_session_alltime_stats():
     return _db_fetch(
         "SELECT market_session, COUNT(*), "
         "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), SUM(profit) "
-        "FROM trades WHERE market_session IS NOT NULL "
+        "FROM trades WHERE market_session IS NOT NULL AND win IN (0,1) "
         "GROUP BY market_session ORDER BY SUM(profit) DESC"
+    )
+
+
+def _compute_advanced_stats(rows) -> dict:
+    """
+    Shared analytics engine — takes an ordered list of (profit, win, symbol,
+    market_session) rows (oldest→newest) and derives profit-factor style
+    trading metrics that a single SQL aggregate can't express cleanly
+    (streaks, equity-curve-based drawdown/recovery factor, etc).
+    """
+    if not rows:
+        return None
+    profits = [float(r[0] or 0.0) for r in rows]
+    wins    = [int(r[1]) for r in rows]
+
+    gross_profit = sum(p for p in profits if p > 0)
+    gross_loss   = sum(p for p in profits if p < 0)   # negative number
+    net_pnl      = sum(profits)
+    total        = len(profits)
+    win_profits  = [p for p, w in zip(profits, wins) if w == 1]
+    loss_profits = [p for p, w in zip(profits, wins) if w == 0]
+    n_wins, n_losses = len(win_profits), len(loss_profits)
+
+    avg_win   = (sum(win_profits) / n_wins) if n_wins else 0.0
+    avg_loss  = (sum(loss_profits) / n_losses) if n_losses else 0.0
+    largest_win  = max(win_profits) if win_profits else 0.0
+    largest_loss = min(loss_profits) if loss_profits else 0.0
+    profit_factor = (gross_profit / abs(gross_loss)) if gross_loss != 0 else float("inf")
+    expectancy    = net_pnl / total if total else 0.0
+
+    # Equity curve → peak / max drawdown / recovery factor
+    equity = 0.0
+    peak   = 0.0
+    max_dd = 0.0
+    for p in profits:
+        equity += p
+        peak = max(peak, equity)
+        max_dd = max(max_dd, peak - equity)
+    recovery_factor = (net_pnl / max_dd) if max_dd > 0 else float("inf")
+
+    # Longest win / loss streaks
+    longest_win_streak = longest_loss_streak = cur_win = cur_loss = 0
+    for w in wins:
+        if w == 1:
+            cur_win += 1; cur_loss = 0
+            longest_win_streak = max(longest_win_streak, cur_win)
+        else:
+            cur_loss += 1; cur_win = 0
+            longest_loss_streak = max(longest_loss_streak, cur_loss)
+
+    # Best/worst symbol and market session (if present in the rows)
+    by_symbol: dict = {}
+    by_session: dict = {}
+    for r in rows:
+        profit = float(r[0] or 0.0)
+        if len(r) > 2 and r[2]:
+            by_symbol.setdefault(r[2], 0.0)
+            by_symbol[r[2]] += profit
+        if len(r) > 3 and r[3]:
+            by_session.setdefault(r[3], 0.0)
+            by_session[r[3]] += profit
+    best_symbol  = max(by_symbol, key=by_symbol.get) if by_symbol else None
+    worst_symbol = min(by_symbol, key=by_symbol.get) if by_symbol else None
+    best_session  = max(by_session, key=by_session.get) if by_session else None
+    worst_session = min(by_session, key=by_session.get) if by_session else None
+
+    return {
+        "total": total, "wins": n_wins, "losses": n_losses,
+        "net_pnl": net_pnl, "gross_profit": gross_profit, "gross_loss": gross_loss,
+        "avg_win": avg_win, "avg_loss": avg_loss,
+        "largest_win": largest_win, "largest_loss": largest_loss,
+        "profit_factor": profit_factor, "expectancy": expectancy,
+        "max_drawdown": max_dd, "peak_equity": peak, "recovery_factor": recovery_factor,
+        "longest_win_streak": longest_win_streak, "longest_loss_streak": longest_loss_streak,
+        "best_symbol": best_symbol, "worst_symbol": worst_symbol,
+        "best_symbol_pnl": by_symbol.get(best_symbol, 0.0) if best_symbol else 0.0,
+        "worst_symbol_pnl": by_symbol.get(worst_symbol, 0.0) if worst_symbol else 0.0,
+        "best_session": best_session, "worst_session": worst_session,
+        "best_session_pnl": by_session.get(best_session, 0.0) if best_session else 0.0,
+        "worst_session_pnl": by_session.get(worst_session, 0.0) if worst_session else 0.0,
+    }
+
+
+def get_alltime_advanced_stats() -> Optional[dict]:
+    """All-time trading metrics derived from every confirmed trade in the DB."""
+    rows = _db_fetch(
+        "SELECT profit, win, symbol, market_session FROM trades "
+        "WHERE win IN (0,1) ORDER BY id ASC"
+    )
+    return _compute_advanced_stats(rows)
+
+
+def get_today_advanced_stats() -> Optional[dict]:
+    """Today's (UTC) trading metrics derived from confirmed trades in the DB."""
+    if USE_PG:
+        sql = ("SELECT profit, win, symbol, market_session FROM trades "
+               "WHERE DATE(timestamp) = CURRENT_DATE AND win IN (0,1) ORDER BY id ASC")
+    else:
+        sql = ("SELECT profit, win, symbol, market_session FROM trades "
+               "WHERE date(timestamp) = date('now') AND win IN (0,1) ORDER BY id ASC")
+    rows = _db_fetch(sql)
+    return _compute_advanced_stats(rows)
+
+
+def _strategy_header() -> str:
+    """Config fingerprint shown at the top of every analytical report so
+    results can be compared apples-to-apples across strategy revisions."""
+    return (
+        f"🧬 <b>Strategy {STRATEGY_VERSION}</b>  ·  Expiry {DURATION}m  ·  "
+        f"Score ≥{SCORE_THRESHOLD}  ·  ML ≥{ML_CONFIDENCE_MIN*100:.0f}%  ·  "
+        f"Barrier {ATR_BARRIER_MULT}×ATR\n"
     )
 
 
@@ -1397,12 +1565,13 @@ def _process_closed_candle(symbol: str, closed: dict, ws) -> None:
 # ══════════════════════════════════════════════════════════════════════
 #  BARRIER HELPER
 # ══════════════════════════════════════════════════════════════════════
-def _compute_barrier(symbol: str, direction: str = "UP") -> str:
+def _compute_barrier(symbol: str, direction: str = "UP", barrier_mult: float = None) -> str:
+    mult = ATR_BARRIER_MULT if barrier_mult is None else barrier_mult
     with _lock:
         atr = (indicators.get(symbol) or {}).get("atr") or 0.0
     if atr <= 0:
         return "+0.20" if direction == "UP" else "-0.20"
-    offset = atr * ATR_BARRIER_MULT
+    offset = atr * mult
     sign   = "+" if direction == "UP" else "-"
     return f"{sign}{offset:.2f}"
 
@@ -1440,7 +1609,8 @@ def _send_tg_document(file_bytes: bytes, filename: str, caption: str = ""):
         try:
             await telegram_app.bot.send_document(
                 chat_id=TELEGRAM_CHAT_ID,
-                document=(filename, file_bytes),
+                document=file_bytes,
+                filename=filename,
                 caption=caption,
                 parse_mode="HTML",
             )
@@ -1684,9 +1854,11 @@ def _release_trade_slot(symbol: str):
 # ══════════════════════════════════════════════════════════════════════
 #  PROPOSAL / BUY
 # ══════════════════════════════════════════════════════════════════════
-def request_proposal(ws, symbol: str, details: dict, direction: str):
+def request_proposal(ws, symbol: str, details: dict, direction: str, barrier_mult: float = None):
     details["direction"]     = direction
     details["proposal_time"] = datetime.now(timezone.utc)
+    details.setdefault("barrier_retries", 0)
+    details["last_barrier_mult"] = barrier_mult if barrier_mult is not None else ATR_BARRIER_MULT
     with _lock:
         pending_signals[symbol] = details
     ws.send(json.dumps({
@@ -1698,7 +1870,7 @@ def request_proposal(ws, symbol: str, details: dict, direction: str):
         "duration": DURATION,
         "duration_unit": "m",
         "symbol": symbol,
-        "barrier": _compute_barrier(symbol, direction),
+        "barrier": _compute_barrier(symbol, direction, barrier_mult),
     }))
 
 
@@ -1721,19 +1893,54 @@ def on_proposal(ws, msg: dict, symbol: str):
     except (TypeError, ValueError):
         offered_profit = 0.0
 
+    MAX_BARRIER_RETRIES = 2
+
     if offered_profit < PROFIT_MIN or offered_profit > PROFIT_MAX:
-        # Payout outside band — cancel cleanly
+        with _lock:
+            details = pending_signals.get(symbol)
+        retries   = (details or {}).get("barrier_retries", 0)
+        cur_mult  = (details or {}).get("last_barrier_mult", ATR_BARRIER_MULT)
+        direction = (details or {}).get("direction", "UP")
+
+        if details is not None and retries < MAX_BARRIER_RETRIES:
+            # ── Adaptive retry: nudge the barrier toward the target band
+            # instead of giving up on the first miss. ONETOUCH payout rises
+            # as the barrier gets farther away (harder to touch) — so an
+            # over-shoot means "move barrier closer", an under-shoot means
+            # "move it farther". 20% step per retry, converges within 2 tries
+            # for most symbols/volatility regimes.
+            step     = 0.80 if offered_profit > PROFIT_MAX else 1.20
+            new_mult = max(0.05, round(cur_mult * step, 3))
+
+            with _lock:
+                pending_signals.pop(symbol, None)
+            _log(f"🔁 {symbol} proposal profit ${offered_profit:.2f} outside band — "
+                 f"retry {retries+1}/{MAX_BARRIER_RETRIES} with mult {cur_mult}→{new_mult}")
+            # Clear per-attempt fields — otherwise the proposal_id guard in
+            # on_proposal() would ignore the retry's response (it thinks a
+            # proposal was already accepted for this symbol), and the
+            # pending proposal would just time out and release the slot
+            # instead of actually retrying.
+            details.pop("proposal_id", None)
+            details.pop("buy_sent_at", None)
+            details["barrier_retries"] = retries + 1
+            request_proposal(ws, symbol, details, direction, barrier_mult=new_mult)
+            return
+
+        # Out of retries (or no details) — cancel cleanly
         with _lock:
             pending_signals.pop(symbol, None)
         _release_trade_slot(symbol)
+        _record_funnel_rejection("Payout outside target band")
         _send_tg(
             f"💸 <b>Payout rejected</b> — <code>{symbol}</code>\n"
             f"Offered profit: <b>${offered_profit:.2f}</b>  "
             f"(target ${PROFIT_MIN:.2f}–${PROFIT_MAX:.2f})\n"
-            f"Barrier too {'close' if offered_profit < PROFIT_MIN else 'far'} — skipping."
+            f"Barrier too {'close' if offered_profit < PROFIT_MIN else 'far'} after "
+            f"{MAX_BARRIER_RETRIES} adaptive retries — skipping."
         )
         _log(f"💸 {symbol} proposal rejected — profit ${offered_profit:.2f} outside "
-             f"[${PROFIT_MIN}–${PROFIT_MAX}]")
+             f"[${PROFIT_MIN}–${PROFIT_MAX}] after {MAX_BARRIER_RETRIES} retries")
         return
 
     ws.send(json.dumps({"buy": pid, "price": STAKE}))
@@ -1769,6 +1976,7 @@ def on_buy(ws, msg: dict, symbol: str):
             "details":     details,
             "settled":     False,
         }
+    _record_execution()
     ws.send(json.dumps({
         "proposal_open_contract": 1,
         "contract_id": int(cid),
@@ -1809,16 +2017,17 @@ def on_contract_update(ws, msg: dict, symbol: str):
         is_settled = (
             bool(contract.get("is_expired"))
             or bool(contract.get("is_sold"))
-            or status in ("won", "lost")
+            or status in ("won", "lost", "void")
         )
         if not is_settled:
             return
 
         info["settled"] = True
+        is_void = status == "void"
 
         # Extract profit robustly
         profit = float(contract.get("profit") or 0)
-        if profit == 0:
+        if not is_void and profit == 0:
             if status == "won":
                 profit = float(info.get("payout", STAKE) or STAKE) - float(info.get("stake", STAKE) or STAKE)
             elif status == "lost":
@@ -1827,6 +2036,23 @@ def on_contract_update(ws, msg: dict, symbol: str):
         win = profit > 0 or status == "won"
         d   = info.get("details", {})
         mkt_session = _get_session_name(info.get("entry_time"))
+
+        # ── VOID / unresolved contracts: never guessed as a win or a loss.
+        # Just remove from tracking and report — stats stay untouched.
+        if is_void:
+            with_active = cid in active_contracts
+            if with_active:
+                del active_contracts[cid]
+            db_queue.put((
+                datetime.now(timezone.utc).isoformat(), symbol, info["direction"],
+                info["barrier"], info["stake"], info["payout"], 0.0, -1,
+                d.get("total_score", 0), d.get("wick_atr_ratio", 0),
+                d.get("atr", 0), d.get("atr_ma", 0),
+                d.get("ema_fast_sl", 0), d.get("ema_slow_sl", 0), d.get("ema_distance", 0),
+                mkt_session,
+            ))
+            _log(f"VOID  {symbol}  contract {cid} unresolved — excluded from win/loss stats")
+            return
 
         # ── Session P&L counters ──────────────────────────────────────
         if win:
@@ -1903,6 +2129,8 @@ def on_contract_update(ws, msg: dict, symbol: str):
                 "worst_sym": _worst_s,
                 "worst_pnl": _traded[_worst_s]["pnl"] if _worst_s else 0.0,
                 "market_session": mkt_session,
+                "peak": peak_equity,
+                "max_dd": max_drawdown,
             })
             # Reset session counters
             total_pnl = 0.0; win_count = 0; loss_count = 0; daily_trades = 0
@@ -1983,37 +2211,87 @@ def on_contract_update(ws, msg: dict, symbol: str):
 #  STALE CONTRACT WATCHDOG
 # ══════════════════════════════════════════════════════════════════════
 def _stale_contract_watchdog():
-    """Force-settle contracts that are past expiry + 5 min grace (result-fix for lost trades)."""
+    """
+    Recover contracts whose real settlement message never arrived (missed
+    proposal_open_contract update — common when several contracts settle
+    around the same time and the per-symbol WS socket drops a message).
+
+    Two-stage recovery:
+      1. At expiry + 5 min grace: actively RE-QUERY the contract's real
+         status from Deriv (one-shot, non-subscribed request) instead of
+         guessing. If Deriv answers, the normal on_contract_update() path
+         settles it correctly (win or loss) — this is the fix for "wins
+         getting counted as losses" when multiple trades are open at once.
+      2. Only if the re-query itself gets no answer within an additional
+         grace window (contract truly unreachable / API issue) do we fall
+         back to a synthetic settlement, and we now record it as an
+         UNKNOWN/void result (profit 0, not auto-counted as a loss) so it
+         doesn't silently corrupt the win/loss stats — the user is told to
+         verify manually instead.
+    """
     while True:
         time.sleep(30)
         try:
             now = datetime.now(timezone.utc)
             grace = timedelta(minutes=DURATION + 5)
+            requery_grace = timedelta(minutes=DURATION + 10)
+
             with _lock:
-                stale = [
+                need_requery = [
                     (cid, dict(info))
                     for cid, info in active_contracts.items()
                     if not info.get("settled")
+                    and not info.get("requeried")
                     and (now - info.get("entry_time", now)) > grace
                 ]
-            for cid, info in stale:
+                still_stale = [
+                    (cid, dict(info))
+                    for cid, info in active_contracts.items()
+                    if not info.get("settled")
+                    and info.get("requeried")
+                    and (now - info.get("entry_time", now)) > requery_grace
+                ]
+
+            # Stage 1: ask Deriv for the real status before assuming anything
+            for cid, info in need_requery:
+                sym = info["symbol"]
+                ws  = ws_registry.get(sym)
+                if ws is None:
+                    logger.warning(f"⏰ {sym} contract {cid} stale but no live WS to re-query — will retry")
+                    continue
+                try:
+                    ws.send(json.dumps({
+                        "proposal_open_contract": 1,
+                        "contract_id": int(cid),
+                    }))
+                    logger.info(f"🔎 Re-queried stale contract {cid} ({sym}) for real result")
+                    # Only mark as requeried once the send actually succeeded —
+                    # otherwise leave it eligible for retry on the next tick
+                    # instead of silently aging into an assumed VOID.
+                    with _lock:
+                        if cid in active_contracts:
+                            active_contracts[cid]["requeried"] = True
+                except Exception as e:
+                    logger.warning(f"⏰ {sym} contract {cid} re-query send failed: {e} — will retry")
+
+            # Stage 2: still nothing after the re-query grace — mark as
+            # unresolved (void), never auto-guessed as a loss.
+            for cid, info in still_stale:
                 sym    = info["symbol"]
-                stake  = info.get("stake", STAKE)
-                profit = -float(stake)   # assume loss if no settlement received
-                logger.warning(f"⏰ Force-settling stale contract {cid} ({sym}) as LOSS")
+                logger.warning(f"⏰ Contract {cid} ({sym}) unresolved after re-query — marking VOID")
                 _send_tg(
-                    f"⚠️ <b>STALE CONTRACT SETTLED</b> – {sym}\n"
-                    f"Contract #{cid} had no result after {DURATION+5} min.\n"
-                    f"Recording as LOSS (${profit:.2f}).\n"
-                    f"<i>Check your Deriv account to verify.</i>"
+                    f"⚠️ <b>UNRESOLVED CONTRACT</b> – {sym}\n"
+                    f"Contract #{cid} had no result after {DURATION+10} min, "
+                    f"even after re-querying Deriv.\n"
+                    f"Recorded as VOID (not counted as win/loss).\n"
+                    f"<i>Check your Deriv account to confirm the real outcome.</i>"
                 )
-                # Inject a synthetic settlement message
                 synthetic_msg = {
                     "proposal_open_contract": {
                         "contract_id": cid,
                         "is_expired": True,
-                        "profit": profit,
-                        "status": "lost",
+                        "profit": 0,
+                        "status": "void",
                     }
                 }
                 on_contract_update(None, synthetic_msg, sym)
@@ -2106,6 +2384,7 @@ def fetch_history(symbol: str, hard_timeout: int = 60):
 #  LIVE WEBSOCKET
 # ══════════════════════════════════════════════════════════════════════
 def _on_open(ws, symbol: str):
+    ws_registry[symbol] = ws
     ws.send(json.dumps({"authorize": DERIV_APP_TOKEN}))
     threading.Timer(1.0, lambda: ws.send(json.dumps({
         "ticks_history": symbol, "subscribe": 1,
@@ -2229,6 +2508,8 @@ def _on_message(ws, message: str, symbol: str):
                             with _lock:
                                 locked_symbols.pop(symbol, None)
 
+                            _record_scan()
+
                             # ── M5 + M15 multi-timeframe gates ────────────────────
                             m5_ind    = indicators_m5.get(symbol, {})
                             m5_ready  = m5_ind.get("ready", False)
@@ -2239,17 +2520,20 @@ def _on_message(ws, message: str, symbol: str):
                             if (m5_ready and m5_dir != 0
                                     and ((direction == "UP" and m5_dir != 1)
                                          or (direction == "DOWN" and m5_dir != -1))):
+                                _record_funnel_rejection("M5 Supertrend disagreement")
                                 _send_rejection(symbol, direction, score,
                                                 f"M5 Supertrend disagrees "
                                                 f"({'↑' if m5_dir==1 else '↓'} on M5 vs {direction} on M1)")
                             elif (m15_ready and m15_dir != 0
                                     and ((direction == "UP" and m15_dir != 1)
                                          or (direction == "DOWN" and m15_dir != -1))):
+                                _record_funnel_rejection("M15 Supertrend disagreement")
                                 _send_rejection(symbol, direction, score,
                                                 f"M15 Supertrend disagrees "
                                                 f"({'↑' if m15_dir==1 else '↓'} on M15 vs {direction} on M1)")
                             elif not _ml_should_trade(details, symbol):
                                 conf = details.get("ml_confidence", 0)
+                                _record_funnel_rejection("ML confidence below gate")
                                 _send_rejection(symbol, direction, score,
                                                 f"ML confidence {conf*100:.1f}% < "
                                                 f"{ML_CONFIDENCE_MIN*100:.0f}% gate "
@@ -2261,6 +2545,7 @@ def _on_message(ws, message: str, symbol: str):
                                      f"conf={details.get('ml_confidence',1.0)*100:.0f}%  "
                                      f"class={_get_symbol_class(symbol)}")
                             else:
+                                _record_funnel_rejection("Risk gate closed (paused/cooldown/daily limit)")
                                 _send_rejection(symbol, direction, score,
                                                 "Risk gate closed (paused / cooldown / daily limit)")
 
@@ -2340,6 +2625,10 @@ def _ws_thread(symbol: str):
             ws_app.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as e:
             logger.error(f"{symbol} WS thread exception: {e}")
+        # Drop the stale socket so the watchdog doesn't try to send on a dead
+        # connection while we're reconnecting.
+        if ws_registry.get(symbol) is ws_app:
+            ws_registry.pop(symbol, None)
         _log(f"⚠  {symbol} disconnected. Reconnecting in 5s…")
         time.sleep(5)
 
@@ -2522,17 +2811,58 @@ def _alltime_text():
     ap    = ap or 0.0
     at_wr = aw / at * 100 if at else 0.0
     avg   = ap / at if at else 0.0
+    adv   = get_alltime_advanced_stats()
 
     lines = [
         "🏆 <b>ALL-TIME SCOREBOARD</b>",
         "━━━━━━━━━━━━━━━━━━━━",
+        _strategy_header(),
         f"💵 <b>Total P&L</b>  : {'+' if ap >= 0 else ''}${ap:.2f}",
         f"📊 <b>Trades</b>     : {at}  ({aw}W / {al}L)",
         f"🎯 <b>Win Rate</b>   : {at_wr:.1f}%",
         f"📈 <b>Avg/Trade</b>  : {'+' if avg >= 0 else ''}${avg:.2f}",
-        "",
-        "<b>By Symbol (all-time)</b>",
     ]
+
+    if adv:
+        pf_str = "∞" if adv["profit_factor"] == float("inf") else f"{adv['profit_factor']:.2f}"
+        rf_str = "∞" if adv["recovery_factor"] == float("inf") else f"{adv['recovery_factor']:.2f}"
+        lines += [
+            "",
+            "<b>Trade Quality</b>",
+            f"  Gross Profit    : +${adv['gross_profit']:.2f}",
+            f"  Gross Loss      : -${abs(adv['gross_loss']):.2f}",
+            f"  Profit Factor   : {pf_str}",
+            f"  Avg Win         : +${adv['avg_win']:.2f}",
+            f"  Avg Loss        : -${abs(adv['avg_loss']):.2f}",
+            f"  Largest Win     : +${adv['largest_win']:.2f}",
+            f"  Largest Loss    : -${abs(adv['largest_loss']):.2f}",
+            f"  Expectancy/Trade: {'+' if adv['expectancy']>=0 else ''}${adv['expectancy']:.2f}",
+            "",
+            "<b>Drawdown & Recovery</b>",
+            f"  Peak Equity     : ${adv['peak_equity']:.2f}",
+            f"  Max Drawdown    : -${adv['max_drawdown']:.2f}",
+            f"  Recovery Factor : {rf_str}",
+            "",
+            "<b>Streaks</b>",
+            f"  Longest Win  Streak: {adv['longest_win_streak']}",
+            f"  Longest Loss Streak: {adv['longest_loss_streak']}",
+        ]
+        if adv["best_symbol"]:
+            lines += [
+                "",
+                "<b>Best / Worst Symbol (all-time)</b>",
+                f"  🏅 {adv['best_symbol']}  {'+' if adv['best_symbol_pnl']>=0 else ''}${adv['best_symbol_pnl']:.2f}",
+                f"  💔 {adv['worst_symbol']}  {'+' if adv['worst_symbol_pnl']>=0 else ''}${adv['worst_symbol_pnl']:.2f}",
+            ]
+        if adv["best_session"]:
+            lines += [
+                "",
+                "<b>Best / Worst Market Session (all-time)</b>",
+                f"  🏅 {adv['best_session']}  {'+' if adv['best_session_pnl']>=0 else ''}${adv['best_session_pnl']:.2f}",
+                f"  💔 {adv['worst_session']}  {'+' if adv['worst_session_pnl']>=0 else ''}${adv['worst_session_pnl']:.2f}",
+            ]
+
+    lines += ["", "<b>By Symbol (all-time)</b>"]
     sym_rows = get_alltime_symbol_stats()
     if sym_rows:
         for sym, cnt, wins, pnl in sym_rows:
@@ -2567,8 +2897,9 @@ def _history_text():
     lines = ["📜 <b>Last 8 Trades</b>\n━━━━━━━━━━━━━━━━━━━━"]
     for ts, sym, direction, profit, win, score in rows:
         sign = "+" if profit > 0 else ""
+        icon = "🏆" if win == 1 else ("💀" if win == 0 else "⚪")
         lines.append(
-            f"{'🏆' if win else '💀'}  {ts[11:16]}  <code>{sym:<7}</code> {direction} "
+            f"{icon}  {ts[11:16]}  <code>{sym:<7}</code> {direction} "
             f"{sign}${profit:.2f}  score={score:.0f}"
         )
     return "\n".join(lines)
@@ -2582,6 +2913,25 @@ def _signals_text():
     return "📋 <b>Recent Signal Log</b>\n━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines[:15])
 
 
+def _funnel_report_lines(funnel: dict) -> list:
+    """Render the signal funnel (scanned/executed/rejected + top reasons)."""
+    scanned  = funnel["scanned"]
+    executed = funnel["executed"]
+    rejects  = funnel["rejections"]
+    total_rejected = sum(rejects.values())
+    lines = [
+        "<b>Signal Funnel (today)</b>",
+        f"  Scanned  : {scanned}",
+        f"  Executed : {executed}",
+        f"  Rejected : {total_rejected}",
+    ]
+    if rejects:
+        lines.append("  Top rejection reasons:")
+        for reason, cnt in sorted(rejects.items(), key=lambda kv: kv[1], reverse=True)[:5]:
+            lines.append(f"    • {reason}: {cnt}")
+    return lines
+
+
 def _daily_history_text() -> str:
     global daily_session_log, _daily_session_log_date
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -2591,12 +2941,17 @@ def _daily_history_text() -> str:
             _daily_session_log_date = today
         log = list(daily_session_log)
 
+    funnel = _funnel_snapshot()
+    funnel_lines = _funnel_report_lines(funnel)
+
     if not log:
         return (
             "📅 <b>Daily Session History</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+            + _strategy_header() +
             f"Date: {today}\n\n"
             "— No TP or SL hits yet today. —\n\n"
-            "<i>Each time the bot hits its daily TP or SL it resets and this record is updated.</i>"
+            + "\n".join(funnel_lines) +
+            "\n\n<i>Each time the bot hits its daily TP or SL it resets and this record is updated.</i>"
         )
 
     tp_hits = sum(1 for e in log if e["reason"] == "TP")
@@ -2607,16 +2962,66 @@ def _daily_history_text() -> str:
     total_day_losses = sum(e["losses"] for e in log)
     total_possible   = total_day_wins + total_day_losses
     day_wr = total_day_wins / total_possible * 100 if total_possible else 0
+    day_avg_trade  = total_day_pnl / total_day_trades if total_day_trades else 0.0
+    day_max_dd     = max((e.get("max_dd", 0.0) for e in log), default=0.0)
+    day_max_dd_sess = max(log, key=lambda e: e.get("max_dd", 0.0)) if log else None
+
+    # Include the still-running current session's live drawdown so "today"
+    # reflects the in-progress session too, not just closed TP/SL sessions.
+    with _lock:
+        live_pnl, live_peak, live_mdd = total_pnl, peak_equity, max_drawdown
+        live_trades, live_wins, live_losses = daily_trades, win_count, loss_count
+    day_max_dd = max(day_max_dd, live_mdd)
+
+    adv_today = get_today_advanced_stats()
 
     lines = [
         "📅 <b>Daily Session History</b>",
         "━━━━━━━━━━━━━━━━━━━━",
+        _strategy_header(),
         f"Date   : {today}",
         f"🎯 TP hits: <b>{tp_hits}</b>   🛑 SL hits: <b>{sl_hits}</b>",
-        f"Day P&L   : <b>{'+' if total_day_pnl >= 0 else ''}${total_day_pnl:.2f}</b>",
-        f"Day trades: {total_day_trades}  ({total_day_wins}W / {total_day_losses}L  {day_wr:.0f}%)",
-        "━━━━━━━━━━━━━━━━━━━━",
+        f"Day P&L    : <b>{'+' if total_day_pnl >= 0 else ''}${total_day_pnl:.2f}</b>",
+        f"Total Trades: {total_day_trades}",
+        f"Total Wins  : {total_day_wins}",
+        f"Total Losses: {total_day_losses}",
+        f"Win Rate    : {day_wr:.1f}%",
+        f"Avg/Trade   : {'+' if day_avg_trade >= 0 else ''}${day_avg_trade:.2f}",
+        f"📉 Max Drawdown: -${day_max_dd:.2f}"
+        + (f"  (in {day_max_dd_sess['market_session']} session)"
+           if day_max_dd_sess and day_max_dd == day_max_dd_sess.get("max_dd", 0.0) and day_max_dd > 0
+           else ("  (current session)" if day_max_dd > 0 and day_max_dd == live_mdd else "")),
     ]
+
+    if adv_today:
+        lines += [
+            "",
+            "<b>Today's Trade Quality (DB)</b>",
+            f"  Gross Profit : +${adv_today['gross_profit']:.2f}",
+            f"  Gross Loss   : -${abs(adv_today['gross_loss']):.2f}",
+            f"  Longest Win  Streak: {adv_today['longest_win_streak']}",
+            f"  Longest Loss Streak: {adv_today['longest_loss_streak']}",
+        ]
+        if adv_today["best_symbol"]:
+            lines.append(
+                f"  🏅 Best Symbol : {adv_today['best_symbol']}  "
+                f"{'+' if adv_today['best_symbol_pnl']>=0 else ''}${adv_today['best_symbol_pnl']:.2f}"
+            )
+            lines.append(
+                f"  💔 Worst Symbol: {adv_today['worst_symbol']}  "
+                f"{'+' if adv_today['worst_symbol_pnl']>=0 else ''}${adv_today['worst_symbol_pnl']:.2f}"
+            )
+        if adv_today["best_session"]:
+            lines.append(
+                f"  🏅 Best Session : {adv_today['best_session']}  "
+                f"{'+' if adv_today['best_session_pnl']>=0 else ''}${adv_today['best_session_pnl']:.2f}"
+            )
+            lines.append(
+                f"  💔 Worst Session: {adv_today['worst_session']}  "
+                f"{'+' if adv_today['worst_session_pnl']>=0 else ''}${adv_today['worst_session_pnl']:.2f}"
+            )
+
+    lines += ["", *funnel_lines, "━━━━━━━━━━━━━━━━━━━━"]
 
     for i, e in enumerate(log, 1):
         icon  = "🎯" if e["reason"] == "TP" else "🛑"
@@ -2624,11 +3029,13 @@ def _daily_history_text() -> str:
         h, mr = divmod(e["duration_min"], 60)
         dur_str  = f"{h}h {mr}m" if h else f"{mr}m"
         ms_name  = e.get("market_session", "—")
+        e_wr  = e["wins"] / (e["wins"] + e["losses"]) * 100 if (e["wins"] + e["losses"]) else 0
         entry = (
             f"{icon} <b>Session {i}</b>  [{e['time']}]  {dur_str}  "
             f"{SESSION_EMOJIS.get(ms_name,'')} {ms_name}\n"
             f"   P&L: <b>{sign}${e['pnl']:.2f}</b>  ·  "
-            f"Trades: {e['trades']} ({e['wins']}W/{e['losses']}L)"
+            f"Trades: {e['trades']} ({e['wins']}W/{e['losses']}L  {e_wr:.0f}%WR)\n"
+            f"   Peak: ${e.get('peak', 0.0):.2f}  ·  Max DD: -${e.get('max_dd', 0.0):.2f}"
         )
         if e["best_sym"]:
             b_sign = "+" if e["best_pnl"] >= 0 else ""
@@ -2638,6 +3045,17 @@ def _daily_history_text() -> str:
                 f"· 💔 {e['worst_sym']} {w_sign}${e['worst_pnl']:.2f}"
             )
         lines.append(entry)
+        lines.append("")   # blank separator so back-to-back sessions don't run together
+
+    if live_trades or live_wins or live_losses:
+        live_wr = live_wins / (live_wins + live_losses) * 100 if (live_wins + live_losses) else 0
+        lines.append(
+            f"▶ <b>Current session (still running)</b>\n"
+            f"   P&L: <b>{'+' if live_pnl >= 0 else ''}${live_pnl:.2f}</b>  ·  "
+            f"Trades: {live_trades} ({live_wins}W/{live_losses}L  {live_wr:.0f}%WR)\n"
+            f"   Peak: ${live_peak:.2f}  ·  Max DD: -${live_mdd:.2f}"
+        )
+        lines.append("")
 
     lines += ["━━━━━━━━━━━━━━━━━━━━", f"<i>Resets at midnight UTC. Today: {today}</i>"]
     return "\n".join(lines)
@@ -2969,36 +3387,55 @@ def _run_test_trade(symbol: str):
             f"Barrier  : {_compute_barrier(symbol, direction)}  (ATR×{ATR_BARRIER_MULT})\n"
             f"<i>Step 2/4 – Requesting proposal…</i>"
         )
-        ws.send(json.dumps({
-            "proposal": 1, "amount": STAKE, "basis": "stake",
-            "contract_type": CONTRACT_TYPE, "currency": "USD",
-            "duration": DURATION, "duration_unit": "m",
-            "symbol": symbol,
-            "barrier": _compute_barrier(symbol, direction),
-        }))
-        prop_msg = recv_typed("proposal", timeout=10)
-        if not prop_msg or "error" in prop_msg:
-            err = (prop_msg or {}).get("error", {}).get("message", "timeout")
-            tg(f"🧪 <b>Test Trade FAILED</b>\n❌ Proposal error: <code>{err}</code>")
-            return
-        prop    = prop_msg["proposal"]
-        pid     = prop["id"]
-        ask     = prop.get("ask_price", STAKE)
-        payout  = prop.get("payout", 0)
-        try:
-            offered_profit = round(float(payout) - STAKE, 4)
-        except (TypeError, ValueError):
-            offered_profit = 0.0
+        # ── Payout gate with adaptive barrier retry (same rule as live
+        # trading) — nudge the barrier toward the target band instead of
+        # giving up on the first miss. ─────────────────────────────────
+        MAX_BARRIER_RETRIES = 2
+        cur_mult = ATR_BARRIER_MULT
+        for attempt in range(MAX_BARRIER_RETRIES + 1):
+            ws.send(json.dumps({
+                "proposal": 1, "amount": STAKE, "basis": "stake",
+                "contract_type": CONTRACT_TYPE, "currency": "USD",
+                "duration": DURATION, "duration_unit": "m",
+                "symbol": symbol,
+                "barrier": _compute_barrier(symbol, direction, cur_mult),
+            }))
+            prop_msg = recv_typed("proposal", timeout=10)
+            if not prop_msg or "error" in prop_msg:
+                err = (prop_msg or {}).get("error", {}).get("message", "timeout")
+                tg(f"🧪 <b>Test Trade FAILED</b>\n❌ Proposal error: <code>{err}</code>")
+                return
+            prop    = prop_msg["proposal"]
+            pid     = prop["id"]
+            ask     = prop.get("ask_price", STAKE)
+            payout  = prop.get("payout", 0)
+            try:
+                offered_profit = round(float(payout) - STAKE, 4)
+            except (TypeError, ValueError):
+                offered_profit = 0.0
 
-        # ── Payout gate (same rule as live trading) ───────────────────
-        if offered_profit < PROFIT_MIN or offered_profit > PROFIT_MAX:
+            if PROFIT_MIN <= offered_profit <= PROFIT_MAX:
+                break  # in band — proceed to buy
+
+            if attempt < MAX_BARRIER_RETRIES:
+                step     = 0.80 if offered_profit > PROFIT_MAX else 1.20
+                new_mult = max(0.05, round(cur_mult * step, 3))
+                tg(
+                    f"🔁 <b>Test Trade</b> – payout ${offered_profit:.2f} outside band, "
+                    f"retrying {attempt+1}/{MAX_BARRIER_RETRIES} "
+                    f"(barrier mult {cur_mult}→{new_mult})…"
+                )
+                cur_mult = new_mult
+                continue
+
             tg(
                 f"🧪 <b>Test Trade</b>  –  💸 Payout rejected\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"Offered payout : ${payout}  (profit ${offered_profit:.2f})\n"
                 f"Target band    : ${PROFIT_MIN:.2f} – ${PROFIT_MAX:.2f}\n"
                 f"Barrier too {'close (easy touch → low payout)' if offered_profit < PROFIT_MIN else 'far (hard touch → high payout)'}.\n"
-                f"<i>Tune ATR_BARRIER_MULT ({ATR_BARRIER_MULT}) to move into band.</i>"
+                f"<i>Still outside band after {MAX_BARRIER_RETRIES} adaptive retries "
+                f"(last mult {cur_mult}).</i>"
             )
             return
 
@@ -3159,7 +3596,8 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         csv_bytes = buf.getvalue().encode("utf-8")
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
         await update.message.reply_document(
-            document=(f"trades_{ts}.csv", csv_bytes),
+            document=csv_bytes,
+            filename=f"trades_{ts}.csv",
             caption=f"📊 <b>Trades Export</b> — {len(rows)} trades",
             parse_mode="HTML",
         )
