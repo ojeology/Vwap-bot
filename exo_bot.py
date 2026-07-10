@@ -6,7 +6,7 @@
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
-import json, time, sqlite3, threading, queue, logging, asyncio, os, sys, pickle, io, csv as _csv, html as _html, signal
+import json, time, sqlite3, threading, queue, logging, asyncio, os, sys, pickle, io, csv as _csv, html as _html
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from collections import deque
@@ -466,7 +466,7 @@ def _ml_export_csv(total: int):
         logger.info(f"ML CSV export sent ({len(rows)} rows)")
     except Exception as e:
         logger.error(f"ML CSV export failed: {e}")
-        _send_tg(f"⚠️ <b>ML CSV export failed</b>\n<code>{_html.escape(str(e))}</code>")
+        _send_tg(f"⚠️ <b>ML CSV export failed</b>\n<code>{e}</code>")
 
 
 def _ml_progress_bar(pct: float, width: int = 12) -> str:
@@ -486,7 +486,7 @@ def _ml_train():
             )
         except Exception as e:
             logger.error(f"ML training query failed: {e}")
-            _send_tg(f"🤖 <b>ML Training Error</b>\n<code>{_html.escape(str(e))}</code>\nWill retry on next trade.")
+            _send_tg(f"🤖 <b>ML Training Error</b>\n<code>{e}</code>\nWill retry on next trade.")
             return
 
         rows  = [r[1:] for r in rows_sym]   # drop symbol column for global model
@@ -557,7 +557,7 @@ def _ml_train():
             _ml_export_csv(total)
         except Exception as e:
             logger.error(f"ML training failed: {e}")
-            _send_tg(f"🤖 <b>ML RETRAINING FAILED</b>\n<code>{_html.escape(str(e))}</code>")
+            _send_tg(f"🤖 <b>ML RETRAINING FAILED</b>\n<code>{e}</code>")
     finally:
         with ml_lock:
             ml_training_active = False
@@ -679,7 +679,7 @@ def _ml_bootstrap_from_history():
         )
     except Exception as e:
         logger.error(f"ML bootstrap failed: {e}")
-        _send_tg(f"⚠️ ML bootstrap failed: <code>{_html.escape(str(e))}</code>")
+        _send_tg(f"⚠️ ML bootstrap failed: <code>{e}</code>")
 
 
 def _ml_conf_bucket(conf: float) -> str:
@@ -5315,38 +5315,8 @@ def _start_telegram():
             # Signal readiness only after polling is confirmed up — any
             # thread calling _send_tg will now find a stable, open loop.
             _tg_ready.set()
-
-            # ── Graceful shutdown on SIGTERM / SIGINT ────────────────────────
-            # Without this, SIGTERM kills the process mid-poll; Telegram then
-            # holds the old getUpdates session open for ~60 s, causing the new
-            # instance to get 409 Conflict errors on every poll until it expires.
-            # Calling updater.stop() + app.stop() first sends a clean close so
-            # the new instance can start polling immediately after restart.
-            _shutdown_event = asyncio.Event()
-            loop = asyncio.get_event_loop()
-            for _sig in (signal.SIGTERM, signal.SIGINT):
-                try:
-                    loop.add_signal_handler(_sig, _shutdown_event.set)
-                except (NotImplementedError, OSError, ValueError):
-                    pass  # only works in the main thread; safe to skip
-
-            try:
-                await _shutdown_event.wait()
-            except asyncio.CancelledError:
-                pass  # loop closed externally (e.g. process killed)
-            finally:
-                # Always stop polling + workers before the async-with block
-                # exits so that PTB's app.shutdown() doesn't raise
-                # "This Application is still running!"
-                logger.info("Stopping Telegram polling cleanly…")
-                try:
-                    await app.updater.stop()
-                except Exception:
-                    pass
-                try:
-                    await app.stop()
-                except Exception:
-                    pass
+            while True:
+                await asyncio.sleep(3600)
 
     asyncio.run(_run())
 
