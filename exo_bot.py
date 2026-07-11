@@ -239,6 +239,11 @@ ml_trained_per_class: dict = {cls: 0   for cls in ML_SYMBOL_CLASSES}
 # bucket → {wins, losses, pnl}  — reset only on restart, not on session reset
 _ml_conf_live_stats: dict = {}
 
+# Live in-memory signal score performance tracker (the raw score gate used to trigger)
+# Same bucket shape as above. Lets us see whether score bands (75-84, 85-89, etc.)
+# translate into real P&L independent of the ML confidence value.
+_ml_score_live_stats: dict = {}
+
 # Tick momentum ─────────────────────────────────────────────────────────
 tick_history: dict = {}  # sym → deque(maxlen=10) of intra-candle close prices
 
@@ -513,13 +518,28 @@ def _ml_train():
             _send_tg("🤖 <b>ML RETRAINING</b> — skipped\nNeed both wins AND losses in history.")
             return
 
+        # ── Adaptive sample weights: newer trades matter more ───────────────
+        # Exponential decay: row 0 is oldest, row -1 is newest. Half-life = 100 trades.
+        half_life = 100.0
+        weights = np.exp(np.linspace(-total / half_life, 0.0, total))
+
         try:
-            # ── Global model (all symbols) ─────────────────────────────────
-            clf = RandomForestClassifier(n_estimators=150, max_depth=6, random_state=42)
-            clf.fit(X, y)
+            # ── Global model (all symbols) with class balancing + recency weights ─
+            clf = RandomForestClassifier(
+                n_estimators=150, max_depth=6, random_state=42,
+                class_weight="balanced", n_jobs=1,
+            )
+            clf.fit(X, y, sample_weight=weights)
             with ml_lock:
                 ml_model = clf
                 ml_trained_on = total
+
+            # Feature importance from global model
+            imp = sorted(
+                zip(ML_FEATURE_COLS, clf.feature_importances_),
+                key=lambda x: x[1], reverse=True,
+            )
+            imp_line = "  ".join([f"{n} {v*100:.0f}%" for n, v in imp[:3]])
 
             # ── Per-class models ───────────────────────────────────────────
             new_cls_models   = {}
@@ -536,12 +556,17 @@ def _ml_train():
                 if len(set(yc)) < 2:
                     cls_lines.append(f"  {cls}: need both outcomes — skipped")
                     continue
-                clf_c = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
-                clf_c.fit(Xc, yc)
+                n_c = len(cls_rows)
+                w_c = np.exp(np.linspace(-n_c / half_life, 0.0, n_c))
+                clf_c = RandomForestClassifier(
+                    n_estimators=100, max_depth=5, random_state=42,
+                    class_weight="balanced", n_jobs=1,
+                )
+                clf_c.fit(Xc, yc, sample_weight=w_c)
                 new_cls_models[cls]  = clf_c
-                new_cls_trained[cls] = len(cls_rows)
-                wr_c = sum(yc) / len(yc) * 100
-                cls_lines.append(f"  {cls}: {len(cls_rows)} trades  {wr_c:.0f}%WR ✅")
+                new_cls_trained[cls] = n_c
+                wr_c = sum(yc) / n_c * 100
+                cls_lines.append(f"  {cls}: {n_c} trades  {wr_c:.0f}%WR ✅")
 
             with ml_lock:
                 ml_models_per_class.update(new_cls_models)
@@ -552,12 +577,14 @@ def _ml_train():
                 f"🤖 <b>ML RETRAINING COMPLETE</b> ✅\n"
                 f"<code>[{_ml_progress_bar(1.0)}] 100%</code>\n"
                 f"Global: <b>{total}</b> trades  |  Gate ≥<b>{ML_CONFIDENCE_MIN*100:.0f}%</b>\n"
+                f"Top features: {imp_line}\n"
                 f"Per-class:\n" + "\n".join(cls_lines)
             )
             _ml_export_csv(total)
         except Exception as e:
             logger.error(f"ML training failed: {e}")
             _send_tg(f"🤖 <b>ML RETRAINING FAILED</b>\n<code>{e}</code>")
+
     finally:
         with ml_lock:
             ml_training_active = False
@@ -580,6 +607,26 @@ def _ml_maybe_retrain(total_trades: int):
             ml_training_active = True
     if spawn:
         threading.Thread(target=_ml_train, daemon=True, name="MLTrain").start()
+
+
+def _ml_retrain_guard_loop():
+    """Independent guard that forces a retrain every ML_RETRAIN_EVERY trades.
+    Catches cases where the DB-writer path might be delayed or skipped."""
+    while True:
+        try:
+            time.sleep(60)
+            with ml_lock:
+                trained, total, training = ml_trained_on, ml_total_trades, ml_training_active
+            if training:
+                continue
+            if ml_model is None:
+                # Model not ready yet — let DB writer bootstrap it first
+                continue
+            if total - trained >= ML_RETRAIN_EVERY:
+                logger.info(f"ML retrain guard triggered: {total} trades, last trained on {trained}")
+                _ml_maybe_retrain(total)
+        except Exception as e:
+            logger.error(f"ML retrain guard error: {e}")
 
 
 def _ml_bootstrap_from_history():
@@ -692,62 +739,103 @@ def _ml_conf_bucket(conf: float) -> str:
     return "<75"
 
 
+def _ml_score_bucket(score: float) -> str:
+    """Return the display bucket label for a raw signal score 0.0–100.0."""
+    if score >= 95:   return "95-100"
+    if score >= 90:   return "90-94"
+    if score >= 85:   return "85-89"
+    if score >= 75:   return "75-84"
+    return "<75"
+
+
 def _ml_confidence_perf_text() -> str:
-    """ML Confidence Performance — live in-memory ML probability buckets + DB score proxy."""
+    """ML Confidence + Signal Score performance — live in-memory + DB lifetime."""
     bucket_order = ["95-100", "90-94", "85-89", "75-84", "<75"]
     bar_w = 8
 
+    def _render_section(title: str, subtitle: str, stats: dict, total: int) -> list:
+        out = [
+            f"<b>{title}</b>  ({total} trades)",
+            f"<i>{subtitle}</i>",
+            "",
+        ]
+        any_data = False
+        for bucket in bucket_order:
+            blabel = _html.escape(bucket)
+            bst = stats.get(bucket)
+            if bst and (bst["wins"] + bst["losses"]) > 0:
+                cnt  = bst["wins"] + bst["losses"]
+                wr   = bst["wins"] / cnt * 100
+                sign = "+" if bst["pnl"] >= 0 else ""
+                bar_f = max(0, min(bar_w, int(wr / 100 * bar_w)))
+                bar   = "█" * bar_f + "░" * (bar_w - bar_f)
+                out.append(
+                    f"  <b>{blabel:>6}%</b>  {cnt:>3} trades  "
+                    f"{bst['wins']}W/{bst['losses']}L  ({wr:.0f}%WR)  [{bar}]  "
+                    f"<b>{sign}${bst['pnl']:.2f}</b>"
+                )
+                any_data = True
+            else:
+                out.append(f"  <b>{blabel:>6}%</b>  — no trades yet —")
+        if not any_data:
+            out.append("<i>No data in this section yet.</i>")
+        return out
+
     # ── Section 1: Live ML confidence (actual model probability) ────────────
     with ml_lock:
-        live_snap = {k: dict(v) for k, v in _ml_conf_live_stats.items()}
+        conf_snap = {k: dict(v) for k, v in _ml_conf_live_stats.items()}
+    conf_total = sum(v["wins"] + v["losses"] for v in conf_snap.values())
 
-    live_total = sum(v["wins"] + v["losses"] for v in live_snap.values())
-    lines = [
-        "🤖 <b>ML Confidence Performance</b>",
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"<b>Live Session  —  actual ML probability</b>  ({live_total} trades)",
-        "<i>Real confidence scores from the RandomForest model</i>",
-        "",
-    ]
+    # ── Section 2: Live signal score (raw trigger score) ─────────────────────
+    with ml_lock:
+        score_snap = {k: dict(v) for k, v in _ml_score_live_stats.items()}
+    score_total = sum(v["wins"] + v["losses"] for v in score_snap.values())
 
-    any_live = False
-    for bucket in bucket_order:
-        blabel = _html.escape(bucket)   # "<75" → "&lt;75" so Telegram HTML is valid
-        bst = live_snap.get(bucket)
-        if bst and (bst["wins"] + bst["losses"]) > 0:
-            cnt  = bst["wins"] + bst["losses"]
-            wr   = bst["wins"] / cnt * 100
-            sign = "+" if bst["pnl"] >= 0 else ""
-            bar_f = max(0, min(bar_w, int(wr / 100 * bar_w)))
-            bar   = "█" * bar_f + "░" * (bar_w - bar_f)
-            lines.append(
-                f"  <b>{blabel:>6}%</b>  {cnt:>3} trades  "
-                f"{bst['wins']}W/{bst['losses']}L  ({wr:.0f}%WR)  [{bar}]  "
-                f"<b>{sign}${bst['pnl']:.2f}</b>"
-            )
-            any_live = True
-        else:
-            lines.append(f"  <b>{blabel:>6}%</b>  — no trades yet —")
+    # ── Section 3: Per-class model status ────────────────────────────────────
+    with ml_lock:
+        cls_status = {k: (v is not None) for k, v in ml_models_per_class.items()}
+        cls_trained = dict(ml_trained_per_class)
 
-    if not any_live:
-        lines.append("<i>No ML-gated trades this session yet. Takes effect after model trains.</i>")
+    cls_lines = []
+    for cls in ML_SYMBOL_CLASSES:
+        ready = "✅" if cls_status.get(cls) else "⏳"
+        cls_lines.append(f"  {ready} {cls:<14} {cls_trained.get(cls, 0)} trades")
 
-    # ── Section 2: DB lifetime — score proxy ─────────────────────────────────
+    # ── Section 4: DB lifetime — score proxy ─────────────────────────────────
     rows = get_ml_confidence_buckets()
     bucket_data = {r[0]: r for r in rows} if rows else {}
     db_total = sum((r[1] or 0) for r in rows) if rows else 0
 
+    lines = [
+        "🤖 <b>ML Confidence Performance</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+    lines += _render_section(
+        "Live Session — actual ML probability",
+        "Real confidence from RandomForest (per-class where available)",
+        conf_snap, conf_total,
+    )
+    lines += ["", "━━━━━━━━━━━━━━━━━━━━"]
+    lines += _render_section(
+        "Live Session — signal score",
+        "Raw score gate that triggered the trade (independent of ML)",
+        score_snap, score_total,
+    )
     lines += [
         "",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"<b>All-Time DB  —  signal score proxy</b>  ({db_total} trades)",
-        "<i>Higher score = stronger signal, correlates with ML confidence</i>",
+        "<b>Per-Class ML Models</b>",
+    ] + cls_lines + [
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"<b>All-Time DB — signal score proxy</b>  ({db_total} trades)",
+        "<i>Higher score = stronger signal; buckets mirror the score gate</i>",
         "",
     ]
 
     any_db = False
     for bucket in bucket_order:
-        blabel = _html.escape(bucket)   # safe for Telegram HTML
+        blabel = _html.escape(bucket)
         r = bucket_data.get(bucket)
         if r:
             _, cnt, wins, pnl = r[0], r[1], r[2], r[3]
@@ -766,7 +854,7 @@ def _ml_confidence_perf_text() -> str:
             lines.append(f"  <b>{blabel:>6}%</b>  — no trades yet —")
 
     if not any_db:
-        lines.append("<i>No trades in DB yet. Data accumulates as the bot runs.</i>")
+        lines.append("<i>No trades in DB yet.</i>")
 
     # Current session totals for context
     with _lock:
@@ -2369,6 +2457,14 @@ def on_contract_update(ws, msg: dict, symbol: str):
             if win: _bst["wins"]   += 1
             else:   _bst["losses"] += 1
             _bst["pnl"] += profit
+        # Update live signal-score tracker so we can see whether raw score bands
+        # (independent of ML confidence) actually make money.
+        _score_val = d.get("total_score", 0)
+        _sbkt = _ml_score_bucket(_score_val)
+        _sbst = _ml_score_live_stats.setdefault(_sbkt, {"wins": 0, "losses": 0, "pnl": 0.0})
+        if win: _sbst["wins"]   += 1
+        else:   _sbst["losses"] += 1
+        _sbst["pnl"] += profit
 
     # DB write — includes market_session
     db_queue.put((
@@ -2925,12 +3021,13 @@ def _main_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(pause_lbl,                    callback_data="toggle_pause"),
          InlineKeyboardButton("⏭ Skip a Symbol",           callback_data="skip_menu")],
         [InlineKeyboardButton("⚙ Settings & Config",       callback_data="settings"),
-         InlineKeyboardButton(_ml_conf_label(),             callback_data="ml_conf_toggle")],
+         InlineKeyboardButton("🧪 Fire Test Trade",         callback_data="test_menu")],
+        # ── Payout quick adjust ────────────────────────────────────────────
+        [InlineKeyboardButton("➖ Lower Payout",           callback_data="payout_down"),
+         InlineKeyboardButton("➕ Raise Payout",          callback_data="payout_up")],
         # ── Tools ────────────────────────────────────────────────────────
         [InlineKeyboardButton("🔄 Refresh Dashboard",       callback_data="refresh"),
-         InlineKeyboardButton("🧪 Fire Test Trade",         callback_data="test_menu")],
-        [InlineKeyboardButton("📦 Backup · Restore",        callback_data="backup"),
-         InlineKeyboardButton("📤 Export Trades CSV",       callback_data="export_csv_quick")],
+         InlineKeyboardButton("📦 Backup · Restore",        callback_data="backup")],
     ])
 
 
@@ -2979,25 +3076,49 @@ def _status_text():
         cds       = {s: t for s, t in cooldown_until.items() if t > now}
         is_paused = paused
         trades    = daily_trades
+        pnl       = total_pnl
+        wc, lc    = win_count, loss_count
+        cl        = consecutive_losses
+        peak      = peak_equity
+        mdd       = max_drawdown
     mkt_sess = _get_session_name(now)
+    tot      = wc + lc
+    wr       = wc / tot * 100 if tot else 0
+    cur_dd   = max(0.0, peak - pnl)
+    mdd_pct  = (mdd / peak * 100) if peak > 0 else 0.0
+    state_emoji = "⏸" if is_paused else "▶"
+
     lines = [
-        "📊 <b>BOT STATUS</b>\n━━━━━━━━━━━━━━━━━━━━",
-        f"State      : {'⏸ PAUSED' if is_paused else '▶ RUNNING'}",
-        f"Market Sess: {SESSION_EMOJIS.get(mkt_sess,'')} {mkt_sess}",
-        f"Active     : {len(contracts)} trade(s)",
-        f"Day trades : {trades}",
-        _ml_progress_text(),
+        f"📊 <b>DERIV SNIPER BOT — STATUS</b>  <i>{now.strftime('%H:%M:%S UTC')}</i>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"{state_emoji} State : <b>{'PAUSED' if is_paused else 'RUNNING'}</b>",
+        f"🌐 Time  : <b>Deriv Server Time (UTC)</b>",
+        f"🌍 Market : {SESSION_EMOJIS.get(mkt_sess,'')} <b>{mkt_sess}</b>",
+        "",
+        "<b>💰 P&amp;L — Current Session</b>",
+        f"  Total P&amp;L : <b>{'+' if pnl >= 0 else ''}${pnl:.2f}</b>",
+        f"  Trades    : {tot}  ({wc}W / {lc}L)  •  Win Rate : <b>{wr:.0f}%</b>",
+        f"  Drawdown  : ${cur_dd:.2f}  •  Max DD : ${mdd:.2f} ({mdd_pct:.1f}%)",
+        f"  Consec. Losses : {cl} / {MAX_CONSECUTIVE_LOSSES}",
+        "",
+        "<b>⚙ Engine</b>",
+        f"  Day trades : {trades}  •  Active : {len(contracts)}  •  Cooldowns : {len(cds)}",
+        f"  {_ml_progress_text()}",
         "",
         _best_worst_line(),
     ]
-    for cid, c in contracts.items():
-        exp  = c["entry_time"] + timedelta(minutes=DURATION)
-        left = max(0, int((exp - now).total_seconds()))
-        m, s = divmod(left, 60)
-        lines.append(f"  • {c['symbol']} #{cid} {c['direction']} {m:02d}:{s:02d} left")
-    lines.append(f"Cooldowns  : {len(cds)}")
-    for sym, t in cds.items():
-        lines.append(f"  • {sym} — {int((t - now).total_seconds() // 60)}m left")
+    if contracts:
+        lines.append("<b>🎯 Active Positions</b>")
+        for cid, c in contracts.items():
+            exp  = c["entry_time"] + timedelta(minutes=DURATION)
+            left = max(0, int((exp - now).total_seconds()))
+            m, s = divmod(left, 60)
+            lines.append(f"  • <code>{c['symbol']:<10}</code> #{cid} {c['direction']:<4} {m:02d}:{s:02d} left")
+    if cds:
+        lines.append("<b>🚫 Cooldowns</b>")
+        for sym, t in cds.items():
+            lines.append(f"  • <code>{sym:<10}</code> {int((t - now).total_seconds() // 60)}m left")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
     return "\n".join(lines)
 
 
@@ -4404,7 +4525,7 @@ async def _handle_adj_callback(q, d: str):
 
 
 async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global paused, pause_until, consecutive_losses
+    global paused, pause_until, consecutive_losses, PROFIT_MIN, PROFIT_MAX
     q = update.callback_query
     d = q.data
     logger.info(f"Button pressed: {d!r}")
@@ -4479,17 +4600,33 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 except Exception as exc:
                     await q.message.reply_text(f"❌ Export failed: <code>{exc}</code>", parse_mode="HTML")
             asyncio.ensure_future(_do_export_quick())
-        elif d == "ml_conf_toggle":
-            global ML_CONFIDENCE_MIN
-            ML_CONFIDENCE_MIN = 0.90 if ML_CONFIDENCE_MIN < 0.85 else 0.75
-            pct = int(ML_CONFIDENCE_MIN * 100)
+        elif d == "payout_up":
+            delta = 0.05
+            # Widen/raise the target band, but keep min ≤ max and within hard limits
+            new_min = round(min(0.85, PROFIT_MIN + delta), 2)
+            new_max = round(min(1.20, PROFIT_MAX + delta), 2)
+            new_min = min(new_min, new_max)
+            PROFIT_MIN, PROFIT_MAX = new_min, new_max
             await q.edit_message_text(
-                f"🤖 <b>ML Gate → {pct}%</b>\n"
-                f"Trades now require ≥{pct}% ML confidence.\n"
-                f"{'More selective — fewer but higher-quality trades.' if pct == 90 else 'More permissive — more trades, model still learning.'}",
+                f"💸 <b>Payout band raised</b>\n"
+                f"Target profit : <b>${PROFIT_MIN:.2f} – ${PROFIT_MAX:.2f}</b> per trade\n"
+                f"<i>Higher band = harder barriers, usually better payout.</i>",
                 reply_markup=_main_kb(), parse_mode="HTML",
             )
-            _log(f"🤖 ML_CONFIDENCE_MIN set to {pct}% via Telegram")
+            _log(f"💸 Payout band raised to ${PROFIT_MIN:.2f}–${PROFIT_MAX:.2f}")
+        elif d == "payout_down":
+            delta = 0.05
+            new_min = round(max(0.10, PROFIT_MIN - delta), 2)
+            new_max = round(max(0.50, PROFIT_MAX - delta), 2)
+            new_min = min(new_min, new_max)
+            PROFIT_MIN, PROFIT_MAX = new_min, new_max
+            await q.edit_message_text(
+                f"💸 <b>Payout band lowered</b>\n"
+                f"Target profit : <b>${PROFIT_MIN:.2f} – ${PROFIT_MAX:.2f}</b> per trade\n"
+                f"<i>Lower band = easier barriers, easier fills.</i>",
+                reply_markup=_main_kb(), parse_mode="HTML",
+            )
+            _log(f"💸 Payout band lowered to ${PROFIT_MIN:.2f}–${PROFIT_MAX:.2f}")
         elif d == "noop" or d == "settings_adj":
             await q.answer()   # acknowledge silently — spacer / no-op buttons
         elif d == "settings":
@@ -4673,19 +4810,27 @@ async def heartbeat_job(ctx: ContextTypes.DEFAULT_TYPE):
     if not hot_lines:
         hot_lines = "  — no data yet —\n"
 
+    # Compute next retrain based on real trade count (already capped at startup)
+    with ml_lock:
+        _hb_t, _hb_trn = ml_total_trades, ml_trained_on
+    _retrain_nxt = max(0, ML_RETRAIN_EVERY - max(0, _hb_t - _hb_trn))
+
     msg = (
-        f"❤️ <b>Hourly Heartbeat  –  {now.strftime('%H:%M UTC')}</b>\n"
+        f"❤️ <b>Hourly Heartbeat</b>  ·  {now.strftime('%H:%M UTC')}  ·  Deriv Server Time\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"State   : {'⏸ PAUSED' if is_paused else '▶ RUNNING'}\n"
-        f"Market  : {SESSION_EMOJIS.get(mkt_s,'')} {mkt_s}\n"
-        f"P&L     : <b>{'+' if pnl >= 0 else ''}${pnl:.2f}</b>\n"
-        f"Trades  : {total}  ({wc}W / {lc}L  {wr:.1f}%)\n"
-        f"Active  : {ac}  |  Streak: {'🔴×' + str(cl) if cl else '🟢 None'}\n"
-        f"Drawdown: -${cur_dd:.2f}  (max -${mdd:.2f})\n"
+        f"{'⏸ PAUSED' if is_paused else '▶ RUNNING'}  ·  "
+        f"{SESSION_EMOJIS.get(mkt_s,'')} {mkt_s}  ·  Active: {ac}\n"
+        "\n"
+        "<b>💰 Session P&amp;L</b>\n"
+        f"  {'+' if pnl >= 0 else ''}${pnl:.2f}  ({total} trades  {wc}W/{lc}L  {wr:.0f}%WR)\n"
+        f"  Drawdown: ${cur_dd:.2f}  ·  Max DD: ${mdd:.2f}\n"
+        f"  Streak: {'🔴×' + str(cl) if cl else '🟢 None'}\n"
+        "\n"
         f"{session_line}"
-        f"🤖 ML: {ml_line}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Top Symbols:</b>\n{hot_lines}"
+        "<b>🤖 ML Engine</b>\n"
+        f"  {ml_line}  ·  next retrain in {_retrain_nxt} trades\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>🔥 Top Symbols</b>\n{hot_lines}"
         f"{_best_worst_line()}"
     )
     _send_tg(msg, reply_markup=_main_kb())
@@ -5154,19 +5299,53 @@ def _pinned_dashboard_loop():
                         ml_m_ = ml_model; ml_t_ = ml_trained_on
                     ml_s = f"✅ trained on {ml_t_}" if ml_m_ else "⏳ warming up"
 
+                    # Rich one-glance summary
+                    db_sum = get_db_summary()
+                    at, ap, aw, al = db_sum if db_sum[0] else (0, 0, 0, 0)
+                    at_wr = aw / at * 100 if at else 0
+                    with _lock:
+                        active_n = len(active_contracts)
+                        dd       = max(0.0, peak_equity - pnl)
+                    next_dt   = _next_session_start(now)
+                    secs_left = max(0, int((next_dt - now).total_seconds()))
+                    hh_l, rem = divmod(secs_left, 3600)
+                    mm_l = rem // 60
+                    next_in = f"{hh_l}h {mm_l}m" if hh_l else f"{mm_l}m"
+
+                    # ── Build a professional, information-dense dashboard ───────────────
+                    # Average win/loss and profit factor from the in-memory session
+                    with _lock:
+                        wc_l, lc_l = win_count, loss_count
+                    tot_l = wc_l + lc_l
+                    wr_l  = wc_l / tot_l * 100 if tot_l else 0
+                    # Next ML retrain count (already capped at real DB count on startup)
+                    with ml_lock:
+                        _t_now, _trn = ml_total_trades, ml_trained_on
+                    _retrain_nxt = max(0, ML_RETRAIN_EVERY - max(0, _t_now - _trn))
+
                     text = (
-                        f"📌 <b>LIVE DASHBOARD</b>  ·  {now.strftime('%H:%M UTC')}\n"
+                        f"📌 <b>LIVE DASHBOARD</b>  ·  Deriv Server Time  <b>{now.strftime('%H:%M:%S UTC')}</b>\n"
                         f"{'⏸ PAUSED' if is_paused_ else '▶ RUNNING'}  ·  "
-                        f"{SESSION_EMOJIS.get(mkt_s,'')} {mkt_s}\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"💵 P&L  : <b>{'+' if pnl >= 0 else ''}${pnl:.2f}</b>  "
-                        f"({tot} trades  {wc_}W/{lc_}L  {wr:.0f}%)\n"
-                        f"🤖 ML   : {ml_s}\n"
-                        f"🎯 Gate : score≥{SCORE_THRESHOLD}  |  ML≥{ML_CONFIDENCE_MIN*100:.0f}%  "
-                        f"|  ATR×{ATR_BARRIER_MULT}\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"<b>🔥 Hot Signals:</b>\n{hot}"
-                        f"<i>↻ updates every 5 min</i>"
+                        f"{SESSION_EMOJIS.get(mkt_s,'')} <b>{mkt_s}</b>  ·  "
+                        f"Active: <b>{active_n}</b>  ·  Day: <b>{daily_trades}</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        "<b>💰 Current Session</b>\n"
+                        f"  P&amp;L        : <b>{'+' if pnl >= 0 else ''}${pnl:.2f}</b>\n"
+                        f"  Trades     : {tot_l}  ({wc_l}W / {lc_l}L)  ·  WR <b>{wr_l:.0f}%</b>\n"
+                        f"  Drawdown   : ${dd:.2f}  ·  Max DD ${max(0.0, mdd):.2f}\n"
+                        "\n"
+                        "<b>🏦 All-Time Database</b>\n"
+                        f"  {at} trades  {aw}W/{at-aw}L  ({at_wr:.0f}%WR)  "
+                        f"P&amp;L {'+' if ap >= 0 else ''}${ap:.2f}\n"
+                        "\n"
+                        "<b>⚙ Engine</b>\n"
+                        f"  ML    : {ml_s}  ·  retrain in <b>{_retrain_nxt}</b> trades\n"
+                        f"  Gate  : score≥{SCORE_THRESHOLD}  ·  ML≥{ML_CONFIDENCE_MIN*100:.0f}%\n"
+                        f"  Payout: ${PROFIT_MIN:.2f}–${PROFIT_MAX:.2f}  ·  ATR×{ATR_BARRIER_MULT}\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        f"<b>🔥 Hot Signals</b>\n{hot}"
+                        f"🕐 Next session: <b>{next_dt.strftime('%H:%M UTC')}</b> in {next_in} · "
+                        f"<i>↻ every 5 min</i>"
                     )
 
                     async def _pin_msg(msg_id):
@@ -5434,14 +5613,22 @@ def main():
     # counter starts from the correct baseline instead of 0 after a restart.
     # ml_trained_on is loaded from the pickle (e.g. 100) but ml_total_trades
     # would otherwise be 0, making since=max(0,0-100)=0 → "retrain in 50".
-    global ml_total_trades  # must declare global here — we're in main(), not module scope
+    # Also cap ml_trained_on to the real DB count: bootstrap models are trained
+    # on historical candle simulations, which is a much larger number than real
+    # trades. Without this cap the counter can stay stuck at 50 forever.
+    global ml_total_trades, ml_trained_on  # must declare global here — in main(), not module scope
     try:
         _db_cnt_rows = _db_fetch("SELECT COUNT(*) FROM trades WHERE win IN (0,1)")
-        if _db_cnt_rows and _db_cnt_rows[0][0]:
-            with ml_lock:
-                ml_total_trades = max(ml_total_trades, int(_db_cnt_rows[0][0]))
-            logger.info(f"ml_total_trades initialised to {ml_total_trades} from DB "
-                        f"(ml_trained_on={ml_trained_on})")
+        _db_count = int(_db_cnt_rows[0][0]) if _db_cnt_rows and _db_cnt_rows[0][0] else 0
+        with ml_lock:
+            ml_total_trades = max(ml_total_trades, _db_count)
+            # If the pickle came from a bootstrap model, trained_on can be huge.
+            # Pull it back to the real trade count so the counter counts real trades.
+            if ml_trained_on > ml_total_trades:
+                ml_trained_on = ml_total_trades
+                logger.info(f"Capped ml_trained_on to real DB count {ml_total_trades}")
+        logger.info(f"ml_total_trades initialised to {ml_total_trades} from DB "
+                    f"(ml_trained_on={ml_trained_on})")
     except Exception as _e:
         logger.warning(f"Failed to init ml_total_trades from DB: {_e}")
 
@@ -5481,6 +5668,8 @@ def main():
     _watch_thread(_midnight_breakdown_loop,     name="MidnightBreakdown")
     _watch_thread(_pinned_dashboard_loop,       name="PinnedDashboard")
     _watch_thread(_session_change_monitor_loop, name="SessionMonitor")
+    # Guard thread: makes sure ML retrains even if DB-writer path is delayed
+    _watch_thread(_ml_retrain_guard_loop,       name="MLRetrainGuard")
 
     # Mark bot as fully ready — commands that need DB/indicators are now safe
     global _bot_ready
