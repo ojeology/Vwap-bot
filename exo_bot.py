@@ -614,6 +614,17 @@ def _make_stacking_clf(random_state: int = 42) -> StackingClassifier:
     return CalibratedClassifierCV(stack, method="isotonic", cv=3)
 
 
+def _make_gb_clf(random_state: int = 42) -> GradientBoostingClassifier:
+    """Lightweight single-model fallback used when there isn't enough data
+    for the full stacking ensemble.  Regularised to avoid over-fitting on
+    small datasets; returns a plain GradientBoostingClassifier so that
+    feature_importances_ is directly accessible after fitting."""
+    return GradientBoostingClassifier(
+        n_estimators=200, max_depth=3, learning_rate=0.05,
+        subsample=0.8, min_samples_leaf=5, random_state=random_state,
+    )
+
+
 def _walk_forward_eval(build_fn, X: list, y: list, weights) -> Optional[dict]:
     """Time-ordered (no shuffling) holdout: train on the first 80% chronologically,
     score on the last 20% never seen in training — an honest read on whether the
