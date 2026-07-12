@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from collections import deque
 from typing import Optional
 
+import math
 import numpy as np
 import pandas as pd
 
@@ -33,7 +34,13 @@ if USE_PG:
         DATABASE_URL = None
         USE_PG = False
 import websocket
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.ensemble import (
+    RandomForestClassifier, GradientBoostingClassifier,
+    ExtraTreesClassifier, StackingClassifier,
+)
+from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import roc_auc_score, brier_score_loss, accuracy_score
 
 from rich.console import Console
 from rich.layout import Layout
@@ -92,7 +99,7 @@ PAUSE_MINUTES          = 30
 # ── Martingale (3-step: base → 2× → 4× stake on consecutive losses) ──
 MARTINGALE_ENABLED    = True    # double stake on each consecutive loss up to MAX_STEPS
 MARTINGALE_MULTIPLIER = 2.0     # stake multiplier per loss step
-MARTINGALE_MAX_STEPS  = 2       # levels: 0=1× base, 1=2× base, 2=4× base → then reset
+MARTINGALE_MAX_STEPS  = 1       # levels: 0=1× base, 1=2× base → then reset (1 recovery step only)
 DAILY_LOSS_LIMIT       = -10.0        # session SL
 DAILY_PROFIT_TARGET    = 5.0          # session TP
 MAX_DAILY_TRADES       = 9999
@@ -158,7 +165,7 @@ SESSION_TIMES = {
 
 # ── ML filter ────────────────────────────────────────────────────────
 MODEL_PATH        = "ml_model.pkl"
-ML_MIN_TRADES     = 100
+ML_MIN_TRADES     = 50
 ML_RETRAIN_EVERY  = 50           # retrain every 50 trades (continuous rolling)
 ML_CONFIDENCE_MIN = 0.75              # require ≥75% confidence (adjustable via Telegram)
 # Rich 16-feature set used when signal_features table has ≥ ML_MIN_TRADES rows
@@ -185,6 +192,15 @@ _ML_LEGACY_COLS = [
     "score", "wick_atr_ratio", "atr", "atr_ma",
     "ema_fast_slope", "ema_slow_slope", "ema_distance",
 ]
+# Engineered on top of the raw DB columns at training time (not stored):
+# cyclical time-of-day + ordinal market-session position, so the model can
+# learn session-dependent edge without a one-hot blowing up on small data.
+_ML_SESSION_ORDER = {name: i for i, name in enumerate(MARKET_SESSIONS.keys())}
+_ML_ENGINEERED_COLS = ["hour_sin", "hour_cos", "session_ord"]
+# Below this many rows, a stacked/calibrated ensemble has too few samples
+# per cross-val fold to be trustworthy — fall back to a single regularized
+# GradientBoosting model instead of forcing "exotic" onto noise.
+ML_STACKING_MIN_TRADES = 60
 
 # ── Per-class ML: separate model per volatility family ───────────────
 ML_SYMBOL_CLASSES = {
@@ -220,6 +236,10 @@ pending_signals, active_contracts = {}, {}
 locked_symbols: dict = {}
 unconfirmed_buys: dict = {}
 ws_registry: dict = {}   # symbol -> live WebSocketApp, used to re-query contracts before assuming a loss
+# symbol -> {"details":..., "requested_at":...} — set while we ask Deriv's
+# portfolio for a contract that may have opened despite a lost buy ack, so
+# we never silently abandon a real, un-tracked open position.
+_portfolio_checks: dict = {}
 total_pnl       = 0.0
 daily_total_pnl = 0.0   # Cumulates all day; resets at UTC midnight only (session resets don't touch it)
 peak_equity = 0.0
@@ -541,18 +561,104 @@ def _ml_progress_bar(pct: float, width: int = 12) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+def _ml_engineer(raw_vals: list, timestamp: str, session: str) -> list:
+    """Extend the raw DB feature vector with cyclical time-of-day + ordinal
+    market-session position, computed at train/predict time (not stored),
+    so the model can pick up session-dependent edge without a one-hot
+    exploding the feature space on a small dataset."""
+    hour = 12.0
+    if timestamp:
+        try:
+            hour = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00")).hour
+        except (ValueError, TypeError):
+            pass
+    hour_sin = math.sin(2 * math.pi * hour / 24.0)
+    hour_cos = math.cos(2 * math.pi * hour / 24.0)
+    session_ord = float(_ML_SESSION_ORDER.get(session, -1))
+    return list(raw_vals) + [hour_sin, hour_cos, session_ord]
+
+
+def _ml_build_matrix(rows: list, n_raw: int) -> tuple:
+    """rows: (symbol, *raw_feature_vals, timestamp, session, win). Returns (X, y)
+    with engineered columns appended."""
+    X, y = [], []
+    for r in rows:
+        raw = [float(r[1 + i]) if r[1 + i] is not None else 0.0 for i in range(n_raw)]
+        ts, sess, win = r[1 + n_raw], r[2 + n_raw], r[3 + n_raw]
+        X.append(_ml_engineer(raw, ts, sess))
+        y.append(win)
+    return X, y
+
+
+def _make_stacking_clf(random_state: int = 42) -> StackingClassifier:
+    """The 'exotic' ensemble: 3 diverse base learners (boosting, bagging,
+    extra-randomized trees) feeding a logistic-regression meta-learner that
+    learns how to blend them, wrapped in probability calibration so the
+    output is a genuine, trustworthy confidence — not just a raw vote."""
+    base = [
+        ("gb", GradientBoostingClassifier(
+            n_estimators=200, max_depth=4, learning_rate=0.05,
+            subsample=0.8, min_samples_leaf=5, random_state=random_state)),
+        ("rf", RandomForestClassifier(
+            n_estimators=200, max_depth=6, class_weight="balanced",
+            random_state=random_state, n_jobs=1)),
+        ("et", ExtraTreesClassifier(
+            n_estimators=200, max_depth=6, class_weight="balanced",
+            random_state=random_state, n_jobs=1)),
+    ]
+    stack = StackingClassifier(
+        estimators=base,
+        final_estimator=LogisticRegression(max_iter=1000),
+        cv=3, stack_method="predict_proba", n_jobs=1, passthrough=False,
+    )
+    return CalibratedClassifierCV(stack, method="isotonic", cv=3)
+
+
+def _walk_forward_eval(build_fn, X: list, y: list, weights) -> Optional[dict]:
+    """Time-ordered (no shuffling) holdout: train on the first 80% chronologically,
+    score on the last 20% never seen in training — an honest read on whether the
+    model generalizes forward in time, not just fits the past."""
+    n = len(X)
+    split = int(n * 0.8)
+    if split < 10 or (n - split) < 5:
+        return None
+    Xtr, Xte = X[:split], X[split:]
+    ytr, yte = y[:split], y[split:]
+    if len(set(ytr)) < 2 or len(set(yte)) < 2:
+        return None
+    try:
+        m = build_fn()
+        m.fit(Xtr, ytr, sample_weight=weights[:split]) if weights is not None else m.fit(Xtr, ytr)
+        proba = m.predict_proba(Xte)[:, 1]
+        preds = (proba >= 0.5).astype(int)
+        return {
+            "acc":   accuracy_score(yte, preds),
+            "auc":   roc_auc_score(yte, proba),
+            "brier": brier_score_loss(yte, proba),
+            "n_test": len(yte),
+        }
+    except Exception as e:
+        logger.warning(f"ML walk-forward eval failed: {e}")
+        return None
+
+
 def _ml_train():
-    """Train ML models. Global: GradientBoostingClassifier (better calibration).
-    Per-class: RandomForestClassifier (fast, good on small datasets).
-    Prefers signal_features table (16 rich features); falls back to trades table (7 legacy features).
+    """Train ML models.
+    Global model: a calibrated stacking ensemble (GradientBoosting + RandomForest +
+    ExtraTrees -> logistic meta-learner -> isotonic calibration) once there's enough
+    data per cross-val fold; otherwise a single regularized GradientBoosting so a
+    handful of trades can't be over-fit into false confidence.
+    Per-class: RandomForest (fast, good on small per-symbol-class datasets).
+    Prefers signal_features table (16 rich + 3 engineered features); falls back to
+    the trades table (7 legacy features) if signal_features is too sparse.
     """
     global ml_model, ml_trained_on, ml_training_active, ml_models_per_class, ml_trained_per_class
     try:
         # ── Choose training data source ──────────────────────────────────────
         try:
             sf_rows = _db_fetch(
-                f"SELECT symbol, {', '.join(ML_FEATURE_COLS)}, win "
-                f"FROM signal_features WHERE win IN (0, 1)"
+                f"SELECT symbol, {', '.join(ML_FEATURE_COLS)}, timestamp, session, win "
+                f"FROM signal_features WHERE win IN (0, 1) ORDER BY id"
             )
         except Exception:
             sf_rows = []
@@ -560,22 +666,22 @@ def _ml_train():
         if len(sf_rows) >= ML_MIN_TRADES:
             rows_sym     = sf_rows
             feature_cols = ML_FEATURE_COLS
-            feat_src     = f"signal_features ({len(ML_FEATURE_COLS)} features)"
+            feat_src     = f"signal_features ({len(ML_FEATURE_COLS)}+{len(_ML_ENGINEERED_COLS)} features)"
         else:
             try:
                 rows_sym = _db_fetch(
-                    f"SELECT symbol, {', '.join(_ML_LEGACY_COLS)}, win "
-                    f"FROM trades WHERE win IN (0, 1)"
+                    f"SELECT symbol, {', '.join(_ML_LEGACY_COLS)}, timestamp, market_session, win "
+                    f"FROM trades WHERE win IN (0, 1) ORDER BY id"
                 )
             except Exception as e:
                 logger.error(f"ML training query failed: {e}")
                 _send_tg(f"🤖 <b>ML Training Error</b>\n<code>{e}</code>\nWill retry on next trade.")
                 return
             feature_cols = _ML_LEGACY_COLS
-            feat_src     = f"trades ({len(_ML_LEGACY_COLS)} features, legacy)"
+            feat_src     = f"trades ({len(_ML_LEGACY_COLS)}+{len(_ML_ENGINEERED_COLS)} features, legacy)"
 
-        rows  = [r[1:] for r in rows_sym]   # drop symbol column
-        total = len(rows)
+        n_raw = len(feature_cols)
+        total = len(rows_sym)
 
         _send_tg(
             f"🤖 <b>ML RETRAINING</b> — {feat_src}\n"
@@ -592,8 +698,8 @@ def _ml_train():
             )
             return
 
-        X = [[float(r[i]) if r[i] is not None else 0.0 for i in range(len(feature_cols))] for r in rows]
-        y = [r[-1] for r in rows]
+        X, y = _ml_build_matrix(rows_sym, n_raw)
+        all_feature_cols = feature_cols + _ML_ENGINEERED_COLS
 
         if len(set(y)) < 2:
             _send_tg("🤖 <b>ML RETRAINING</b> — skipped\nNeed both wins AND losses in history.")
@@ -602,25 +708,50 @@ def _ml_train():
         # ── Adaptive recency weights (exponential decay, half-life = 100 trades) ─
         half_life = 100.0
         weights   = np.exp(np.linspace(-total / half_life, 0.0, total))
+        use_stack = total >= ML_STACKING_MIN_TRADES
 
         try:
-            # ── Global model: GradientBoosting (better probability calibration) ─
-            clf = GradientBoostingClassifier(
-                n_estimators=200, max_depth=4, learning_rate=0.05,
-                subsample=0.8, min_samples_leaf=5,
-                random_state=42,
+            # ── Honest forward-looking holdout BEFORE fitting on everything ──
+            eval_res = _walk_forward_eval(
+                (_make_stacking_clf if use_stack else _make_gb_clf), X, y, weights,
             )
-            clf.fit(X, y, sample_weight=weights)
+
+            # ── Global model: exotic stack once data supports it, else a single
+            #    regularized GradientBoosting to avoid over-fitting on noise ──
+            if use_stack:
+                clf = _make_stacking_clf()
+                clf.fit(X, y)   # CalibratedClassifierCV doesn't accept sample_weight cleanly through Stacking
+                arch_label = "Stacked (GB+RF+ExtraTrees → LogReg) + isotonic calibration"
+                imp_line = "n/a (stacked ensemble — see per-class importances below)"
+            else:
+                clf = _make_gb_clf()
+                clf.fit(X, y, sample_weight=weights)
+                arch_label = "GradientBoosting (single model — building toward stacking at " \
+                             f"{ML_STACKING_MIN_TRADES} trades)"
+                imp = sorted(zip(all_feature_cols, clf.feature_importances_),
+                             key=lambda x: x[1], reverse=True)
+                # Full ranked importance table sent to Telegram
+                _imp_full = "\n".join(
+                    [f"  {i+1:2d}. {n:<20s} {v*100:5.1f}%" for i, (n, v) in enumerate(imp)]
+                )
+                threading.Thread(
+                    target=_send_tg,
+                    args=(f"📊 <b>ML Feature Importance</b>\n<pre>{_imp_full}</pre>",),
+                    daemon=True,
+                ).start()
+                imp_line = "  ".join([f"{n} {v*100:.0f}%" for n, v in imp[:4]])
+
             with ml_lock:
                 ml_model     = clf
                 ml_trained_on = total
 
-            # Top-4 feature importances
-            imp = sorted(
-                zip(feature_cols, clf.feature_importances_),
-                key=lambda x: x[1], reverse=True,
-            )
-            imp_line = "  ".join([f"{n} {v*100:.0f}%" for n, v in imp[:4]])
+            eval_line = ""
+            if eval_res:
+                eval_line = (
+                    f"Holdout (last {eval_res['n_test']}, unseen in training): "
+                    f"Acc {eval_res['acc']*100:.0f}%  ·  AUC {eval_res['auc']:.2f}  ·  "
+                    f"Brier {eval_res['brier']:.3f}\n"
+                )
 
             # ── Per-class models: RandomForest (fast, handles small datasets) ──
             new_cls_models  = {}
@@ -631,9 +762,7 @@ def _ml_train():
                 if len(cls_rows) < 20:
                     cls_lines.append(f"  {cls}: only {len(cls_rows)} trades — skipped")
                     continue
-                Xc = [[float(r[i+1]) if r[i+1] is not None else 0.0
-                       for i in range(len(feature_cols))] for r in cls_rows]
-                yc = [r[-1] for r in cls_rows]
+                Xc, yc = _ml_build_matrix(cls_rows, n_raw)
                 if len(set(yc)) < 2:
                     cls_lines.append(f"  {cls}: need both outcomes — skipped")
                     continue
@@ -658,7 +787,9 @@ def _ml_train():
                 f"🤖 <b>ML RETRAINING COMPLETE</b> ✅\n"
                 f"<code>[{_ml_progress_bar(1.0)}] 100%</code>\n"
                 f"Source: {feat_src}  |  <b>{total}</b> trades\n"
-                f"Global: GradientBoosting  |  Gate ≥<b>{ML_CONFIDENCE_MIN*100:.0f}%</b>\n"
+                f"Global: {arch_label}\n"
+                f"Gate ≥<b>{ML_CONFIDENCE_MIN*100:.0f}%</b>\n"
+                f"{eval_line}"
                 f"Top features: {imp_line}\n"
                 f"Per-class (RandomForest):\n" + "\n".join(cls_lines)
             )
@@ -2273,10 +2404,13 @@ def score_signal(symbol: str, candle: dict) -> tuple:
     )
     if st_aligned: tr_pts += 4
 
-    # ADX trend strength
-    if   adx_val > 30:  tr_pts += 8    # strong trend
-    elif adx_val >= 20: tr_pts += 5    # moderate
-    elif adx_val < 15:  tr_pts -= 8   # weak — major deduction
+    # ADX trend strength — banded scoring (very high ADX can mean exhaustion)
+    if   adx_val >= 45: tr_pts += 6    # very strong but possibly extended
+    elif adx_val >= 35: tr_pts += 8    # sweet spot — strong, not exhausted
+    elif adx_val >= 25: tr_pts += 5    # moderate trend
+    elif adx_val >= 20: tr_pts += 3    # mild trend forming
+    elif adx_val >= 15: tr_pts += 0    # borderline — no bonus, no penalty
+    else:               tr_pts -= 5    # weak/choppy — penalise
 
     score += tr_pts
     details.update({
@@ -2302,14 +2436,21 @@ def score_signal(symbol: str, candle: dict) -> tuple:
     )
     sd_pts = 0
     if sd_zone != "none" and sd_zone_agree:
-        if sd_fresh: sd_pts += 8                     # fresh, untouched zone
+        # Freshness tiers — zone loses strength with each retest
+        if sd_fresh:
+            sd_pts += 12                              # untouched: maximum strength
+        elif sd_tests <= 1:
+            sd_pts += 4                               # first retest: still valid
+        elif sd_tests == 2:
+            sd_pts += 1                               # second retest: weakening
+        else:
+            sd_pts -= 2                               # third+ retest: over-tested
         if   sd_dist <= 0.5:  sd_pts += 5            # price AT zone
         elif sd_dist <= 1.5:  sd_pts += 3            # approaching
         elif sd_dist <= 3.0:  sd_pts += 1            # within range
         # Strong rejection wick at zone → confirms reaction
         if (direction == "UP" and lw >= 0.5) or (direction == "DOWN" and uw >= 0.5):
             sd_pts += 7
-        if sd_tests >= 3: sd_pts -= 5                # over-tested → weaker zone
 
     score += sd_pts
     details.update({
@@ -3372,6 +3513,16 @@ def _release_trade_slot(symbol: str):
 #  PROPOSAL / BUY
 # ══════════════════════════════════════════════════════════════════════
 def request_proposal(ws, symbol: str, details: dict, direction: str, barrier_mult: float = None):
+    # ── Clear stale timing fields from previous trade ─────────────────
+    # Re-entry details are copied from the settling contract's details dict,
+    # which carries buy_sent_at / proposal_id from that older trade.
+    # The pending-timeout loop checks buy_sent_at and fires "ack missing"
+    # immediately if it sees a timestamp that is 60+ s old — killing the
+    # step-2 (and any higher-step) martingale re-entry before Deriv even
+    # responds to the new proposal.  Clear them here so every call to
+    # request_proposal starts with a clean timing slate.
+    details.pop("buy_sent_at",  None)
+    details.pop("proposal_id",  None)
     # ── Martingale: stake doubles on each consecutive loss ────────────
     if MARTINGALE_ENABLED:
         with _lock:
@@ -3450,6 +3601,81 @@ def on_proposal(ws, msg: dict, symbol: str):
     with _lock:
         if symbol in pending_signals:
             pending_signals[symbol]["buy_sent_at"] = datetime.now(timezone.utc)
+
+
+def _adopt_orphan_contract(symbol: str, direction: str, details: dict, c: dict):
+    """A buy ack never arrived, but Deriv's portfolio shows a real open
+    contract matching this symbol/direction — adopt it into active_contracts
+    so it gets tracked to settlement normally, instead of silently
+    abandoning a real position with money on it."""
+    cid = c.get("contract_id")
+    if not cid or cid in active_contracts:
+        return False
+    with _lock:
+        active_contracts[cid] = {
+            "symbol":      symbol,
+            "direction":   direction,
+            "barrier":     None,
+            "stake":       c.get("buy_price", details.get("stake_used", STAKE)),
+            "payout":      c.get("payout"),
+            "entry_time":  datetime.now(timezone.utc),
+            "entry_price": last_price.get(symbol, 0),
+            "details":     details,
+            "settled":     False,
+        }
+    ws = ws_registry.get(symbol)
+    if ws is not None:
+        try:
+            ws.send(json.dumps({
+                "proposal_open_contract": 1,
+                "contract_id": int(cid),
+                "subscribe": 1,
+            }))
+        except Exception as e:
+            logger.warning(f"{symbol} adopt-orphan subscribe failed: {e}")
+    _record_execution()
+    _send_tg(
+        f"🔎 <b>Recovered untracked contract</b> — <code>{symbol}</code>\n"
+        f"Buy ack was lost, but Deriv's portfolio confirms contract #{cid} "
+        f"is really open. Now tracking it to settlement."
+    )
+    _log(f"🔎 {symbol} adopted orphan contract cid={cid} (buy ack was lost)")
+    return True
+
+
+def on_portfolio(ws, msg: dict, symbol: str):
+    """Response to our own {'portfolio': 1} safety check, fired when a buy
+    ack goes missing — confirms whether a contract actually opened before we
+    give up and reset/release, so we never abandon a real open position."""
+    check = _portfolio_checks.pop(symbol, None)
+    if check is None:
+        return
+    details   = check["details"]
+    direction = details.get("direction", "UP")
+    want_type = _get_contract_type(direction)
+    contracts = (msg.get("portfolio", {}) or {}).get("contracts", []) or []
+    since = check["requested_at"] - timedelta(seconds=30)
+    for c in contracts:
+        if c.get("symbol") != symbol or c.get("contract_type") != want_type:
+            continue
+        with _lock:
+            already_tracked = c.get("contract_id") in active_contracts
+        if already_tracked:
+            continue
+        purchase_time = c.get("purchase_time") or c.get("date_start")
+        try:
+            pt = datetime.fromtimestamp(int(purchase_time), tz=timezone.utc) if purchase_time else None
+        except (TypeError, ValueError):
+            pt = None
+        if pt is not None and pt < since:
+            continue  # too old — not the contract we're looking for
+        if _adopt_orphan_contract(symbol, direction, details, c):
+            unconfirmed_buys.pop(symbol, None)
+            return
+    # No matching open contract found — genuinely never executed. Let the
+    # timeout loop's normal cleanup (reset martingale / release slot) proceed.
+    with _lock:
+        _portfolio_checks.pop(symbol, None)
 
 
 def on_buy(ws, msg: dict, symbol: str):
@@ -3597,12 +3823,24 @@ def on_contract_update(ws, msg: dict, symbol: str):
                 martingale_level[symbol] = 0
                 # win cooldown already handled by ALLOW_SECOND_ENTRY above
             elif cur_ml < MARTINGALE_MAX_STEPS:
-                new_ml = cur_ml + 1
-                next_s = round(STAKE * (MARTINGALE_MULTIPLIER ** new_ml), 2)
-                martingale_level[symbol] = new_ml
-                do_martingale_reentry   = True   # instant re-entry queued
-                _log(f"📈 Martingale {symbol}: LOSS → step {new_ml}  "
-                     f"stake ${next_s:.2f}  (re-entry queued)")
+                # Smart gate: only re-enter if the original signal was high quality.
+                # Blindly doubling on a weak setup is the most dangerous part of
+                # martingale — require A-grade score AND strong ML confidence.
+                _m_score = float(d.get("total_score", 0) or 0)
+                _m_conf  = float(d.get("ml_confidence") or 0.0)
+                if _m_score >= 90 and _m_conf >= 0.90:
+                    new_ml = cur_ml + 1
+                    next_s = round(STAKE * (MARTINGALE_MULTIPLIER ** new_ml), 2)
+                    martingale_level[symbol] = new_ml
+                    do_martingale_reentry   = True   # re-entry queued
+                    _log(f"📈 Martingale {symbol}: LOSS → step {new_ml}  "
+                         f"stake ${next_s:.2f}  "
+                         f"(smart gate ✅ score={_m_score:.0f} ML={_m_conf*100:.0f}%)")
+                else:
+                    martingale_level[symbol] = 0
+                    _log(f"↩️  Martingale {symbol}: LOSS — smart gate blocked re-entry "
+                         f"(score={_m_score:.0f} <90 or ML={_m_conf*100:.0f}% <90%) "
+                         f"→ reset to base ${STAKE:.2f}")
             else:
                 # All steps exhausted — reset and impose standard cooldown
                 _log(f"↩️  Martingale {symbol}: all {MARTINGALE_MAX_STEPS} steps exhausted — "
@@ -4298,6 +4536,8 @@ def _on_message(ws, message: str, symbol: str):
             on_buy(ws, msg, symbol)
         elif mtype == "proposal_open_contract":
             on_contract_update(ws, msg, symbol)
+        elif mtype == "portfolio":
+            on_portfolio(ws, msg, symbol)
         elif mtype == "error":
             err = msg.get("error", {})
             err_msg = err.get("message", err)
@@ -4315,6 +4555,16 @@ def _on_message(ws, message: str, symbol: str):
                     + ("Martingale step reset to base — no trade was opened."
                        if is_reentry else "Slot released.")
                 )
+        elif mtype not in (None, "authorize", "ping"):
+            # Diagnostic net: log any message type we don't explicitly route,
+            # so a repeat of the "buy sent, ack never arrives" incident shows
+            # exactly what (if anything) Deriv actually sent back, instead of
+            # leaving us guessing between a dropped request and a misrouted
+            # response. "authorize"/"ping" are expected, already-handled-
+            # elsewhere connection housekeeping — never worth logging, and
+            # authorize's payload includes account balance/email, so it must
+            # not be dumped into the log on every (re)connect.
+            logger.warning(f"{symbol} unhandled msg_type={mtype}: {msg}")
 
     except json.JSONDecodeError as e:
         logger.error(f"{symbol} bad JSON: {e}")
@@ -4366,16 +4616,41 @@ def _pending_trade_timeout_loop():
                         _cleanup_failed_entry(symbol, det)
                         _log(f"⏰ {symbol} pending proposal timed out — slot released")
                 for symbol in list(unconfirmed_buys.keys()):
-                    if now >= unconfirmed_buys[symbol]["expires_at"]:
-                        det = unconfirmed_buys.pop(symbol, None)
-                        is_reentry = _cleanup_failed_entry(symbol, (det or {}).get("details"))
-                        _send_tg(
-                            f"⚠️ <b>UNCONFIRMED TRADE EXPIRED</b> — {symbol}\n"
-                            f"Buy order sent but no ack within 3 min.\n"
-                            + (f"Martingale step reset to base — no trade was opened.\n"
-                               if is_reentry else
-                               f"Slot released — check your Deriv account.\n")
-                        )
+                    entry = unconfirmed_buys[symbol]
+                    if now < entry["expires_at"]:
+                        continue
+                    # Before giving up, confirm with Deriv's own portfolio
+                    # that no contract actually opened — a lost ack does not
+                    # mean a lost trade; the buy may have gone through with
+                    # only the confirmation dropped. Give that check ~15s.
+                    if not entry.get("portfolio_checked_at"):
+                        ws2 = ws_registry.get(symbol)
+                        if ws2 is not None:
+                            try:
+                                ws2.send(json.dumps({"portfolio": 1}))
+                                _portfolio_checks[symbol] = {
+                                    "details": entry.get("details"),
+                                    "requested_at": now,
+                                }
+                                entry["portfolio_checked_at"] = now
+                                entry["expires_at"] = now + timedelta(seconds=15)
+                                _log(f"🔎 {symbol} checking Deriv portfolio before declaring "
+                                     f"trade unconfirmed")
+                                continue
+                            except Exception as e:
+                                logger.warning(f"{symbol} portfolio safety check failed: {e}")
+                        # No live WS to check with — fall through and finalize as before.
+                    det = unconfirmed_buys.pop(symbol, None)
+                    _portfolio_checks.pop(symbol, None)
+                    is_reentry = _cleanup_failed_entry(symbol, (det or {}).get("details"))
+                    _send_tg(
+                        f"⚠️ <b>UNCONFIRMED TRADE EXPIRED</b> — {symbol}\n"
+                        f"Buy order sent but no ack within 3 min "
+                        f"(confirmed via Deriv portfolio — no contract opened).\n"
+                        + (f"Martingale step reset to base — no trade was opened.\n"
+                           if is_reentry else
+                           f"Slot released — check your Deriv account.\n")
+                    )
         except Exception as e:
             logger.error(f"pending_trade_timeout_loop: {e}")
 
@@ -4764,6 +5039,40 @@ def _funnel_report_lines(funnel: dict) -> list:
     return lines
 
 
+def _daily_market_session_lines() -> list:
+    """Compact per-market-session (Asian/London/NY, fixed UTC windows) mini
+    breakdown for today — these windows are fixed clock ranges and never
+    overlap, unlike the TP/SL-triggered 'rounds' listed below them, which
+    can start and end mid-session. Kept separate so the two concepts don't
+    get conflated in the report."""
+    _roll_market_session_stats_if_needed()
+    with _lock:
+        ms_snap = {k: dict(v) for k, v in market_session_stats.items()}
+    broad_groups = {
+        "Midnight": ["Midnight"], "Asian": ["Early Asian", "Late Asian"],
+        "London": ["London"], "New York": ["Early New York", "Late New York"],
+    }
+    out = ["<b>By Market Session (today, fixed UTC windows)</b>"]
+    any_data = False
+    for broad, subs in broad_groups.items():
+        w = l = 0; pnl = 0.0
+        for sub in subs:
+            s = ms_snap.get(sub, {"wins": 0, "losses": 0, "pnl": 0.0})
+            w += s["wins"]; l += s["losses"]; pnl += s["pnl"]
+        tot = w + l
+        if tot == 0:
+            continue
+        any_data = True
+        wr = w / tot * 100 if tot else 0
+        sign = "+" if pnl >= 0 else ""
+        tag = "🏅" if pnl > 0 else ("💔" if pnl < 0 else "➖")
+        out.append(f"  {SESSION_EMOJIS.get(broad,'')} {broad:<9} {tag} {sign}${pnl:.2f}  ({w}W/{l}L {wr:.0f}%WR)")
+    if not any_data:
+        out.append("  — no trades yet today —")
+    out.append("<i>Full breakdown incl. all-time: 🌏 Sessions Breakdown button.</i>")
+    return out
+
+
 def _daily_history_text() -> str:
     global daily_session_log, _daily_session_log_date
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -4776,33 +5085,45 @@ def _daily_history_text() -> str:
     funnel = _funnel_snapshot()
     funnel_lines = _funnel_report_lines(funnel)
 
-    if not log:
-        return (
-            "📅 <b>Daily Session History</b>\n━━━━━━━━━━━━━━━━━━━━\n"
-            + _strategy_header() +
-            f"Date: {today}\n\n"
-            "— No TP or SL hits yet today. —\n\n"
-            + "\n".join(funnel_lines) +
-            "\n\n<i>Each time the bot hits its daily TP or SL it resets and this record is updated.</i>"
-        )
-
-    tp_hits = sum(1 for e in log if e["reason"] == "TP")
-    sl_hits = sum(1 for e in log if e["reason"] == "SL")
-    total_day_pnl    = sum(e["pnl"]    for e in log)
-    total_day_trades = sum(e["trades"] for e in log)
-    total_day_wins   = sum(e["wins"]   for e in log)
-    total_day_losses = sum(e["losses"] for e in log)
-    total_possible   = total_day_wins + total_day_losses
-    day_wr = total_day_wins / total_possible * 100 if total_possible else 0
-    day_avg_trade  = total_day_pnl / total_day_trades if total_day_trades else 0.0
-    day_max_dd     = max((e.get("max_dd", 0.0) for e in log), default=0.0)
-    day_max_dd_sess = max(log, key=lambda e: e.get("max_dd", 0.0)) if log else None
-
-    # Include the still-running current session's live drawdown so "today"
-    # reflects the in-progress session too, not just closed TP/SL sessions.
+    # Always source the headline figure from the dedicated daily accumulator
+    # (persists across TP/SL round resets, only zeroed at UTC midnight) —
+    # NOT from summing closed rounds, which used to be blank/wrong whenever
+    # no TP/SL round had closed yet today even though real trades happened.
     with _lock:
         live_pnl, live_peak, live_mdd = total_pnl, peak_equity, max_drawdown
         live_trades, live_wins, live_losses = daily_trades, win_count, loss_count
+        day_pnl_total = daily_total_pnl
+
+    if not log:
+        day_wr = live_wins / (live_wins + live_losses) * 100 if (live_wins + live_losses) else 0
+        lines = [
+            "📅 <b>Daily Session History</b>", "━━━━━━━━━━━━━━━━━━━━",
+            _strategy_header(),
+            f"Date: {today}",
+            f"Day P&L    : <b>{'+' if day_pnl_total >= 0 else ''}${day_pnl_total:.2f}</b>",
+            f"Trades     : {live_trades}   Wins: {live_wins}   Losses: {live_losses}   WR: {day_wr:.1f}%",
+            f"📉 Drawdown : -${live_mdd:.2f}",
+            "",
+            "— No TP or SL round has closed yet today —",
+            "",
+            *_daily_market_session_lines(),
+            "",
+            *funnel_lines,
+            "",
+            "<i>Each time the bot hits its daily TP or SL it resets and a new round begins below. Resets at midnight UTC.</i>",
+        ]
+        return "\n".join(lines)
+
+    tp_hits = sum(1 for e in log if e["reason"] == "TP")
+    sl_hits = sum(1 for e in log if e["reason"] == "SL")
+    total_day_trades = sum(e["trades"] for e in log) + live_trades
+    total_day_wins   = sum(e["wins"]   for e in log) + live_wins
+    total_day_losses = sum(e["losses"] for e in log) + live_losses
+    total_possible   = total_day_wins + total_day_losses
+    day_wr = total_day_wins / total_possible * 100 if total_possible else 0
+    day_avg_trade  = day_pnl_total / total_day_trades if total_day_trades else 0.0
+    day_max_dd     = max((e.get("max_dd", 0.0) for e in log), default=0.0)
+    day_max_dd_sess = max(log, key=lambda e: e.get("max_dd", 0.0)) if log else None
     day_max_dd = max(day_max_dd, live_mdd)
 
     adv_today = get_today_advanced_stats()
@@ -4813,8 +5134,8 @@ def _daily_history_text() -> str:
         _strategy_header(),
         f"Date   : {today}",
         f"🎯 TP hits: <b>{tp_hits}</b>   🛑 SL hits: <b>{sl_hits}</b>",
-        f"Day P&L    : <b>{'+' if total_day_pnl >= 0 else ''}${total_day_pnl:.2f}</b>",
-        f"Total Trades: {total_day_trades}",
+        f"Day P&L    : <b>{'+' if day_pnl_total >= 0 else ''}${day_pnl_total:.2f}</b>",
+        f"Total Trades: {total_day_trades}  <i>(incl. current round)</i>",
         f"Total Wins  : {total_day_wins}",
         f"Total Losses: {total_day_losses}",
         f"Win Rate    : {day_wr:.1f}%",
@@ -4853,7 +5174,9 @@ def _daily_history_text() -> str:
                 f"{'+' if adv_today['worst_session_pnl']>=0 else ''}${adv_today['worst_session_pnl']:.2f}"
             )
 
-    lines += ["", *funnel_lines, "━━━━━━━━━━━━━━━━━━━━"]
+    lines += ["", *_daily_market_session_lines(), "", *funnel_lines, "━━━━━━━━━━━━━━━━━━━━",
+              "<b>TP/SL Rounds today</b>  <i>(each starts on the previous reset, ends on the next "
+              "TP/SL hit — a round can span more than one market session above)</i>"]
 
     for i, e in enumerate(log, 1):
         icon  = "🎯" if e["reason"] == "TP" else "🛑"
@@ -4863,8 +5186,8 @@ def _daily_history_text() -> str:
         ms_name  = e.get("market_session", "—")
         e_wr  = e["wins"] / (e["wins"] + e["losses"]) * 100 if (e["wins"] + e["losses"]) else 0
         entry = (
-            f"{icon} <b>Session {i}</b>  [{e['time']}]  {dur_str}  "
-            f"{SESSION_EMOJIS.get(ms_name,'')} {ms_name}\n"
+            f"{icon} <b>Round {i}</b>  [{e['time']}]  {dur_str}  "
+            f"ended in {SESSION_EMOJIS.get(ms_name,'')} {ms_name}\n"
             f"   P&L: <b>{sign}${e['pnl']:.2f}</b>  ·  "
             f"Trades: {e['trades']} ({e['wins']}W/{e['losses']}L  {e_wr:.0f}%WR)\n"
             f"   Peak: ${e.get('peak', 0.0):.2f}  ·  Max DD: -${e.get('max_dd', 0.0):.2f}"
@@ -4882,7 +5205,7 @@ def _daily_history_text() -> str:
     if live_trades or live_wins or live_losses:
         live_wr = live_wins / (live_wins + live_losses) * 100 if (live_wins + live_losses) else 0
         lines.append(
-            f"▶ <b>Current session (still running)</b>\n"
+            f"▶ <b>Current round (still running)</b>\n"
             f"   P&L: <b>{'+' if live_pnl >= 0 else ''}${live_pnl:.2f}</b>  ·  "
             f"Trades: {live_trades} ({live_wins}W/{live_losses}L  {live_wr:.0f}%WR)\n"
             f"   Peak: ${live_peak:.2f}  ·  Max DD: -${live_mdd:.2f}"
@@ -5405,8 +5728,10 @@ def _run_test_trade(symbol: str):
             f"P&L         : <b>{pstr}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"✅ Full pipeline confirmed: proposal → buy → settlement → result\n"
-            f"<i>Test trade does NOT affect session stats.</i>"
+            f"<i>Test trade itself does NOT affect session stats.</i>"
         )
+        if not win:
+            _fire_test_martingale_reentry(symbol, direction, tg)
     except Exception as e:
         logger.exception(f"🧪 {tag} unexpected error: {e}")
         tg(f"🧪 <b>Test Trade Error</b>\n<code>{e}</code>")
@@ -5418,6 +5743,47 @@ def _run_test_trade(symbol: str):
         with _lock:
             _test_trade_active.pop(symbol, None)
         _test_trade_sem.release()
+
+
+def _fire_test_martingale_reentry(symbol: str, direction: str, tg):
+    """A test trade lost — drive the REAL production martingale re-entry
+    path (request_proposal on the live per-symbol WS, same as a genuine
+    losing signal would) instead of the test harness's isolated one-shot
+    socket. This is the only way to actually exercise/validate the
+    re-entry pipeline on demand — unlike the base test trade, this places
+    a real contract at real (multiplied) stake and DOES flow into session
+    P&L / win-loss counts / DB history like any other martingale re-entry,
+    because it settles through the same on_contract_update() path.
+    """
+    if not MARTINGALE_ENABLED:
+        tg("🧪 <i>Martingale is disabled (MARTINGALE_ENABLED=False) — skipping re-entry test.</i>")
+        return
+    with _lock:
+        busy = (symbol in pending_signals or symbol in unconfirmed_buys
+                or any(c["symbol"] == symbol for c in active_contracts.values()))
+    if busy:
+        tg(f"🧪 <b>Martingale re-entry test skipped</b> — <code>{symbol}</code> already has "
+           f"a live/pending trade from the main engine. Try again once it's clear.")
+        return
+    ws2 = ws_registry.get(symbol)
+    if ws2 is None:
+        tg(f"🧪 <b>Martingale re-entry test skipped</b> — no live WS for <code>{symbol}</code>.")
+        return
+    with _lock:
+        new_ml = min(martingale_level.get(symbol, 0) + 1, MARTINGALE_MAX_STEPS)
+        martingale_level[symbol] = new_ml
+    m_stake = round(STAKE * (MARTINGALE_MULTIPLIER ** new_ml), 2)
+    tg(
+        f"⚡ <b>Test Martingale Re-entry — Step {new_ml}/{MARTINGALE_MAX_STEPS}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Symbol    : <code>{symbol}</code>\n"
+        f"Direction : {'🟢 Rise (UP)' if direction == 'UP' else '🔴 Fall (DOWN)'}  <i>(same as losing test trade)</i>\n"
+        f"Stake     : <b>${m_stake:.2f}</b>  (×{int(MARTINGALE_MULTIPLIER**new_ml)} base ${STAKE:.2f})\n"
+        f"<i>Real contract via live engine — this WILL count toward session P&amp;L and history "
+        f"(unlike the base test trade above). Watch for the normal WIN/LOSS result card.</i>"
+    )
+    request_proposal(ws2, symbol, {}, direction)
+    _log(f"🧪⚡ Test-triggered martingale re-entry {symbol} {direction} step={new_ml} stake=${m_stake:.2f}")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -6955,12 +7321,32 @@ def _session_change_monitor_loop():
 #  TELEGRAM STARTUP
 # ══════════════════════════════════════════════════════════════════════
 def _start_telegram():
+    # Re-read the token at call time so a late-injected env var is picked up
+    # after the first attempt, and so config changes don't need a full restart.
+    token = os.environ.get("TG_BOT_TOKEN") or TELEGRAM_BOT_TOKEN
+    if not token:
+        logger.warning(
+            "TG_BOT_TOKEN is not set — Telegram disabled. "
+            "Set the secret and restart the bot to enable it."
+        )
+        # Sleep a long time so the watch-thread does not spam-retry every 5 s.
+        time.sleep(300)
+        return
+
     async def _run():
         global telegram_app, _tg_loop
         # Clear readiness in case this is a restart
         _tg_ready.clear()
         _tg_loop = asyncio.get_running_loop()
-        app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        try:
+            app = Application.builder().token(token).build()
+        except Exception as _tok_err:
+            logger.error(
+                f"Telegram Application build failed ({_tok_err}). "
+                "Check TG_BOT_TOKEN — sleeping 300 s before retry."
+            )
+            await asyncio.sleep(300)
+            return
         telegram_app = app
 
         async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
