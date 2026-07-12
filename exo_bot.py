@@ -166,8 +166,14 @@ SESSION_TIMES = {
 # ── ML filter ────────────────────────────────────────────────────────
 MODEL_PATH        = "ml_model.pkl"
 ML_MIN_TRADES     = 50
+ML_SF_SUFFICIENT_TRADES = 150    # signal_features must reach this many real trades before
+                                 # it's trusted to stand alone; below it we bootstrap the
+                                 # global model from the (larger, legacy-feature) trades
+                                 # table instead — this is what lets a Neon-seeded backtest
+                                 # actually get used for training instead of being ignored
+                                 # in favor of a handful of real signal_features rows.
 ML_RETRAIN_EVERY  = 50           # retrain every 50 trades (continuous rolling)
-ML_CONFIDENCE_MIN = 0.75              # require ≥75% confidence (adjustable via Telegram)
+ML_CONFIDENCE_MIN = 0.60              # require ≥60% confidence (adjustable via Telegram)
 # Rich 16-feature set used when signal_features table has ≥ ML_MIN_TRADES rows
 ML_FEATURE_COLS = [
     "score",          # total signal score [0-100]
@@ -460,17 +466,24 @@ def _ml_save():
 
 
 def _ml_get_confidence(details: dict, symbol: str = "") -> float:
-    """Return ML win-probability (0.0–1.0). Supports rich 16-feature and legacy 7-feature models."""
+    """Return ML win-probability (0.0–1.0). Supports rich 16-feature and legacy 7-feature
+    models. Both are trained with 3 *engineered* columns appended on top (hour_sin,
+    hour_cos, session_ord — see `_ml_engineer`), so the vector built here MUST append
+    the same engineered columns computed from "now", or sklearn raises a feature-count
+    mismatch and every prediction silently falls through to the `except` below (which
+    returns 1.0 == ML gate wide open, no filtering at all)."""
     cls = _get_symbol_class(symbol) if symbol else "standard_vol"
     with ml_lock:
         model = ml_models_per_class.get(cls) or ml_model
     if model is None:
         return 1.0
     try:
-        n_feats = getattr(model, "n_features_in_", len(ML_FEATURE_COLS))
-        if n_feats == len(ML_FEATURE_COLS):
+        rich_n   = len(ML_FEATURE_COLS) + len(_ML_ENGINEERED_COLS)
+        legacy_n = len(_ML_LEGACY_COLS) + len(_ML_ENGINEERED_COLS)
+        n_feats  = getattr(model, "n_features_in_", rich_n)
+        if n_feats == rich_n:
             # Rich 16-feature vector (trained on signal_features table)
-            feats = [[
+            raw = [
                 float(details.get("total_score", 0) or 0),
                 float(details.get("adx", 0) or 0),
                 float(details.get("rsi", 0) or 0),
@@ -487,10 +500,10 @@ def _ml_get_confidence(details: dict, symbol: str = "") -> float:
                 float(int(bool(details.get("macd_bullish", False)))),
                 float(details.get("roc", 0) or 0),
                 float(details.get("wick_atr_ratio", 0) or 0),
-            ]]
+            ]
         else:
-            # Legacy 7-feature vector (trained on trades table)
-            feats = [[
+            # Legacy 7-feature vector (trained on trades table), n_feats == legacy_n
+            raw = [
                 float(details.get("total_score", 0) or 0),
                 float(details.get("wick_atr_ratio", 0) or 0),
                 float(details.get("atr", 0) or 0),
@@ -498,7 +511,10 @@ def _ml_get_confidence(details: dict, symbol: str = "") -> float:
                 float(details.get("ema_fast_sl", 0) or 0),
                 float(details.get("ema_slow_sl", 0) or 0),
                 float(details.get("ema_distance", 0) or 0),
-            ]]
+            ]
+        now     = datetime.now(timezone.utc)
+        session = _get_session_name(now)
+        feats   = [_ml_engineer(raw, now.isoformat(), session)]
         proba   = model.predict_proba(feats)[0]
         classes = list(model.classes_)
         win_idx = classes.index(1) if 1 in classes else len(classes) - 1
@@ -674,25 +690,33 @@ def _ml_train():
         except Exception:
             sf_rows = []
 
-        if len(sf_rows) >= ML_MIN_TRADES:
-            rows_sym     = sf_rows
-            feature_cols = ML_FEATURE_COLS
-            feat_src     = f"signal_features ({len(ML_FEATURE_COLS)}+{len(_ML_ENGINEERED_COLS)} features)"
-        else:
+        trades_rows = []
+        if len(sf_rows) < ML_SF_SUFFICIENT_TRADES:
+            # signal_features alone isn't rich enough yet — see if the (larger,
+            # legacy-feature) trades table has more to offer, e.g. a Neon-seeded
+            # backtest. Whichever source has more qualifying rows wins.
             try:
-                rows_sym = _db_fetch(
+                trades_rows = _db_fetch(
                     f"SELECT symbol, {', '.join(_ML_LEGACY_COLS)}, timestamp, market_session, win "
                     f"FROM trades WHERE win IN (0, 1) ORDER BY id"
                 )
             except Exception as e:
-                logger.error(f"ML training query failed: {e}")
-                _send_tg(f"🤖 <b>ML Training Error</b>\n<code>{e}</code>\nWill retry on next trade.")
-                return
+                logger.error(f"ML training query (trades fallback) failed: {e}")
+                trades_rows = []
+
+        if len(sf_rows) >= ML_SF_SUFFICIENT_TRADES or len(sf_rows) >= len(trades_rows):
+            rows_sym     = sf_rows
+            feature_cols = ML_FEATURE_COLS
+            feat_src     = f"signal_features ({len(ML_FEATURE_COLS)}+{len(_ML_ENGINEERED_COLS)} features)"
+        else:
+            rows_sym     = trades_rows
             feature_cols = _ML_LEGACY_COLS
             feat_src     = f"trades ({len(_ML_LEGACY_COLS)}+{len(_ML_ENGINEERED_COLS)} features, legacy)"
 
         n_raw = len(feature_cols)
         total = len(rows_sym)
+        logger.info(f"ML source-select DEBUG: sf_rows={len(sf_rows)} trades_rows={len(trades_rows)} "
+                    f"chosen={feat_src} total={total}")
 
         _send_tg(
             f"🤖 <b>ML RETRAINING</b> — {feat_src}\n"
@@ -1207,7 +1231,10 @@ def _performance_analytics_text() -> str:
 
     if len(rows) < 10:
         try:
-            n_tr = _db_fetch("SELECT COUNT(*) FROM trades WHERE win IN (0,1)")
+            n_tr = _db_fetch(
+                "SELECT COUNT(*) FROM trades WHERE win IN (0,1) "
+                "AND (barrier IS NULL OR barrier != 'backtest')"
+            )
             n    = int(n_tr[0][0]) if n_tr else 0
         except Exception:
             n = 0
@@ -1333,7 +1360,8 @@ _CREATE_TABLE_SQLITE = """
         atr             REAL,    atr_ma          REAL,
         ema_fast_slope  REAL,    ema_slow_slope  REAL,
         ema_distance    REAL,
-        market_session  TEXT
+        market_session  TEXT,
+        is_recovery     INTEGER
     )
 """
 
@@ -1350,14 +1378,46 @@ _CREATE_TABLE_PG = """
         atr             REAL,    atr_ma          REAL,
         ema_fast_slope  REAL,    ema_slow_slope  REAL,
         ema_distance    REAL,
-        market_session  TEXT
+        market_session  TEXT,
+        is_recovery     INTEGER
     )
 """
 
 _INSERT_COLS = (
     "timestamp,symbol,direction,barrier,stake,payout,profit,win,score,"
-    "wick_atr_ratio,atr,atr_ma,ema_fast_slope,ema_slow_slope,ema_distance,market_session"
+    "wick_atr_ratio,atr,atr_ma,ema_fast_slope,ema_slow_slope,ema_distance,market_session,"
+    "is_recovery"
 )
+
+# ── Rejected-signals table (slim log: what got rejected, and — filled in later
+# by a background check — whether the market would have paid out anyway) ────
+_CREATE_REJ_SQLITE = """
+    CREATE TABLE IF NOT EXISTS rejected_signals (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp        TEXT,     symbol           TEXT,
+        direction        TEXT,     score            REAL,
+        grade            TEXT,     filter_category  TEXT,
+        reason           TEXT,     entry_price      REAL,
+        check_at         TEXT,     would_have_won   INTEGER
+    )
+"""
+
+_CREATE_REJ_PG = """
+    CREATE TABLE IF NOT EXISTS rejected_signals (
+        id               SERIAL PRIMARY KEY,
+        timestamp        TEXT,     symbol           TEXT,
+        direction        TEXT,     score            REAL,
+        grade            TEXT,     filter_category  TEXT,
+        reason           TEXT,     entry_price      REAL,
+        check_at         TEXT,     would_have_won   INTEGER
+    )
+"""
+
+_REJ_COLS = (
+    "timestamp,symbol,direction,score,grade,filter_category,reason,"
+    "entry_price,check_at,would_have_won"
+)
+_REJ_N = 10
 
 # ── Signal-features table (rich 39-column per-trade signal log) ──────
 _CREATE_SF_SQLITE = """
@@ -1471,15 +1531,21 @@ def _db_writer():
         cur.execute(_CREATE_TABLE_PG)
         # Add market_session column if missing (older PG schema)
         cur.execute("""
-            DO $$ BEGIN
+            DO $body$ BEGIN
                 ALTER TABLE trades ADD COLUMN market_session TEXT;
             EXCEPTION WHEN duplicate_column THEN NULL;
-            END $$;
+            END $body$;
+        """)
+        cur.execute("""
+            DO $body$ BEGIN
+                ALTER TABLE trades ADD COLUMN is_recovery INTEGER;
+            EXCEPTION WHEN duplicate_column THEN NULL;
+            END $body$;
         """)
         def _write(item):
             cur.execute(
                 f"INSERT INTO trades ({_INSERT_COLS}) "
-                f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 _pg_safe_row(item),
             )
             cur.execute("SELECT COUNT(*) FROM trades")
@@ -1491,12 +1557,18 @@ def _db_writer():
             conn.execute("ALTER TABLE trades ADD COLUMN market_session TEXT")
         except sqlite3.OperationalError:
             pass
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN is_recovery INTEGER")
+        except sqlite3.OperationalError:
+            pass
         conn.execute(_CREATE_SF_SQLITE)   # signal_features table
+        conn.execute(_CREATE_REJ_SQLITE)  # rejected_signals table
         conn.commit()
 
     # ── PostgreSQL path: write immediately (autocommit) ──────────────────
     if USE_PG:
-        cur.execute(_CREATE_SF_PG)   # ensure signal_features table exists
+        cur.execute(_CREATE_SF_PG)    # ensure signal_features table exists
+        cur.execute(_CREATE_REJ_PG)   # ensure rejected_signals table exists
         while True:
             item = db_queue.get()
             if item is None:
@@ -1515,6 +1587,26 @@ def _db_writer():
                         threading.Thread(target=_pattern_discovery, daemon=True, name="PatDisc").start()
                 except Exception as e:
                     logger.error(f"SF write error (PG): {e}")
+                continue
+            if isinstance(item, dict) and item.get("type") == "rej":
+                try:
+                    cur.execute(
+                        f"INSERT INTO rejected_signals ({_REJ_COLS}) "
+                        f"VALUES ({','.join(['%s'] * _REJ_N)})",
+                        _pg_safe_row(item["data"]),
+                    )
+                except Exception as e:
+                    logger.error(f"Rejected-signal write error (PG): {e}")
+                continue
+            if isinstance(item, dict) and item.get("type") == "rej_update":
+                try:
+                    cur.execute(
+                        "UPDATE rejected_signals SET would_have_won=%s "
+                        "WHERE timestamp=%s AND symbol=%s AND would_have_won IS NULL",
+                        (item["win"], item["timestamp"], item["symbol"]),
+                    )
+                except Exception as e:
+                    logger.error(f"Rejected-signal update error (PG): {e}")
                 continue
             try:
                 total = _write(item)
@@ -1587,6 +1679,30 @@ def _db_writer():
                 logger.error(f"SF write error (SQLite): {e}")
             continue
 
+        if isinstance(item, dict) and item.get("type") == "rej":
+            try:
+                conn.execute(
+                    f"INSERT INTO rejected_signals ({_REJ_COLS}) "
+                    f"VALUES ({','.join(['?'] * _REJ_N)})",
+                    item["data"],
+                )
+                conn.commit()
+            except Exception as e:
+                logger.error(f"Rejected-signal write error (SQLite): {e}")
+            continue
+
+        if isinstance(item, dict) and item.get("type") == "rej_update":
+            try:
+                conn.execute(
+                    "UPDATE rejected_signals SET would_have_won=? "
+                    "WHERE timestamp=? AND symbol=? AND would_have_won IS NULL",
+                    (item["win"], item["timestamp"], item["symbol"]),
+                )
+                conn.commit()
+            except Exception as e:
+                logger.error(f"Rejected-signal update error (SQLite): {e}")
+            continue
+
         _batch.append(item)
         now = time.time()
         if len(_batch) >= _BATCH_MAX or (now - _last_flush[0]) >= _FLUSH_INTERVAL:
@@ -1620,17 +1736,74 @@ def _watch_thread(target, args=(), name="Worker", restartable=True):
 def get_recent_trades(limit=8):
     return _db_fetch(
         "SELECT timestamp, symbol, direction, profit, win, score "
-        "FROM trades ORDER BY id DESC LIMIT ?", (limit,)
+        "FROM trades WHERE (barrier IS NULL OR barrier != 'backtest') "
+        "ORDER BY id DESC LIMIT ?", (limit,)
+    )
+
+
+def get_score_bucket_perf_fine():
+    """Fine-grained score-bucket performance (75-79/80-84/85-89/90-94/95-100),
+    lifetime, from signal_features (preferred, has score+win+profit) falling
+    back to trades. Pure SQL aggregation — no extra compute on Render."""
+    sql = (
+        "SELECT "
+        "  CASE WHEN score >= 95 THEN '95-100' WHEN score >= 90 THEN '90-94' "
+        "       WHEN score >= 85 THEN '85-89'  WHEN score >= 80 THEN '80-84' "
+        "       WHEN score >= 75 THEN '75-79'  ELSE '<75' END as bucket, "
+        "  COUNT(*) as trades, "
+        "  SUM(CASE WHEN win=1 THEN 1 ELSE 0 END) as wins, "
+        "  SUM(CASE WHEN win=0 THEN 1 ELSE 0 END) as losses, "
+        "  SUM(CASE WHEN win=1 THEN profit ELSE 0 END) as gross_win, "
+        "  SUM(CASE WHEN win=0 THEN profit ELSE 0 END) as gross_loss, "
+        "  SUM(profit) as pnl "
+        "FROM {table} WHERE win IN (0,1) {extra} "
+        "GROUP BY bucket ORDER BY MIN(score) DESC"
+    )
+    rows = _db_fetch(sql.format(table="signal_features", extra=""))
+    if not rows:
+        rows = _db_fetch(sql.format(
+            table="trades", extra="AND (barrier IS NULL OR barrier != 'backtest')"
+        ))
+    return rows
+
+
+def get_martingale_perf():
+    """Compare normal entries vs martingale/recovery re-entries, lifetime."""
+    return _db_fetch(
+        "SELECT COALESCE(is_recovery, 0) as is_recovery, "
+        "  COUNT(*) as trades, "
+        "  SUM(CASE WHEN win=1 THEN 1 ELSE 0 END) as wins, "
+        "  SUM(CASE WHEN win=1 THEN profit ELSE 0 END) as gross_win, "
+        "  SUM(CASE WHEN win=0 THEN profit ELSE 0 END) as gross_loss, "
+        "  SUM(profit) as pnl "
+        "FROM trades WHERE win IN (0,1) AND (barrier IS NULL OR barrier != 'backtest') "
+        "GROUP BY is_recovery"
+    )
+
+
+def get_rejection_effectiveness():
+    """Lifetime rejected-signal outcomes, grouped by filter category — answers
+    'is this filter actually saving us money, or costing us wins?'"""
+    return _db_fetch(
+        "SELECT filter_category, "
+        "  COUNT(*) as total, "
+        "  SUM(CASE WHEN would_have_won IS NOT NULL THEN 1 ELSE 0 END) as checked, "
+        "  SUM(CASE WHEN would_have_won=1 THEN 1 ELSE 0 END) as would_have_won "
+        "FROM rejected_signals "
+        "GROUP BY filter_category ORDER BY total DESC"
     )
 
 
 def get_db_summary():
     # win=-1 rows are VOID/unresolved contracts (never confirmed win or loss) —
     # excluded from the count so win-rate isn't diluted by unresolved trades.
+    # Excludes barrier='backtest' rows (synthetic trades inserted by backtest.py) —
+    # those only exist to train the ML model, never to count as real live performance.
     rows = _db_fetch(
         "SELECT SUM(CASE WHEN win IN (0,1) THEN 1 ELSE 0 END), SUM(profit), "
         "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), "
-        "SUM(CASE WHEN win=0 THEN 1 ELSE 0 END) FROM trades"
+        "SUM(CASE WHEN win=0 THEN 1 ELSE 0 END) FROM trades "
+        "WHERE (barrier IS NULL OR barrier != 'backtest')"
     )
     return rows[0] if rows else (0, 0, 0, 0)
 
@@ -1639,7 +1812,8 @@ def get_alltime_symbol_stats(limit=10):
     return _db_fetch(
         "SELECT symbol, SUM(CASE WHEN win IN (0,1) THEN 1 ELSE 0 END), "
         "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), SUM(profit) "
-        "FROM trades WHERE win IN (0,1) GROUP BY symbol ORDER BY SUM(profit) DESC LIMIT ?", (limit,)
+        "FROM trades WHERE win IN (0,1) AND (barrier IS NULL OR barrier != 'backtest') "
+        "GROUP BY symbol ORDER BY SUM(profit) DESC LIMIT ?", (limit,)
     )
 
 
@@ -1649,7 +1823,8 @@ def get_alltime_daily_stats(limit=7):
     return _db_fetch(
         "SELECT date(timestamp) as day, SUM(CASE WHEN win IN (0,1) THEN 1 ELSE 0 END), "
         "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), SUM(profit) "
-        "FROM trades WHERE win IN (0,1) GROUP BY day ORDER BY day DESC LIMIT ?", (limit,)
+        "FROM trades WHERE win IN (0,1) AND (barrier IS NULL OR barrier != 'backtest') "
+        "GROUP BY day ORDER BY day DESC LIMIT ?", (limit,)
     )
 
 
@@ -1661,6 +1836,7 @@ def get_7day_full_breakdown():
             "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), SUM(profit) "
             "FROM trades "
             "WHERE DATE(timestamp) >= CURRENT_DATE - INTERVAL '7 days' AND win IN (0,1) "
+            "AND (barrier IS NULL OR barrier != 'backtest') "
             "GROUP BY DATE(timestamp), market_session "
             "ORDER BY DATE(timestamp) DESC, SUM(profit) DESC"
         )
@@ -1670,6 +1846,7 @@ def get_7day_full_breakdown():
             "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), SUM(profit) "
             "FROM trades "
             "WHERE date(timestamp) >= date('now', '-7 days') AND win IN (0,1) "
+            "AND (barrier IS NULL OR barrier != 'backtest') "
             "GROUP BY date(timestamp), market_session "
             "ORDER BY date(timestamp) DESC, SUM(profit) DESC"
         )
@@ -1682,6 +1859,7 @@ def get_session_alltime_stats():
         "SELECT market_session, COUNT(*), "
         "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), SUM(profit) "
         "FROM trades WHERE market_session IS NOT NULL AND win IN (0,1) "
+        "AND (barrier IS NULL OR barrier != 'backtest') "
         "GROUP BY market_session ORDER BY SUM(profit) DESC"
     )
 
@@ -1703,7 +1881,7 @@ def get_ml_confidence_buckets():
         "  COUNT(*) as trades, "
         "  SUM(CASE WHEN win=1 THEN 1 ELSE 0 END) as wins, "
         "  SUM(profit) as pnl "
-        "FROM trades WHERE win IN (0,1) "
+        "FROM trades WHERE win IN (0,1) AND (barrier IS NULL OR barrier != 'backtest') "
         "GROUP BY bucket ORDER BY MIN(score) DESC"
     )
     return rows
@@ -1793,7 +1971,7 @@ def get_alltime_advanced_stats() -> Optional[dict]:
     """All-time trading metrics derived from every confirmed trade in the DB."""
     rows = _db_fetch(
         "SELECT profit, win, symbol, market_session FROM trades "
-        "WHERE win IN (0,1) ORDER BY id ASC"
+        "WHERE win IN (0,1) AND (barrier IS NULL OR barrier != 'backtest') ORDER BY id ASC"
     )
     return _compute_advanced_stats(rows)
 
@@ -1802,10 +1980,12 @@ def get_today_advanced_stats() -> Optional[dict]:
     """Today's (UTC) trading metrics derived from confirmed trades in the DB."""
     if USE_PG:
         sql = ("SELECT profit, win, symbol, market_session FROM trades "
-               "WHERE DATE(timestamp) = CURRENT_DATE AND win IN (0,1) ORDER BY id ASC")
+               "WHERE DATE(timestamp) = CURRENT_DATE AND win IN (0,1) "
+               "AND (barrier IS NULL OR barrier != 'backtest') ORDER BY id ASC")
     else:
         sql = ("SELECT profit, win, symbol, market_session FROM trades "
-               "WHERE date(timestamp) = date('now') AND win IN (0,1) ORDER BY id ASC")
+               "WHERE date(timestamp) = date('now') AND win IN (0,1) "
+               "AND (barrier IS NULL OR barrier != 'backtest') ORDER BY id ASC")
     rows = _db_fetch(sql)
     return _compute_advanced_stats(rows)
 
@@ -2875,10 +3055,56 @@ def _send_tg_wait(text: str, reply_markup=None, parse_mode: str = "HTML", timeou
             logger.debug(f"send_tg_wait timeout/error: {e}")
 
 
+def _rejection_filter_category(reason: str) -> str:
+    """Bucket a free-text rejection reason into a stable category for reporting."""
+    r = reason.lower()
+    if "m15" in r:
+        return "m15_disagreement"
+    if "m5" in r:
+        return "m5_disagreement"
+    if "ml confidence" in r:
+        return "ml_confidence"
+    if "risk gate" in r or "cooldown" in r or "daily limit" in r or "paused" in r:
+        return "risk_gate"
+    if "confirmation" in r:
+        return "no_confirmation"
+    if "payout" in r:
+        return "payout"
+    return "other"
+
+
+def _setup_quality(score) -> str:
+    """Reporting-only label for a signal score — does not affect execution."""
+    try:
+        s = float(score)
+    except (TypeError, ValueError):
+        return "Unknown"
+    if s >= 95:  return "Elite"
+    if s >= 90:  return "Strong"
+    if s >= 80:  return "Normal"
+    return "Weak"
+
+
 def _send_rejection(symbol: str, direction: str, score: int, reason: str,
-                     details: dict = None):
-    """Send a detailed trade-rejected card to Telegram immediately and write to log."""
+                     details: dict = None, entry_price: float = None):
+    """Send a detailed trade-rejected card to Telegram immediately and write to log.
+    Also persists a slim row to `rejected_signals` (barrier='backtest' trades never
+    call this) so /rejections can later report whether the market would have paid
+    out anyway — a cheap, reporting-only check, no extra live compute per tick."""
     _log(f"❌ {symbol} {direction} rejected [{score}/100] — {reason}")
+
+    if entry_price is not None:
+        try:
+            grade, _ = _trade_grade(score, (details or {}).get("ml_confidence"))
+            now_dt   = datetime.now(timezone.utc)
+            check_at = now_dt + timedelta(minutes=DURATION)
+            db_queue.put({"type": "rej", "data": (
+                now_dt.isoformat(), symbol, direction, float(score), grade,
+                _rejection_filter_category(reason), reason, float(entry_price),
+                check_at.isoformat(), None,
+            )})
+        except Exception as e:
+            logger.error(f"Rejected-signal enqueue failed: {e}")
     now_str  = datetime.now(timezone.utc).strftime("%H:%M UTC")
     mkt_sess = _get_session_name()
     sess_ico = SESSION_EMOJIS.get(mkt_sess, "")
@@ -3795,7 +4021,7 @@ def on_contract_update(ws, msg: dict, symbol: str):
                 d.get("total_score", 0), d.get("wick_atr_ratio", 0),
                 d.get("atr", 0), d.get("atr_ma", 0),
                 d.get("ema_fast_sl", 0), d.get("ema_slow_sl", 0), d.get("ema_distance", 0),
-                mkt_session,
+                mkt_session, int(bool(d.get("_is_martingale_reentry"))),
             ))
             _log(f"VOID  {symbol}  contract {cid} unresolved — excluded from win/loss stats")
             return
@@ -3991,7 +4217,7 @@ def on_contract_update(ws, msg: dict, symbol: str):
         d.get("total_score", 0), d.get("wick_atr_ratio", 0),
         d.get("atr", 0), d.get("atr_ma", 0),
         d.get("ema_fast_sl", 0), d.get("ema_slow_sl", 0), d.get("ema_distance", 0),
-        mkt_session,
+        mkt_session, int(bool(d.get("_is_martingale_reentry"))),
     ))
 
     # Signal-features write (rich 39-column log for advanced ML + analytics)
@@ -4444,7 +4670,7 @@ def _on_message(ws, message: str, symbol: str):
                                 _send_rejection(symbol, direction, score,
                                                 f"M5 Supertrend disagrees "
                                                 f"({'↑' if m5_dir==1 else '↓'} on M5 vs {direction} on M1)",
-                                                details)
+                                                details, entry_price=row_c["Close"])
                             elif (m15_ready and m15_dir != 0
                                     and ((direction == "UP" and m15_dir != 1)
                                          or (direction == "DOWN" and m15_dir != -1))):
@@ -4452,7 +4678,7 @@ def _on_message(ws, message: str, symbol: str):
                                 _send_rejection(symbol, direction, score,
                                                 f"M15 Supertrend disagrees "
                                                 f"({'↑' if m15_dir==1 else '↓'} on M15 vs {direction} on M1)",
-                                                details)
+                                                details, entry_price=row_c["Close"])
                             else:
                                 # ── ML gate: second-entry requires higher confidence ────
                                 now_t = datetime.now(timezone.utc)
@@ -4472,7 +4698,7 @@ def _on_message(ws, message: str, symbol: str):
                                     _send_rejection(symbol, direction, score,
                                                     f"ML confidence {conf*100:.1f}% below {_gate_lbl} gate "
                                                     f"[{_get_symbol_class(symbol)}]",
-                                                    details)
+                                                    details, entry_price=row_c["Close"])
                                 elif _is_second:
                                     if _reserve_trade_slot(symbol, now_t):
                                         # Success — consume the second-entry window now
@@ -4492,7 +4718,7 @@ def _on_message(ws, message: str, symbol: str):
                                         _record_funnel_rejection("Risk gate closed (paused/cooldown/daily limit)")
                                         _send_rejection(symbol, direction, score,
                                                         "Risk gate closed for 2nd entry (paused / daily limit)",
-                                                        details)
+                                                        details, entry_price=row_c["Close"])
                                 elif _reserve_trade_slot(symbol, now_t):
                                     # ── Confirmation gate ────────────────────────────────────
                                     # Require at least one momentum confirmation before firing.
@@ -4536,7 +4762,7 @@ def _on_message(ws, message: str, symbol: str):
                                     _record_funnel_rejection("Risk gate closed (paused/cooldown/daily limit)")
                                     _send_rejection(symbol, direction, score,
                                                     "Risk gate closed (paused / cooldown / daily limit)",
-                                                    details)
+                                                    details, entry_price=row_c["Close"])
 
                 with _lock:
                     current_candle[symbol] = dict(c)
@@ -4981,6 +5207,85 @@ def _alltime_text():
         "━━━━━━━━━━━━━━━━━━━━",
         "<i>Persists across restarts (stored in trades.db).</i>",
     ]
+    return "\n".join(lines)
+
+
+def _score_bucket_perf_text():
+    """Lifetime fine-grained score-bucket dashboard — reporting only, cheap SQL."""
+    rows = get_score_bucket_perf_fine()
+    order = ["95-100", "90-94", "85-89", "80-84", "75-79", "<75"]
+    data = {r[0]: r for r in rows} if rows else {}
+    lines = ["📊 <b>SCORE BUCKET PERFORMANCE</b>  (lifetime)", "━━━━━━━━━━━━━━━━━━━━"]
+    any_data = False
+    for bucket in order:
+        r = data.get(bucket)
+        label = _setup_quality(
+            {"95-100": 97, "90-94": 92, "85-89": 87, "80-84": 82, "75-79": 77, "<75": 50}[bucket]
+        )
+        if not r or r[1] == 0:
+            lines.append(f"  <b>{bucket:>6}</b> ({label:<6}) — no trades yet —")
+            continue
+        any_data = True
+        _, trades, wins, losses, gwin, gloss, pnl = r
+        wr = wins / trades * 100 if trades else 0
+        pf = (gwin / abs(gloss)) if gloss else (float("inf") if gwin > 0 else 0.0)
+        pf_s = f"{pf:.2f}" if pf != float("inf") else "∞"
+        sign = "+" if pnl >= 0 else ""
+        lines.append(
+            f"  <b>{bucket:>6}</b> ({label:<6})  {trades} trades  {wins}W/{losses}L  "
+            f"({wr:.0f}%WR)  PF {pf_s}  <b>{sign}${pnl:.2f}</b>"
+        )
+    if not any_data:
+        lines.append("<i>No scored trades logged yet.</i>")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("<i>PF = profit factor (gross win ÷ gross loss). Reporting only — no thresholds changed.</i>")
+    return "\n".join(lines)
+
+
+def _martingale_perf_text():
+    """Normal entries vs martingale/recovery re-entries — is Gale-1 pulling its weight?"""
+    rows = get_martingale_perf()
+    data = {int(r[0]): r for r in rows} if rows else {}
+    lines = ["🎯 <b>NORMAL vs RECOVERY (Martingale) TRADES</b>  (lifetime, live only)", "━━━━━━━━━━━━━━━━━━━━"]
+    any_data = False
+    for flag, label in ((0, "Normal"), (1, "Recovery (Gale-1)")):
+        r = data.get(flag)
+        if not r or r[1] == 0:
+            lines.append(f"  {label:<20} — no trades yet —")
+            continue
+        any_data = True
+        _, trades, wins, gwin, gloss, pnl = r
+        losses = trades - wins
+        wr = wins / trades * 100 if trades else 0
+        pf = (gwin / abs(gloss)) if gloss else (float("inf") if gwin > 0 else 0.0)
+        pf_s = f"{pf:.2f}" if pf != float("inf") else "∞"
+        sign = "+" if pnl >= 0 else ""
+        lines.append(
+            f"  {label:<20} {trades} trades  {wins}W/{losses}L  ({wr:.0f}%WR)  "
+            f"PF {pf_s}  <b>{sign}${pnl:.2f}</b>"
+        )
+    if not any_data:
+        lines.append("<i>No live trades recorded yet.</i>")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    return "\n".join(lines)
+
+
+def _rejection_effectiveness_text():
+    """Lifetime filter-rejection effectiveness — of what we rejected, how much
+    of it would have actually won? A filter with a high 'would-have-won' rate
+    on a small sample is a candidate to loosen; this is reporting only."""
+    rows = get_rejection_effectiveness()
+    lines = ["🧪 <b>FILTER EFFECTIVENESS</b>  (lifetime, rejected signals)", "━━━━━━━━━━━━━━━━━━━━"]
+    if not rows:
+        lines.append("<i>No rejected signals logged yet.</i>")
+        return "\n".join(lines)
+    for cat, total, checked, would_win in rows:
+        checked   = checked or 0
+        would_win = would_win or 0
+        pct = f"{would_win/checked*100:.0f}%" if checked else "—"
+        lines.append(f"  {cat:<20} rejected {total:>4}  checked {checked:>4}  would've won {pct}")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("<i>'Checked' rows are ones far enough past to have an outcome yet.</i>")
     return "\n".join(lines)
 
 
@@ -5866,6 +6171,25 @@ async def cmd_patterns(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(_NOT_READY_MSG, parse_mode="HTML"); return
     await update.message.reply_text("🔬 Running pattern discovery…", parse_mode="HTML")
     threading.Thread(target=_pattern_discovery, daemon=True, name="PatDiscCmd").start()
+
+async def cmd_scoreperf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Fine-grained score-bucket performance dashboard (75-79...95-100)."""
+    if not _bot_ready:
+        await update.message.reply_text(_NOT_READY_MSG, parse_mode="HTML"); return
+    await update.message.reply_text(_score_bucket_perf_text(), parse_mode="HTML")
+
+async def cmd_martingale(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Normal vs recovery (Gale-1) trade performance."""
+    if not _bot_ready:
+        await update.message.reply_text(_NOT_READY_MSG, parse_mode="HTML"); return
+    await update.message.reply_text(_martingale_perf_text(), parse_mode="HTML")
+
+async def cmd_rejections(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Filter-rejection effectiveness: of what we rejected, how much would've won?"""
+    if not _bot_ready:
+        await update.message.reply_text(_NOT_READY_MSG, parse_mode="HTML"); return
+    await update.message.reply_text(_rejection_effectiveness_text(), parse_mode="HTML")
+
 
 async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Send full trades.db CSV on demand."""
@@ -7061,6 +7385,35 @@ def _scan_status_loop():
 # ══════════════════════════════════════════════════════════════════════
 #  MIDNIGHT BREAKDOWN  (00:00 UTC daily)
 # ══════════════════════════════════════════════════════════════════════
+def _rejected_signal_backfill_loop():
+    """Every 30s, check rejected signals whose contract window has elapsed and
+    fill in whether the market would have paid out anyway — using the live
+    price already being tracked for trading, so no extra API calls or compute."""
+    while True:
+        try:
+            time.sleep(30)
+            now_iso = datetime.now(timezone.utc).isoformat()
+            rows = _db_fetch(
+                "SELECT timestamp, symbol, direction, entry_price FROM rejected_signals "
+                "WHERE would_have_won IS NULL AND check_at <= ? LIMIT 200",
+                (now_iso,),
+            )
+            for ts, sym, direction, entry_price in rows:
+                with _lock:
+                    cc = current_candle.get(sym)
+                cur_price = float(cc["close"]) if cc else None
+                if cur_price is None or entry_price is None:
+                    continue
+                won = (direction == "UP" and cur_price > entry_price) or \
+                      (direction == "DOWN" and cur_price < entry_price)
+                db_queue.put({
+                    "type": "rej_update", "timestamp": ts, "symbol": sym,
+                    "win": int(won),
+                })
+        except Exception as e:
+            logger.error(f"Rejected-signal backfill error: {e}")
+
+
 def _midnight_breakdown_loop():
     """At every UTC midnight, send a full day breakdown by market session."""
     global daily_total_pnl
@@ -7385,6 +7738,9 @@ def _start_telegram():
         app.add_handler(CommandHandler("set",       cmd_set))
         app.add_handler(CommandHandler("analytics", cmd_analytics))
         app.add_handler(CommandHandler("patterns",  cmd_patterns))
+        app.add_handler(CommandHandler("scoreperf",  cmd_scoreperf))
+        app.add_handler(CommandHandler("martingale", cmd_martingale))
+        app.add_handler(CommandHandler("rejections", cmd_rejections))
         # CSV upload: catch ALL document messages and check filename inside the
         # handler — avoids MIME-type mismatches (mobile sends text/plain,
         # desktop sends text/csv, some clients send application/octet-stream).
@@ -7541,9 +7897,15 @@ def main():
     # Also cap ml_trained_on to the real DB count: bootstrap models are trained
     # on historical candle simulations, which is a much larger number than real
     # trades. Without this cap the counter can stay stuck at 50 forever.
+    # NOTE: excludes barrier='backtest' rows — those are synthetic trades that
+    # backtest.py inserts purely to help train the ML model; they must never
+    # count toward the user-visible "real trades placed" progress counter.
     global ml_total_trades, ml_trained_on  # must declare global here — in main(), not module scope
     try:
-        _db_cnt_rows = _db_fetch("SELECT COUNT(*) FROM trades WHERE win IN (0,1)")
+        _db_cnt_rows = _db_fetch(
+            "SELECT COUNT(*) FROM trades WHERE win IN (0,1) "
+            "AND (barrier IS NULL OR barrier != 'backtest')"
+        )
         _db_count = int(_db_cnt_rows[0][0]) if _db_cnt_rows and _db_cnt_rows[0][0] else 0
         with ml_lock:
             ml_total_trades = max(ml_total_trades, _db_count)
@@ -7554,6 +7916,12 @@ def main():
                 logger.info(f"Capped ml_trained_on to real DB count {ml_total_trades}")
         logger.info(f"ml_total_trades initialised to {ml_total_trades} from DB "
                     f"(ml_trained_on={ml_trained_on})")
+        # ── Train once on boot straight from whatever is already in the DB
+        # (e.g. a backtest seed) instead of waiting for the next live trade.
+        # _ml_maybe_retrain() has its own gating (untrained, or trained_on is
+        # stale by >= ML_RETRAIN_EVERY) so it's safe to always call here —
+        # one-time background thread, same cost as any other retrain.
+        _ml_maybe_retrain(ml_total_trades)
     except Exception as _e:
         logger.warning(f"Failed to init ml_total_trades from DB: {_e}")
 
@@ -7589,6 +7957,7 @@ def main():
     _watch_thread(_pending_trade_timeout_loop,  name="PendingTimeout")
     _watch_thread(_stale_contract_watchdog,     name="StaleWatchdog")
     _watch_thread(_midnight_breakdown_loop,     name="MidnightBreakdown")
+    _watch_thread(_rejected_signal_backfill_loop, name="RejectionBackfill")
     _watch_thread(_pinned_dashboard_loop,       name="PinnedDashboard")
     _watch_thread(_session_change_monitor_loop, name="SessionMonitor")
     # Guard thread: makes sure ML retrains even if DB-writer path is delayed
