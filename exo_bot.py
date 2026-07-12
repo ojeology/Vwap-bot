@@ -173,7 +173,7 @@ ML_SF_SUFFICIENT_TRADES = 150    # signal_features must reach this many real tra
                                  # actually get used for training instead of being ignored
                                  # in favor of a handful of real signal_features rows.
 ML_RETRAIN_EVERY  = 50           # retrain every 50 trades (continuous rolling)
-ML_CONFIDENCE_MIN = 0.60              # require ≥60% confidence (adjustable via Telegram)
+ML_CONFIDENCE_MIN = 0.50              # require ≥60% confidence (adjustable via Telegram)
 # Rich 16-feature set used when signal_features table has ≥ ML_MIN_TRADES rows
 ML_FEATURE_COLS = [
     "score",          # total signal score [0-100]
