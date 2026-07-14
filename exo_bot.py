@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║        DERIV RISE/FALL BOT v4  –  Professional Edition               ║
-║  Market Structure · Candlestick Patterns · Supertrend · Fast ML      ║
+║        DERIV TOUCH BOT v1  –  Professional Edition                   ║
+║  Supertrend · Market Sessions · Fast ML · 93% Confidence Gate        ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
 import json, time, sqlite3, threading, queue, logging, asyncio, os, sys, pickle, io, csv as _csv, html as _html
+import math
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from collections import deque
 from typing import Optional
 
-import math
 import numpy as np
 import pandas as pd
 
-# PostgreSQL — prefers NEON_DATABASE_URL (user-supplied Neon connection string),
-# falls back to Replit-managed DATABASE_URL, then SQLite.
+# PostgreSQL support (optional – falls back to SQLite when neither URL is set)
+# Prefers NEON_DATABASE_URL (same convention as sniper_bot.py) so this bot's
+# data lands in the same managed Neon Postgres instance, not a local placeholder DB.
 DATABASE_URL = os.environ.get("NEON_DATABASE_URL") or os.environ.get("DATABASE_URL")
 USE_PG = bool(DATABASE_URL)
 if USE_PG:
@@ -27,8 +28,8 @@ if USE_PG:
     except ImportError:
         # psycopg2 not installed — fall back to SQLite and warn
         import logging as _lg
-        _lg.getLogger("sniper").warning(
-            "NEON_DATABASE_URL is set but psycopg2-binary is not installed. "
+        _lg.getLogger("touch").warning(
+            "DATABASE_URL is set but psycopg2-binary is not installed. "
             "Falling back to SQLite. Run: pip install psycopg2-binary"
         )
         DATABASE_URL = None
@@ -40,7 +41,6 @@ from sklearn.ensemble import (
 )
 from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import roc_auc_score, brier_score_loss, accuracy_score
 
 from rich.console import Console
 from rich.layout import Layout
@@ -61,7 +61,7 @@ from telegram.ext import (
 #  CONFIG
 # ══════════════════════════════════════════════════════════════════════
 DERIV_APP_TOKEN    = os.environ.get("DERIV_TOKEN",    "m8MRwwwroJy6YQw")
-TELEGRAM_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN",   "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN",   "8908331931:AAHg-50KK8DLcYH1d2O7i9tIhredM-TIHnI")
 TELEGRAM_CHAT_ID   = os.environ.get("TG_CHAT_ID",     "6400145232")
 
 if not os.environ.get("DERIV_TOKEN"):
@@ -72,21 +72,18 @@ if not os.environ.get("TG_BOT_TOKEN"):
 SYNTH_VOLATILITY    = ["R_100", "R_75", "R_50", "R_25", "R_10"]
 SYNTH_VOLATILITY_1S = ["1HZ100V", "1HZ90V", "1HZ75V", "1HZ50V", "1HZ30V", "1HZ25V", "1HZ15V", "1HZ10V"]
 SYNTH_RANGE_BREAK   = ["RDBULL", "RDBEAR"]
-SYNTH_STEP          = ["stpRNG"]                                      # Step Index — Rise/Fall
-SYNTH_JUMP          = ["JD10", "JD25", "JD50", "JD75", "JD100"]      # Jump 10/25/50/75/100
 
-SYMBOLS        = (SYNTH_VOLATILITY + SYNTH_VOLATILITY_1S + SYNTH_RANGE_BREAK
-                  + SYNTH_STEP + SYNTH_JUMP)
-ALL_RF_SYMBOLS = SYMBOLS   # all Rise/Fall tradeable symbols
+SYMBOLS = SYNTH_VOLATILITY + SYNTH_VOLATILITY_1S + SYNTH_RANGE_BREAK
+ALL_TOUCH_SYMBOLS = SYMBOLS
 
 # ── Risk parameters ───────────────────────────────────────────────────
-STAKE                  = 1.0          # $1 per trade
+STAKE                  = 3.0          # $3 per trade
 TARGET_PROFIT          = 0.70         # display only
-PROFIT_MIN             = 0.60         # reject proposal if payout profit ratio < this (Rise/Fall)
-# No upper bound — Rise/Fall accepts any payout above the minimum
-DURATION               = 5            # 5-minute Rise/Fall contracts
-CONTRACT_TYPE_RISE     = "CALL"       # Rise contract (UP direction)
-CONTRACT_TYPE_FALL     = "PUT"        # Fall contract (DOWN direction)
+PROFIT_MIN             = 0.55         # reject proposal if profit-per-trade < this
+PROFIT_MAX             = 0.90         # reject proposal if profit-per-trade > this
+ATR_BARRIER_MULT       = 0.60        # tuned for ~$0.60-0.90 profit/trade across all symbols
+DURATION               = 10
+CONTRACT_TYPE          = "ONETOUCH"
 COOLDOWN_MINUTES       = 20
 # ── Second entry (re-entry on same symbol after a win) ────────────────
 ALLOW_SECOND_ENTRY     = True     # enable controlled re-entry after a win
@@ -95,35 +92,27 @@ SECOND_ENTRY_ML_MIN    = 0.90     # stricter ML gate for re-entry (90%)
 SECOND_ENTRY_WINDOW    = 15       # window (min) to wait for re-entry signal after win
 MAX_CONSECUTIVE_LOSSES = 3
 PAUSE_MINUTES          = 30
-
-# ── Martingale (3-step: base → 2× → 4× stake on consecutive losses) ──
-MARTINGALE_ENABLED    = True    # double stake on each consecutive loss up to MAX_STEPS
-MARTINGALE_MULTIPLIER = 2.0     # stake multiplier per loss step
-MARTINGALE_MAX_STEPS  = 1       # levels: 0=1× base, 1=2× base → then reset (1 recovery step only)
 DAILY_LOSS_LIMIT       = -10.0        # session SL
 DAILY_PROFIT_TARGET    = 5.0          # session TP
 MAX_DAILY_TRADES       = 9999
 
 # ── Indicator parameters ──────────────────────────────────────────────
-EMA_SLOW               = 200          # kept for direction fallback only
+EMA_SLOW               = 200          # EMA200 — long-term trend
+EMA_FAST               = 50           # EMA50  — medium trend (Sober Book trend component)
+ROC_PERIOD             = 10
 ATR_PERIOD             = 14
 ATR_MA_PERIOD          = 30
 RSI_PERIOD             = 14
 SUPERTREND_PERIOD      = 10
 SUPERTREND_ATR_MULT    = 3.0
-SCORE_THRESHOLD        = 75           # B-grade minimum (95=A+, 90=A, 85=B+, 75=B)
+SCORE_THRESHOLD        = 75           # minimum score to trade (lowered from 93 per user request)
 HEARTBEAT_INTERVAL_SEC = 3600      # richer hourly heartbeat
 
 # ── Strategy version ────────────────────────────────────────────────────
 # Bump this any time DURATION / SCORE_THRESHOLD / ML_CONFIDENCE_MIN /
 # ATR_BARRIER_MULT (or the underlying strategy logic) changes, so reports
 # can be compared apples-to-apples across config revisions over time.
-STRATEGY_VERSION = "V4.0-RF"  # Rise/Fall edition
-
-# ── Confirmation gate: require at least one entry signal before executing ──
-# Checks: candle pattern aligned, MACD confirmed, ROC aligned, or wick rejection.
-# Prevents "perfect trend, early entry" trades that miss the actual turn.
-CONFIRMATION_GATE_ENABLED = True
+STRATEGY_VERSION = "V2.5"
 
 # ── Market sessions (UTC hours) ───────────────────────────────────────
 # Maps session name → (start_hour_utc, end_hour_utc).
@@ -144,6 +133,8 @@ SESSION_EMOJIS = {
     "Early New York": "🗽",
     "Late New York":  "🌆",
 }
+# Ordinal position of each session, for the ML "session_ord" engineered feature.
+_ML_SESSION_ORDER = {name: i for i, name in enumerate(MARKET_SESSIONS.keys())}
 # Broad session group mapping (for DB backward-compat display)
 SESSION_GROUP = {
     "Midnight":       "Midnight",
@@ -164,49 +155,22 @@ SESSION_TIMES = {
 }
 
 # ── ML filter ────────────────────────────────────────────────────────
-MODEL_PATH        = "ml_model.pkl"
-ML_MIN_TRADES     = 50
-ML_SF_SUFFICIENT_TRADES = 150    # signal_features must reach this many real trades before
-                                 # it's trusted to stand alone; below it we bootstrap the
-                                 # global model from the (larger, legacy-feature) trades
-                                 # table instead — this is what lets a Neon-seeded backtest
-                                 # actually get used for training instead of being ignored
-                                 # in favor of a handful of real signal_features rows.
+MODEL_PATH        = "touch_ml_model.pkl"   # separate from sniper_bot.py's ml_model.pkl — different contract type/features
+ML_MIN_TRADES     = 100
 ML_RETRAIN_EVERY  = 50           # retrain every 50 trades (continuous rolling)
-ML_CONFIDENCE_MIN = 0.50              # require ≥60% confidence (adjustable via Telegram)
-# Rich 16-feature set used when signal_features table has ≥ ML_MIN_TRADES rows
-ML_FEATURE_COLS = [
-    "score",          # total signal score [0-100]
-    "adx_val",        # ADX trend strength
-    "rsi_val",        # RSI oscillator
-    "stochrsi_k_val", # StochRSI K line
-    "ms_pts",         # market structure points
-    "sd_pts",         # supply/demand zone points
-    "et_pts",         # entry timing points
-    "mom_pts",        # momentum points
-    "cc_pts",         # candle confirmation points
-    "sd_dist",        # zone proximity (ATR multiples)
-    "atr_val",        # ATR volatility
-    "ema_aligned",    # EMA50/200 alignment (0/1 int)
-    "ms_bos",         # break of structure (0/1 int)
-    "macd_bullish",   # MACD direction (0/1 int)
-    "roc_val",        # rate of change
-    "wick_atr_ratio", # candle wick size in ATR
-]
-# Legacy 7-feature set for trades-table fallback (column names in `trades` table)
-_ML_LEGACY_COLS = [
+ML_CONFIDENCE_MIN = 0.60              # require ≥60% confidence (lowered from 75%; adjustable via Telegram)
+ML_STACKING_MIN_TRADES = 200     # below this, use a single regularized GB model;
+                                 # at/above it, switch to the stacked ensemble (needs
+                                 # more data to avoid over-fitting 3 base learners)
+ML_FEATURE_COLS   = [
     "score", "wick_atr_ratio", "atr", "atr_ma",
     "ema_fast_slope", "ema_slow_slope", "ema_distance",
 ]
-# Engineered on top of the raw DB columns at training time (not stored):
-# cyclical time-of-day + ordinal market-session position, so the model can
-# learn session-dependent edge without a one-hot blowing up on small data.
-_ML_SESSION_ORDER = {name: i for i, name in enumerate(MARKET_SESSIONS.keys())}
+# Engineered columns appended at train/predict time only (never stored) — see
+# _ml_engineer(). Ported from sniper_bot.py: cyclical time-of-day lets the
+# model learn session-dependent edge without one-hot blowing up the feature
+# space on a small dataset.
 _ML_ENGINEERED_COLS = ["hour_sin", "hour_cos", "session_ord"]
-# Below this many rows, a stacked/calibrated ensemble has too few samples
-# per cross-val fold to be trustworthy — fall back to a single regularized
-# GradientBoosting model instead of forcing "exotic" onto noise.
-ML_STACKING_MIN_TRADES = 60
 
 # ── Per-class ML: separate model per volatility family ───────────────
 ML_SYMBOL_CLASSES = {
@@ -214,8 +178,6 @@ ML_SYMBOL_CLASSES = {
     "tick_vol":     ["1HZ100V", "1HZ90V", "1HZ75V", "1HZ50V",
                      "1HZ30V", "1HZ25V", "1HZ15V", "1HZ10V"],
     "range_break":  ["RDBULL", "RDBEAR"],
-    "step":         ["stpRNG"],
-    "jump":         ["JD10", "JD25", "JD50", "JD75", "JD100"],
 }
 TICK_MOMENTUM_MIN = 3   # consecutive confirming ticks required before entry
 # Note: DB columns keep original names for compat; we store:
@@ -224,10 +186,10 @@ TICK_MOMENTUM_MIN = 3   # consecutive confirming ticks required before entry
 #   ema_distance    → Supertrend distance / ATR ratio
 
 logging.basicConfig(
-    filename="sniper.log", level=logging.INFO,
+    filename="touch.log", level=logging.INFO,
     format="%(asctime)s [%(threadName)s] %(levelname)s %(message)s",
 )
-logger = logging.getLogger("sniper")
+logger = logging.getLogger("touch")
 
 # ══════════════════════════════════════════════════════════════════════
 #  GLOBALS
@@ -241,13 +203,11 @@ indicators_m15: dict = {}  # M15 Supertrend direction per symbol
 pending_signals, active_contracts = {}, {}
 locked_symbols: dict = {}
 unconfirmed_buys: dict = {}
-ws_registry: dict = {}   # symbol -> live WebSocketApp, used to re-query contracts before assuming a loss
-# symbol -> {"details":..., "requested_at":...} — set while we ask Deriv's
-# portfolio for a contract that may have opened despite a lost buy ack, so
-# we never silently abandon a real, un-tracked open position.
+# Awaiting a {"portfolio": 1} response to confirm/deny an orphaned buy whose
+# ack never arrived — symbol -> {"details":..., "requested_at":...}
 _portfolio_checks: dict = {}
-total_pnl       = 0.0
-daily_total_pnl = 0.0   # Cumulates all day; resets at UTC midnight only (session resets don't touch it)
+ws_registry: dict = {}   # symbol -> live WebSocketApp, used to re-query contracts before assuming a loss
+total_pnl = 0.0
 peak_equity = 0.0
 max_drawdown = 0.0
 win_count = loss_count = daily_trades = consecutive_losses = 0
@@ -289,9 +249,6 @@ _pinned_msg_id: Optional[int] = None   # ID of the auto-pinned dashboard message
 _current_session_name: str = ""        # for session-change auto-reports
 _test_trade_sem = threading.Semaphore(1)
 _test_trade_active: dict = {}
-
-# Martingale tracking — symbol → current loss step (0=base, 1=2×, 2=4×)
-martingale_level: dict = {}
 
 # ML state ─────────────────────────────────────────────────────────────
 ml_model = None          # global combined model (all symbols)
@@ -465,57 +422,133 @@ def _ml_save():
         logger.error(f"Failed to save ML model: {e}")
 
 
+def _ml_engineer(raw_vals: list, timestamp: str, session: str) -> list:
+    """Extend the raw DB feature vector with cyclical time-of-day + ordinal
+    market-session position, computed at train/predict time (not stored),
+    so the model can pick up session-dependent edge without a one-hot
+    exploding the feature space on a small dataset. Ported from sniper_bot.py."""
+    hour = 12.0
+    if timestamp:
+        try:
+            hour = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00")).hour
+        except (ValueError, TypeError):
+            pass
+    hour_sin = math.sin(2 * math.pi * hour / 24.0)
+    hour_cos = math.cos(2 * math.pi * hour / 24.0)
+    session_ord = float(_ML_SESSION_ORDER.get(session, -1))
+    return list(raw_vals) + [hour_sin, hour_cos, session_ord]
+
+
+def _ml_build_matrix(rows: list, n_raw: int) -> tuple:
+    """rows: (symbol, *raw_feature_vals, timestamp, session, win). Returns (X, y)
+    with engineered columns appended."""
+    X, y = [], []
+    for r in rows:
+        raw = [float(r[1 + i]) if r[1 + i] is not None else 0.0 for i in range(n_raw)]
+        ts, sess, win = r[1 + n_raw], r[2 + n_raw], r[3 + n_raw]
+        X.append(_ml_engineer(raw, ts, sess))
+        y.append(win)
+    return X, y
+
+
+def _make_stacking_clf(random_state: int = 42) -> StackingClassifier:
+    """The 'exotic' ensemble: 3 diverse base learners (boosting, bagging,
+    extra-randomized trees) feeding a logistic-regression meta-learner that
+    learns how to blend them, wrapped in probability calibration so the
+    output is a genuine, trustworthy confidence — not just a raw vote.
+    Ported from sniper_bot.py, used once enough trades exist (see
+    ML_STACKING_MIN_TRADES)."""
+    base = [
+        ("gb", GradientBoostingClassifier(
+            n_estimators=200, max_depth=4, learning_rate=0.05,
+            subsample=0.8, min_samples_leaf=5, random_state=random_state)),
+        ("rf", RandomForestClassifier(
+            n_estimators=200, max_depth=6, class_weight="balanced",
+            random_state=random_state, n_jobs=1)),
+        ("et", ExtraTreesClassifier(
+            n_estimators=200, max_depth=6, class_weight="balanced",
+            random_state=random_state, n_jobs=1)),
+    ]
+    stack = StackingClassifier(
+        estimators=base,
+        final_estimator=LogisticRegression(max_iter=1000),
+        cv=3, stack_method="predict_proba", n_jobs=1, passthrough=False,
+    )
+    return CalibratedClassifierCV(stack, method="isotonic", cv=3)
+
+
+def _make_gb_clf(random_state: int = 42) -> GradientBoostingClassifier:
+    """Lightweight single-model fallback used when there isn't enough data
+    for the full stacking ensemble. Regularised to avoid over-fitting on
+    small datasets; returns a plain GradientBoostingClassifier so that
+    feature_importances_ is directly accessible after fitting."""
+    return GradientBoostingClassifier(
+        n_estimators=200, max_depth=3, learning_rate=0.05,
+        subsample=0.8, min_samples_leaf=5, random_state=random_state,
+    )
+
+
+def _walk_forward_eval(build_fn, X: list, y: list, weights) -> Optional[dict]:
+    """Time-ordered (no shuffling) holdout: train on the first 80% chronologically,
+    score on the last 20% never seen in training — an honest read on whether the
+    model generalizes forward in time, not just fits the past."""
+    n = len(X)
+    split = int(n * 0.8)
+    if split < 10 or (n - split) < 5:
+        return None
+    Xtr, Xte = X[:split], X[split:]
+    ytr, yte = y[:split], y[split:]
+    if len(set(ytr)) < 2 or len(set(yte)) < 2:
+        return None
+    try:
+        m = build_fn()
+        if weights is not None:
+            try:
+                m.fit(Xtr, ytr, sample_weight=weights[:split])
+            except TypeError:
+                m.fit(Xtr, ytr)   # CalibratedClassifierCV/Stacking doesn't take sample_weight cleanly
+        else:
+            m.fit(Xtr, ytr)
+        proba = m.predict_proba(Xte)[:, list(m.classes_).index(1)] if 1 in m.classes_ else [0.0] * len(yte)
+        preds = [1 if p >= 0.5 else 0 for p in proba]
+        acc = sum(1 for p, t in zip(preds, yte) if p == t) / len(yte)
+        said_trade = [i for i, p in enumerate(preds) if p == 1]
+        precision = (
+            sum(1 for i in said_trade if yte[i] == 1) / len(said_trade)
+            if said_trade else 0.0
+        )
+        baseline_wr = sum(yte) / len(yte)
+        return {
+            "n_test": len(yte), "acc": acc, "precision": precision,
+            "baseline_wr": baseline_wr,
+        }
+    except Exception as e:
+        logger.error(f"walk-forward eval failed: {e}")
+        return None
+
+
 def _ml_get_confidence(details: dict, symbol: str = "") -> float:
-    """Return ML win-probability (0.0–1.0). Supports rich 16-feature and legacy 7-feature
-    models. Both are trained with 3 *engineered* columns appended on top (hour_sin,
-    hour_cos, session_ord — see `_ml_engineer`), so the vector built here MUST append
-    the same engineered columns computed from "now", or sklearn raises a feature-count
-    mismatch and every prediction silently falls through to the `except` below (which
-    returns 1.0 == ML gate wide open, no filtering at all)."""
+    """Return ML win-probability (0.0–1.0) using the best available model for this symbol."""
     cls = _get_symbol_class(symbol) if symbol else "standard_vol"
     with ml_lock:
+        # Prefer per-class model; fall back to global model
         model = ml_models_per_class.get(cls) or ml_model
     if model is None:
         return 1.0
     try:
-        rich_n   = len(ML_FEATURE_COLS) + len(_ML_ENGINEERED_COLS)
-        legacy_n = len(_ML_LEGACY_COLS) + len(_ML_ENGINEERED_COLS)
-        n_feats  = getattr(model, "n_features_in_", rich_n)
-        if n_feats == rich_n:
-            # Rich 16-feature vector (trained on signal_features table)
-            raw = [
-                float(details.get("total_score", 0) or 0),
-                float(details.get("adx", 0) or 0),
-                float(details.get("rsi", 0) or 0),
-                float(details.get("stochrsi_k", 0) or 0),
-                float(details.get("market_struct_pts", 0) or 0),
-                float(details.get("sd_zone_pts", 0) or 0),
-                float(details.get("entry_quality", 0) or 0),
-                float(details.get("momentum", 0) or 0),
-                float(details.get("candle_pattern_pts", 0) or 0),
-                float(details.get("sd_zone_dist", 99.0) or 99.0),
-                float(details.get("atr", 0) or 0),
-                float(int(bool(details.get("ema_aligned", False)))),
-                float(int(bool(details.get("market_struct_bos", False)))),
-                float(int(bool(details.get("macd_bullish", False)))),
-                float(details.get("roc", 0) or 0),
-                float(details.get("wick_atr_ratio", 0) or 0),
-            ]
-        else:
-            # Legacy 7-feature vector (trained on trades table), n_feats == legacy_n
-            raw = [
-                float(details.get("total_score", 0) or 0),
-                float(details.get("wick_atr_ratio", 0) or 0),
-                float(details.get("atr", 0) or 0),
-                float(details.get("atr_ma", 0) or 0),
-                float(details.get("ema_fast_sl", 0) or 0),
-                float(details.get("ema_slow_sl", 0) or 0),
-                float(details.get("ema_distance", 0) or 0),
-            ]
+        raw = [
+            details.get("total_score", 0),
+            details.get("wick_atr_ratio", 0),
+            details.get("atr", 0) or 0,
+            details.get("atr_ma", 0) or 0,
+            details.get("ema_fast_sl", 0) or 0,
+            details.get("ema_slow_sl", 0) or 0,
+            details.get("ema_distance", 0) or 0,
+        ]
         now     = datetime.now(timezone.utc)
         session = _get_session_name(now)
         feats   = [_ml_engineer(raw, now.isoformat(), session)]
-        proba   = model.predict_proba(feats)[0]
+        proba = model.predict_proba(feats)[0]
         classes = list(model.classes_)
         win_idx = classes.index(1) if 1 in classes else len(classes) - 1
         return float(proba[win_idx])
@@ -548,11 +581,11 @@ def _ml_export_csv(total: int):
             "market_session",
         ]
         # Use _db_fetch for PostgreSQL + SQLite compatibility
-        rows = _db_fetch(f"SELECT {', '.join(cols)} FROM trades ORDER BY id")
+        rows = _db_fetch(f"SELECT {', '.join(cols)} FROM touch_trades ORDER BY id")
         if not rows:
             # Fallback: try without market_session (older schema)
             cols = cols[:-1]
-            rows = _db_fetch(f"SELECT {', '.join(cols)} FROM trades ORDER BY id")
+            rows = _db_fetch(f"SELECT {', '.join(cols)} FROM touch_trades ORDER BY id")
         buf = io.StringIO()
         writer = _csv.writer(buf)
         writer.writerow(cols)
@@ -577,150 +610,33 @@ def _ml_progress_bar(pct: float, width: int = 12) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-def _ml_engineer(raw_vals: list, timestamp: str, session: str) -> list:
-    """Extend the raw DB feature vector with cyclical time-of-day + ordinal
-    market-session position, computed at train/predict time (not stored),
-    so the model can pick up session-dependent edge without a one-hot
-    exploding the feature space on a small dataset."""
-    hour = 12.0
-    if timestamp:
-        try:
-            hour = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00")).hour
-        except (ValueError, TypeError):
-            pass
-    hour_sin = math.sin(2 * math.pi * hour / 24.0)
-    hour_cos = math.cos(2 * math.pi * hour / 24.0)
-    session_ord = float(_ML_SESSION_ORDER.get(session, -1))
-    return list(raw_vals) + [hour_sin, hour_cos, session_ord]
-
-
-def _ml_build_matrix(rows: list, n_raw: int) -> tuple:
-    """rows: (symbol, *raw_feature_vals, timestamp, session, win). Returns (X, y)
-    with engineered columns appended."""
-    X, y = [], []
-    for r in rows:
-        raw = [float(r[1 + i]) if r[1 + i] is not None else 0.0 for i in range(n_raw)]
-        ts, sess, win = r[1 + n_raw], r[2 + n_raw], r[3 + n_raw]
-        X.append(_ml_engineer(raw, ts, sess))
-        y.append(win)
-    return X, y
-
-
-def _make_stacking_clf(random_state: int = 42) -> StackingClassifier:
-    """The 'exotic' ensemble: 3 diverse base learners (boosting, bagging,
-    extra-randomized trees) feeding a logistic-regression meta-learner that
-    learns how to blend them, wrapped in probability calibration so the
-    output is a genuine, trustworthy confidence — not just a raw vote."""
-    base = [
-        ("gb", GradientBoostingClassifier(
-            n_estimators=200, max_depth=4, learning_rate=0.05,
-            subsample=0.8, min_samples_leaf=5, random_state=random_state)),
-        ("rf", RandomForestClassifier(
-            n_estimators=200, max_depth=6, class_weight="balanced",
-            random_state=random_state, n_jobs=1)),
-        ("et", ExtraTreesClassifier(
-            n_estimators=200, max_depth=6, class_weight="balanced",
-            random_state=random_state, n_jobs=1)),
-    ]
-    stack = StackingClassifier(
-        estimators=base,
-        final_estimator=LogisticRegression(max_iter=1000),
-        cv=3, stack_method="predict_proba", n_jobs=1, passthrough=False,
-    )
-    return CalibratedClassifierCV(stack, method="isotonic", cv=3)
-
-
-def _make_gb_clf(random_state: int = 42) -> GradientBoostingClassifier:
-    """Lightweight single-model fallback used when there isn't enough data
-    for the full stacking ensemble.  Regularised to avoid over-fitting on
-    small datasets; returns a plain GradientBoostingClassifier so that
-    feature_importances_ is directly accessible after fitting."""
-    return GradientBoostingClassifier(
-        n_estimators=200, max_depth=3, learning_rate=0.05,
-        subsample=0.8, min_samples_leaf=5, random_state=random_state,
-    )
-
-
-def _walk_forward_eval(build_fn, X: list, y: list, weights) -> Optional[dict]:
-    """Time-ordered (no shuffling) holdout: train on the first 80% chronologically,
-    score on the last 20% never seen in training — an honest read on whether the
-    model generalizes forward in time, not just fits the past."""
-    n = len(X)
-    split = int(n * 0.8)
-    if split < 10 or (n - split) < 5:
-        return None
-    Xtr, Xte = X[:split], X[split:]
-    ytr, yte = y[:split], y[split:]
-    if len(set(ytr)) < 2 or len(set(yte)) < 2:
-        return None
-    try:
-        m = build_fn()
-        m.fit(Xtr, ytr, sample_weight=weights[:split]) if weights is not None else m.fit(Xtr, ytr)
-        proba = m.predict_proba(Xte)[:, 1]
-        preds = (proba >= 0.5).astype(int)
-        return {
-            "acc":   accuracy_score(yte, preds),
-            "auc":   roc_auc_score(yte, proba),
-            "brier": brier_score_loss(yte, proba),
-            "n_test": len(yte),
-        }
-    except Exception as e:
-        logger.warning(f"ML walk-forward eval failed: {e}")
-        return None
-
-
 def _ml_train():
-    """Train ML models.
-    Global model: a calibrated stacking ensemble (GradientBoosting + RandomForest +
-    ExtraTrees -> logistic meta-learner -> isotonic calibration) once there's enough
-    data per cross-val fold; otherwise a single regularized GradientBoosting so a
-    handful of trades can't be over-fit into false confidence.
-    Per-class: RandomForest (fast, good on small per-symbol-class datasets).
-    Prefers signal_features table (16 rich + 3 engineered features); falls back to
-    the trades table (7 legacy features) if signal_features is too sparse.
-    """
+    """Train / retrain the ML model (global + per-class). Global model is a
+    stacked ensemble (GB+RF+ExtraTrees -> calibrated LogReg) once enough real
+    trades exist, else a single regularized GradientBoosting model. Per-class
+    models stay RandomForest — those datasets are smaller and RF is cheap and
+    robust there. Sets ml_training_active; clears in finally."""
     global ml_model, ml_trained_on, ml_training_active, ml_models_per_class, ml_trained_per_class
     try:
-        # ── Choose training data source ──────────────────────────────────────
+        n_raw = len(ML_FEATURE_COLS)
         try:
-            sf_rows = _db_fetch(
-                f"SELECT symbol, {', '.join(ML_FEATURE_COLS)}, timestamp, session, win "
-                f"FROM signal_features WHERE win IN (0, 1) ORDER BY id"
+            # Use _db_fetch so training works with both SQLite and PostgreSQL.
+            # timestamp + market_session are needed for the engineered features
+            # (_ml_engineer); ORDER BY id keeps rows chronological for both the
+            # recency weighting and the walk-forward split.
+            rows_sym = _db_fetch(
+                f"SELECT symbol, {', '.join(ML_FEATURE_COLS)}, timestamp, market_session, win "
+                f"FROM touch_trades WHERE win IN (0, 1) ORDER BY id"   # exclude VOID rows (win=-1)
             )
-        except Exception:
-            sf_rows = []
+        except Exception as e:
+            logger.error(f"ML training query failed: {e}")
+            _send_tg(f"🤖 <b>ML Training Error</b>\n<code>{e}</code>\nWill retry on next trade.")
+            return
 
-        trades_rows = []
-        if len(sf_rows) < ML_SF_SUFFICIENT_TRADES:
-            # signal_features alone isn't rich enough yet — see if the (larger,
-            # legacy-feature) trades table has more to offer, e.g. a Neon-seeded
-            # backtest. Whichever source has more qualifying rows wins.
-            try:
-                trades_rows = _db_fetch(
-                    f"SELECT symbol, {', '.join(_ML_LEGACY_COLS)}, timestamp, market_session, win "
-                    f"FROM trades WHERE win IN (0, 1) ORDER BY id"
-                )
-            except Exception as e:
-                logger.error(f"ML training query (trades fallback) failed: {e}")
-                trades_rows = []
-
-        if len(sf_rows) >= ML_SF_SUFFICIENT_TRADES or len(sf_rows) >= len(trades_rows):
-            rows_sym     = sf_rows
-            feature_cols = ML_FEATURE_COLS
-            feat_src     = f"signal_features ({len(ML_FEATURE_COLS)}+{len(_ML_ENGINEERED_COLS)} features)"
-        else:
-            rows_sym     = trades_rows
-            feature_cols = _ML_LEGACY_COLS
-            feat_src     = f"trades ({len(_ML_LEGACY_COLS)}+{len(_ML_ENGINEERED_COLS)} features, legacy)"
-
-        n_raw = len(feature_cols)
         total = len(rows_sym)
-        logger.info(f"ML source-select DEBUG: sf_rows={len(sf_rows)} trades_rows={len(trades_rows)} "
-                    f"chosen={feat_src} total={total}")
-
         _send_tg(
-            f"🤖 <b>ML RETRAINING</b> — {feat_src}\n"
-            f"Training on <b>{total}</b> trades…\n"
+            f"🤖 <b>ML RETRAINING</b> — started\n"
+            f"Training on <b>{total}</b> real trades (global + 3 class models)…\n"
             f"<code>[{_ml_progress_bar(0.0)}]   0%</code>"
         )
 
@@ -734,64 +650,61 @@ def _ml_train():
             return
 
         X, y = _ml_build_matrix(rows_sym, n_raw)
-        all_feature_cols = feature_cols + _ML_ENGINEERED_COLS
+        all_feature_cols = ML_FEATURE_COLS + _ML_ENGINEERED_COLS
 
         if len(set(y)) < 2:
             _send_tg("🤖 <b>ML RETRAINING</b> — skipped\nNeed both wins AND losses in history.")
             return
 
-        # ── Adaptive recency weights (exponential decay, half-life = 100 trades) ─
+        # ── Adaptive sample weights: newer trades matter more ───────────────
+        # Exponential decay: row 0 is oldest, row -1 is newest. Half-life = 100 trades.
         half_life = 100.0
-        weights   = np.exp(np.linspace(-total / half_life, 0.0, total))
+        weights = np.exp(np.linspace(-total / half_life, 0.0, total))
         use_stack = total >= ML_STACKING_MIN_TRADES
 
-        try:
-            # ── Honest forward-looking holdout BEFORE fitting on everything ──
-            eval_res = _walk_forward_eval(
-                (_make_stacking_clf if use_stack else _make_gb_clf), X, y, weights,
+        # ── Walk-forward validation: chronological holdout, never random ────
+        # Random splits leak future information into training (lookahead bias) —
+        # rows are already ordered oldest→newest, so we train on the first 80%
+        # and score purely on the most recent, unseen 20%, using the SAME
+        # architecture the global model below will actually run.
+        wf_line = "Walk-forward: not enough data yet"
+        eval_res = _walk_forward_eval(
+            (_make_stacking_clf if use_stack else _make_gb_clf), X, y, weights,
+        )
+        if eval_res:
+            wf_line = (
+                f"Walk-forward (last {eval_res['n_test']} trades, unseen by model):\n"
+                f"  Accuracy: {eval_res['acc']*100:.0f}%  ·  "
+                f"Precision on 'trade' calls: {eval_res['precision']*100:.0f}%\n"
+                f"  vs. raw win-rate baseline: {eval_res['baseline_wr']*100:.0f}%"
             )
 
-            # ── Global model: exotic stack once data supports it, else a single
-            #    regularized GradientBoosting to avoid over-fitting on noise ──
+        try:
+            # ── Global model: stacked ensemble once data supports it, else a
+            #    single regularized GradientBoosting to avoid over-fitting noise ──
             if use_stack:
                 clf = _make_stacking_clf()
-                clf.fit(X, y)   # CalibratedClassifierCV doesn't accept sample_weight cleanly through Stacking
+                clf.fit(X, y)   # CalibratedClassifierCV/Stacking don't take sample_weight cleanly
                 arch_label = "Stacked (GB+RF+ExtraTrees → LogReg) + isotonic calibration"
-                imp_line = "n/a (stacked ensemble — see per-class importances below)"
+                imp_line = "n/a (stacked ensemble)"
             else:
                 clf = _make_gb_clf()
                 clf.fit(X, y, sample_weight=weights)
-                arch_label = "GradientBoosting (single model — building toward stacking at " \
-                             f"{ML_STACKING_MIN_TRADES} trades)"
-                imp = sorted(zip(all_feature_cols, clf.feature_importances_),
-                             key=lambda x: x[1], reverse=True)
-                # Full ranked importance table sent to Telegram
-                _imp_full = "\n".join(
-                    [f"  {i+1:2d}. {n:<20s} {v*100:5.1f}%" for i, (n, v) in enumerate(imp)]
+                arch_label = f"GradientBoosting (single model — stacking unlocks at {ML_STACKING_MIN_TRADES} trades)"
+                imp = sorted(
+                    zip(all_feature_cols, clf.feature_importances_),
+                    key=lambda x: x[1], reverse=True,
                 )
-                threading.Thread(
-                    target=_send_tg,
-                    args=(f"📊 <b>ML Feature Importance</b>\n<pre>{_imp_full}</pre>",),
-                    daemon=True,
-                ).start()
-                imp_line = "  ".join([f"{n} {v*100:.0f}%" for n, v in imp[:4]])
+                imp_line = "  ".join([f"{n} {v*100:.0f}%" for n, v in imp[:3]])
 
             with ml_lock:
-                ml_model     = clf
+                ml_model = clf
                 ml_trained_on = total
 
-            eval_line = ""
-            if eval_res:
-                eval_line = (
-                    f"Holdout (last {eval_res['n_test']}, unseen in training): "
-                    f"Acc {eval_res['acc']*100:.0f}%  ·  AUC {eval_res['auc']:.2f}  ·  "
-                    f"Brier {eval_res['brier']:.3f}\n"
-                )
-
-            # ── Per-class models: RandomForest (fast, handles small datasets) ──
-            new_cls_models  = {}
-            new_cls_trained = {}
-            cls_lines       = []
+            # ── Per-class models (RandomForest — small datasets, cheap, robust) ──
+            new_cls_models   = {}
+            new_cls_trained  = {}
+            cls_lines = []
             for cls, syms in ML_SYMBOL_CLASSES.items():
                 cls_rows = [r for r in rows_sym if r[0] in syms]
                 if len(cls_rows) < 20:
@@ -804,7 +717,7 @@ def _ml_train():
                 n_c = len(cls_rows)
                 w_c = np.exp(np.linspace(-n_c / half_life, 0.0, n_c))
                 clf_c = RandomForestClassifier(
-                    n_estimators=150, max_depth=6, random_state=42,
+                    n_estimators=100, max_depth=5, random_state=42,
                     class_weight="balanced", n_jobs=1,
                 )
                 clf_c.fit(Xc, yc, sample_weight=w_c)
@@ -821,12 +734,10 @@ def _ml_train():
             _send_tg(
                 f"🤖 <b>ML RETRAINING COMPLETE</b> ✅\n"
                 f"<code>[{_ml_progress_bar(1.0)}] 100%</code>\n"
-                f"Source: {feat_src}  |  <b>{total}</b> trades\n"
-                f"Global: {arch_label}\n"
-                f"Gate ≥<b>{ML_CONFIDENCE_MIN*100:.0f}%</b>\n"
-                f"{eval_line}"
+                f"Global: <b>{total}</b> trades  |  Gate ≥<b>{ML_CONFIDENCE_MIN*100:.0f}%</b>\n"
+                f"Architecture: {arch_label}\n"
                 f"Top features: {imp_line}\n"
-                f"Per-class (RandomForest):\n" + "\n".join(cls_lines)
+                f"Per-class:\n" + "\n".join(cls_lines) + f"\n\n{wf_line}"
             )
             _ml_export_csv(total)
         except Exception as e:
@@ -880,8 +791,7 @@ def _ml_retrain_guard_loop():
 def _ml_bootstrap_from_history():
     """
     Build initial ML training data from historical candle data.
-    Simulates Rise/Fall outcomes: did the close AFTER DURATION candles
-    close higher (CALL/UP) or lower (PUT/DOWN) than the entry close?
+    Simulates ONETOUCH outcomes: did price touch the barrier in next DURATION candles?
     This lets the ML filter work from the very first real trade.
     """
     global ml_model, ml_trained_on
@@ -893,7 +803,7 @@ def _ml_bootstrap_from_history():
             )
             return
 
-    _send_tg("🤖 <b>ML Bootstrap</b> — building training data from candle history (Rise/Fall)…")
+    _send_tg("🤖 <b>ML Bootstrap</b> — building training data from candle history…")
 
     all_X, all_y = [], []
 
@@ -910,10 +820,13 @@ def _ml_bootstrap_from_history():
         if atr <= 0:
             continue
 
+        barrier_offset = atr * ATR_BARRIER_MULT
         st_dir  = float(ind.get("supertrend_dir", 0))
         adx_v   = float(ind.get("adx") or 0)
         atr_ma  = float(ind.get("atr_ma") or atr)
-        st_dist_f = abs(float(ind.get("supertrend_val") or 0) - float(df["Close"].iloc[-1])) / atr
+        # ema_distance slot = ST-distance / ATR (barrier_offset / atr = ATR_BARRIER_MULT constant)
+        # This matches the 'ema_distance' column used at live-inference time (score_signal line 964).
+        st_dist_f = barrier_offset / atr  # = ATR_BARRIER_MULT; consistent proxy across all bootstrap rows
 
         check_from = max(30, len(df) - 400)
         check_to   = len(df) - DURATION - 1
@@ -921,16 +834,17 @@ def _ml_bootstrap_from_history():
             continue
 
         for i in range(check_from, check_to):
-            candle       = df.iloc[i]
-            future_close = float(df.iloc[i + DURATION]["Close"])
-            close        = float(candle["Close"])
+            candle = df.iloc[i]
+            future = df.iloc[i + 1:i + DURATION + 1]
+            close  = float(candle["Close"])
 
             direction = "UP" if st_dir >= 0 else "DOWN"
-            # Rise/Fall win: close higher for CALL, close lower for PUT
             if direction == "UP":
-                won = future_close > close
+                target  = close + barrier_offset
+                touched = bool((future["High"] >= target).any())
             else:
-                won = future_close < close
+                target  = close - barrier_offset
+                touched = bool((future["Low"] <= target).any())
 
             hi   = float(candle["High"])
             lo   = float(candle["Low"])
@@ -940,7 +854,7 @@ def _ml_bootstrap_from_history():
                 float(SCORE_THRESHOLD), wick, float(atr), atr_ma,
                 st_dir, adx_v, st_dist_f,
             ])
-            all_y.append(1 if won else 0)
+            all_y.append(1 if touched else 0)
 
     total = len(all_X)
     wins  = sum(all_y)
@@ -1137,158 +1051,6 @@ def _ml_progress_text() -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  PATTERN DISCOVERY  (fires every 100 settled trades)
-# ══════════════════════════════════════════════════════════════════════
-def _pattern_discovery():
-    """Analyse signal_features for top/worst performing combinations and send to Telegram."""
-    try:
-        rows = _db_fetch(
-            "SELECT ms_type, sd_zone, adx_val, candle_pattern, session, "
-            "ms_bos, sd_fresh, score, ml_confidence, win, profit "
-            "FROM signal_features WHERE win IN (0, 1) ORDER BY id"
-        )
-        if len(rows) < 50:
-            return
-
-        def adx_bucket(v):
-            v = v or 0
-            if v >= 30: return "ADX>30"
-            if v >= 20: return "ADX20-30"
-            if v >= 15: return "ADX15-20"
-            return "ADX<15"
-
-        def conf_bucket(v):
-            if v is None: return "NoML"
-            pct = v * 100
-            if pct >= 85: return "ML≥85%"
-            if pct >= 75: return "ML75-85%"
-            return "ML<75%"
-
-        combo_stats: dict = {}
-        for r in rows:
-            ms_type, sd_zone, adx_v, pat, sess, ms_bos, sd_fresh, score, conf, win, profit = r
-            adx_b  = adx_bucket(adx_v)
-            conf_b = conf_bucket(conf)
-            key = f"{pat or 'none'} + {sd_zone or 'none'} + {adx_b} + {conf_b}"
-            s   = combo_stats.setdefault(key, {"wins": 0, "total": 0, "pnl": 0.0})
-            s["total"] += 1
-            s["wins"]  += int(win)
-            s["pnl"]   += float(profit or 0)
-
-        # Only show combos with ≥10 trades (statistical significance)
-        qualified = [(k, v) for k, v in combo_stats.items() if v["total"] >= 10]
-        top  = sorted(qualified, key=lambda x: x[1]["wins"] / x[1]["total"], reverse=True)[:8]
-        worst = sorted(qualified, key=lambda x: x[1]["wins"] / x[1]["total"])[:3]
-
-        n_total  = len(rows)
-        wr_all   = sum(r[-2] for r in rows) / n_total * 100 if n_total else 0
-        pnl_all  = sum(float(r[-1] or 0) for r in rows)
-
-        lines = [
-            f"🔬 <b>PATTERN DISCOVERY</b>  ({n_total} trades  {wr_all:.1f}%WR  "
-            f"{'+'if pnl_all>=0 else ''}${pnl_all:.2f})",
-            "━━━━━━━━━━━━━━━━━━━━",
-            "<b>🏆 Top Combinations:</b>",
-        ]
-        for key, v in top:
-            wr  = v["wins"] / v["total"] * 100
-            sgn = "+" if v["pnl"] >= 0 else ""
-            lines.append(
-                f"  <b>{wr:.0f}%WR</b> ({v['wins']}/{v['total']})  {sgn}${v['pnl']:.2f}\n"
-                f"  ↳ {key}"
-            )
-
-        if worst:
-            lines += ["", "<b>⚠️ Worst Combinations:</b>"]
-            for key, v in worst:
-                wr  = v["wins"] / v["total"] * 100
-                sgn = "+" if v["pnl"] >= 0 else ""
-                lines.append(
-                    f"  <b>{wr:.0f}%WR</b> ({v['wins']}/{v['total']})  {sgn}${v['pnl']:.2f}\n"
-                    f"  ↳ {key}"
-                )
-
-        lines.append("\n<i>Combinations need ≥10 trades. Tune signal gates accordingly.</i>")
-        _send_tg("\n".join(lines))
-        logger.info(f"Pattern discovery sent: {len(qualified)} combos analysed")
-    except Exception as e:
-        logger.error(f"_pattern_discovery error: {e}")
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  PERFORMANCE ANALYTICS
-# ══════════════════════════════════════════════════════════════════════
-def _performance_analytics_text() -> str:
-    """Win-rate breakdown by score, ADX, pattern, session, S&D distance, ML confidence."""
-    try:
-        rows = _db_fetch(
-            "SELECT score, adx_val, candle_pattern, session, "
-            "sd_dist, ml_confidence, win, profit "
-            "FROM signal_features WHERE win IN (0, 1)"
-        )
-    except Exception as e:
-        return f"⚠️ Analytics query failed: <code>{e}</code>"
-
-    if len(rows) < 10:
-        try:
-            n_tr = _db_fetch(
-                "SELECT COUNT(*) FROM trades WHERE win IN (0,1) "
-                "AND (barrier IS NULL OR barrier != 'backtest')"
-            )
-            n    = int(n_tr[0][0]) if n_tr else 0
-        except Exception:
-            n = 0
-        return (
-            f"📊 <b>Performance Analytics</b>\n"
-            f"Signal features DB has no data yet ({n} trades in trades table).\n"
-            f"Analytics available after first {ML_MIN_TRADES} trades are logged."
-        )
-
-    def bucket_analysis(rows, key_fn):
-        buckets: dict = {}
-        for r in rows:
-            k = key_fn(r)
-            s = buckets.setdefault(k, {"wins": 0, "total": 0, "pnl": 0.0})
-            s["total"] += 1
-            s["wins"]  += int(r[-2])
-            s["pnl"]   += float(r[-1] or 0)
-        out = []
-        for k in sorted(buckets.keys()):
-            v  = buckets[k]
-            if v["total"] == 0:
-                continue
-            wr  = v["wins"] / v["total"] * 100
-            sgn = "+" if v["pnl"] >= 0 else ""
-            bar = "█" * min(10, int(wr / 10)) + "░" * max(0, 10 - int(wr / 10))
-            out.append(f"  <b>{k:<14}</b>  {v['total']:>3}t  {wr:.0f}%WR [{bar}]  {sgn}${v['pnl']:.2f}")
-        return out or ["  — no data —"]
-
-    n     = len(rows)
-    wr_all = sum(r[-2] for r in rows) / n * 100 if n else 0
-
-    score_fn = lambda r: f"Score {int((r[0] or 0)//5*5)}-{int((r[0] or 0)//5*5+4)}"
-    adx_fn   = lambda r: ("ADX>30" if (r[1] or 0)>=30 else "ADX20-30" if (r[1] or 0)>=20 else "ADX<20")
-    pat_fn   = lambda r: (r[2] or "none")[:18]
-    sess_fn  = lambda r: r[3] or "unknown"
-    dist_fn  = lambda r: ("Dist<0.8ATR" if (r[4] or 99)<0.8 else "Dist0.8-1.5" if (r[4] or 99)<1.5 else "Dist>1.5ATR")
-    conf_fn  = lambda r: ("ML≥85%" if (r[5] or 0)*100>=85 else "ML75-85%" if (r[5] or 0)*100>=75 else "ML<75%" if r[5] else "NoML")
-
-    lines = [
-        "📊 <b>Performance Analytics</b>",
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"Total: <b>{n}</b> trades  |  Overall WR: <b>{wr_all:.1f}%</b>",
-        "", "<b>By Score Range</b>",
-    ] + bucket_analysis(rows, score_fn)
-
-    lines += ["", "<b>By ADX</b>"] + bucket_analysis(rows, adx_fn)
-    lines += ["", "<b>By Candle Pattern</b>"] + bucket_analysis(rows, pat_fn)
-    lines += ["", "<b>By Session</b>"] + bucket_analysis(rows, sess_fn)
-    lines += ["", "<b>By S&amp;D Zone Distance</b>"] + bucket_analysis(rows, dist_fn)
-    lines += ["", "<b>By ML Confidence</b>"] + bucket_analysis(rows, conf_fn)
-    return "\n".join(lines)
-
-
-# ══════════════════════════════════════════════════════════════════════
 #  SYMBOL STATE INIT
 # ══════════════════════════════════════════════════════════════════════
 def _init_symbol(sym):
@@ -1322,22 +1084,23 @@ def _init_symbol(sym):
         "body_ratio":     None,   # abs(close-open)/(high-low) — 0=doji, 1=full body
         "upper_wick_atr": None,   # upper wick size in ATR units
         "lower_wick_atr": None,   # lower wick size in ATR units
-        # Sober Trading Book filters (core gates)
-        "market_structure":    "sideways",  # bullish / bearish / sideways
-        "market_struct_bos":   False,       # Break of Structure detected
-        "market_struct_choch": False,       # Change of Character detected
-        "market_struct_hh":    False,       # Higher High
-        "market_struct_hl":    False,       # Higher Low
-        "market_struct_lh":    False,       # Lower High
-        "market_struct_ll":    False,       # Lower Low
-        "sd_zone":             "none",      # demand / supply / none
-        "sd_zone_dist":        99.0,        # distance to zone in ATR units
-        "sd_zone_fresh":       False,       # zone untouched since formation
-        "candle_pattern":      "none",      # pattern name
-        "candle_pattern_bias": "neutral",   # bullish / bearish / neutral
-        # Extra indicators for display
-        "ema_fast":            None,        # EMA 50
-        "roc":                 None,        # 10-period Rate of Change (%)
+        # Trend (Sober Book)
+        "ema_fast": None,   # EMA 50
+        "roc":      None,   # Rate of Change (10-period)
+        # Sober Trading Book additions
+        "market_structure":    "sideways",
+        "market_struct_bos":   False,
+        "market_struct_choch": False,
+        "market_struct_hh":    False,
+        "market_struct_hl":    False,
+        "market_struct_lh":    False,
+        "market_struct_ll":    False,
+        "sd_zone":            "none",
+        "sd_zone_dist":       99.0,
+        "sd_zone_fresh":      False,
+        "sd_zone_tests":      0,
+        "candle_pattern":      "none",
+        "candle_pattern_bias": "neutral",
         "ready": False,
     }
 
@@ -1348,7 +1111,7 @@ def _init_symbol(sym):
 db_queue: queue.Queue = queue.Queue()
 
 _CREATE_TABLE_SQLITE = """
-    CREATE TABLE IF NOT EXISTS trades (
+    CREATE TABLE IF NOT EXISTS touch_trades (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp       TEXT,
         symbol          TEXT,
@@ -1361,12 +1124,12 @@ _CREATE_TABLE_SQLITE = """
         ema_fast_slope  REAL,    ema_slow_slope  REAL,
         ema_distance    REAL,
         market_session  TEXT,
-        is_recovery     INTEGER
+        is_backtest     INTEGER DEFAULT 0
     )
 """
 
 _CREATE_TABLE_PG = """
-    CREATE TABLE IF NOT EXISTS trades (
+    CREATE TABLE IF NOT EXISTS touch_trades (
         id              SERIAL PRIMARY KEY,
         timestamp       TEXT,
         symbol          TEXT,
@@ -1379,116 +1142,122 @@ _CREATE_TABLE_PG = """
         ema_fast_slope  REAL,    ema_slow_slope  REAL,
         ema_distance    REAL,
         market_session  TEXT,
-        is_recovery     INTEGER
+        is_backtest     BOOLEAN DEFAULT FALSE
     )
 """
 
 _INSERT_COLS = (
     "timestamp,symbol,direction,barrier,stake,payout,profit,win,score,"
-    "wick_atr_ratio,atr,atr_ma,ema_fast_slope,ema_slow_slope,ema_distance,market_session,"
-    "is_recovery"
+    "wick_atr_ratio,atr,atr_ma,ema_fast_slope,ema_slow_slope,ema_distance,market_session"
 )
 
-# ── Rejected-signals table (slim log: what got rejected, and — filled in later
-# by a background check — whether the market would have paid out anyway) ────
-_CREATE_REJ_SQLITE = """
-    CREATE TABLE IF NOT EXISTS rejected_signals (
-        id               INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp        TEXT,     symbol           TEXT,
-        direction        TEXT,     score            REAL,
-        grade            TEXT,     filter_category  TEXT,
-        reason           TEXT,     entry_price      REAL,
-        check_at         TEXT,     would_have_won   INTEGER
-    )
-"""
+# NULL-safe filter for excluding future backtest-tagged rows from live stats.
+# touch_trades' own `barrier` column always holds a real numeric barrier price
+# (never a tag), so backtest rows must be marked via the dedicated is_backtest
+# column instead of overloading `barrier` like sniper_bot.py's `trades` table does.
+_LIVE_ONLY_FILTER = "(is_backtest IS NULL OR is_backtest = 0)"
 
-_CREATE_REJ_PG = """
-    CREATE TABLE IF NOT EXISTS rejected_signals (
-        id               SERIAL PRIMARY KEY,
-        timestamp        TEXT,     symbol           TEXT,
-        direction        TEXT,     score            REAL,
-        grade            TEXT,     filter_category  TEXT,
-        reason           TEXT,     entry_price      REAL,
-        check_at         TEXT,     would_have_won   INTEGER
-    )
-"""
-
-_REJ_COLS = (
-    "timestamp,symbol,direction,score,grade,filter_category,reason,"
-    "entry_price,check_at,would_have_won"
-)
-_REJ_N = 10
-
-# ── Signal-features table (rich 39-column per-trade signal log) ──────
-_CREATE_SF_SQLITE = """
+# ── signal_features: rich per-trade feature log for Pattern Discovery /
+#    Performance Analytics (mirrors sniper_bot.py's schema+purpose) ─────────
+_CREATE_SIGNAL_FEATURES_SQLITE = """
     CREATE TABLE IF NOT EXISTS signal_features (
-        id               INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp        TEXT,     symbol           TEXT,
-        direction        TEXT,     expiry_min        INTEGER,
-        score            REAL,     grade            TEXT,
-        ml_confidence    REAL,
-        ms_pts           REAL,     ms_type          TEXT,
-        ms_bos           INTEGER,  ms_choch         INTEGER,
-        ms_hh            INTEGER,  ms_hl            INTEGER,
-        ms_lh            INTEGER,  ms_ll            INTEGER,
-        ema_fast         REAL,     ema_slow         REAL,
-        ema_aligned      INTEGER,
-        adx_val          REAL,     rsi_val          REAL,
-        stochrsi_k_val   REAL,
-        et_pts           REAL,
-        mom_pts          REAL,     macd_bullish     INTEGER,
-        macd_hist_rising INTEGER,  roc_val          REAL,
-        sd_zone          TEXT,     sd_dist          REAL,
-        sd_fresh         INTEGER,  sd_pts           REAL,
-        cc_pts           REAL,     candle_pattern   TEXT,
-        candle_bias      TEXT,
-        atr_val          REAL,     atr_ma_val       REAL,
-        wick_atr_ratio   REAL,
-        session          TEXT,
-        win              INTEGER,
-        profit           REAL
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp       TEXT,
+        symbol          TEXT,
+        ms_type         TEXT,
+        ms_bos          INTEGER,
+        sd_zone         TEXT,
+        sd_dist         REAL,
+        sd_fresh        INTEGER,
+        adx_val         REAL,
+        candle_pattern  TEXT,
+        session         TEXT,
+        score           REAL,
+        ml_confidence   REAL,
+        win             INTEGER,
+        profit          REAL
     )
 """
 
-_CREATE_SF_PG = """
+_CREATE_SIGNAL_FEATURES_PG = """
     CREATE TABLE IF NOT EXISTS signal_features (
-        id               SERIAL PRIMARY KEY,
-        timestamp        TEXT,     symbol           TEXT,
-        direction        TEXT,     expiry_min        INTEGER,
-        score            REAL,     grade            TEXT,
-        ml_confidence    REAL,
-        ms_pts           REAL,     ms_type          TEXT,
-        ms_bos           INTEGER,  ms_choch         INTEGER,
-        ms_hh            INTEGER,  ms_hl            INTEGER,
-        ms_lh            INTEGER,  ms_ll            INTEGER,
-        ema_fast         REAL,     ema_slow         REAL,
-        ema_aligned      INTEGER,
-        adx_val          REAL,     rsi_val          REAL,
-        stochrsi_k_val   REAL,
-        et_pts           REAL,
-        mom_pts          REAL,     macd_bullish     INTEGER,
-        macd_hist_rising INTEGER,  roc_val          REAL,
-        sd_zone          TEXT,     sd_dist          REAL,
-        sd_fresh         INTEGER,  sd_pts           REAL,
-        cc_pts           REAL,     candle_pattern   TEXT,
-        candle_bias      TEXT,
-        atr_val          REAL,     atr_ma_val       REAL,
-        wick_atr_ratio   REAL,
-        session          TEXT,
-        win              INTEGER,
-        profit           REAL
+        id              SERIAL PRIMARY KEY,
+        timestamp       TEXT,
+        symbol          TEXT,
+        ms_type         TEXT,
+        ms_bos          BOOLEAN,
+        sd_zone         TEXT,
+        sd_dist         REAL,
+        sd_fresh        BOOLEAN,
+        adx_val         REAL,
+        candle_pattern  TEXT,
+        session         TEXT,
+        score           REAL,
+        ml_confidence   REAL,
+        win             INTEGER,
+        profit          REAL
     )
 """
 
-_SF_COLS = (
-    "timestamp,symbol,direction,expiry_min,score,grade,ml_confidence,"
-    "ms_pts,ms_type,ms_bos,ms_choch,ms_hh,ms_hl,ms_lh,ms_ll,"
-    "ema_fast,ema_slow,ema_aligned,adx_val,rsi_val,stochrsi_k_val,"
-    "et_pts,mom_pts,macd_bullish,macd_hist_rising,roc_val,"
-    "sd_zone,sd_dist,sd_fresh,sd_pts,cc_pts,candle_pattern,candle_bias,"
-    "atr_val,atr_ma_val,wick_atr_ratio,session,win,profit"
+_SIGNAL_FEATURES_INSERT_COLS = (
+    "timestamp,symbol,ms_type,ms_bos,sd_zone,sd_dist,sd_fresh,adx_val,"
+    "candle_pattern,session,score,ml_confidence,win,profit"
 )
-_SF_N = 39   # number of columns in signal_features (excluding id)
+
+
+def _log_signal_features(symbol: str, details: dict, session: str, win: bool, profit: float):
+    """Persist one row of rich per-trade features for Pattern Discovery / Analytics."""
+    try:
+        row = (
+            datetime.now(timezone.utc).isoformat(), symbol,
+            details.get("market_structure", "sideways"),
+            int(bool(details.get("market_struct_bos", False))),   # INTEGER in Neon
+            details.get("sd_zone", "none"),
+            float(details.get("sd_zone_dist", 99.0) or 99.0),
+            int(bool(details.get("sd_zone_fresh", False))),        # INTEGER in Neon
+            float(details.get("adx", 0) or 0),
+            details.get("candle_pattern", "none"),
+            session,
+            float(details.get("total_score", 0) or 0),
+            details.get("ml_confidence"),
+            int(win),
+            float(profit),
+        )
+        if USE_PG:
+            conn = psycopg2.connect(DATABASE_URL)
+            cur  = conn.cursor()
+            cur.execute(_CREATE_SIGNAL_FEATURES_PG)
+            cur.execute(
+                f"INSERT INTO signal_features ({_SIGNAL_FEATURES_INSERT_COLS}) "
+                f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", row,
+            )
+            conn.commit(); cur.close(); conn.close()
+        else:
+            conn = sqlite3.connect("touch_trades.db")
+            conn.execute(_CREATE_SIGNAL_FEATURES_SQLITE)
+            conn.execute(
+                f"INSERT INTO signal_features ({_SIGNAL_FEATURES_INSERT_COLS}) "
+                f"VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row,
+            )
+            conn.commit(); conn.close()
+    except Exception as e:
+        logger.error(f"_log_signal_features error: {e}")
+
+
+def _pg_safe(v):
+    """Convert numpy / pandas scalars to plain Python types for psycopg2.
+    psycopg2 serialises numpy.float64 as 'np.float64(x)' which PostgreSQL
+    reads as schema-qualified, raising 'schema np does not exist'."""
+    t = type(v)
+    m = getattr(t, "__module__", "") or ""
+    if m.startswith("numpy") or m.startswith("pandas"):
+        if hasattr(v, "item"):          # ndarray scalars have .item()
+            return v.item()
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return v
+    return v
 
 
 def _db_fetch(sql: str, params: tuple = ()) -> list:
@@ -1501,7 +1270,7 @@ def _db_fetch(sql: str, params: tuple = ()) -> list:
             rows = cur.fetchall()
             cur.close(); conn.close()
         else:
-            conn = sqlite3.connect("trades.db")
+            conn = sqlite3.connect("touch_trades.db")
             rows = conn.execute(sql, params).fetchall()
             conn.close()
         return rows
@@ -1510,17 +1279,93 @@ def _db_fetch(sql: str, params: tuple = ()) -> list:
         return []
 
 
-def _pg_safe_row(row):
-    """Convert numpy scalar types (np.float64, np.int64, np.bool_, etc.) to native
-    Python types before handing a row to psycopg2. Needed because psycopg2's numpy
-    adapter can render e.g. np.float64(0.92) as literal unquoted SQL text
-    ('np.float64(0.92)'), which Postgres then misparses as a schema reference."""
-    safe = []
-    for v in row:
-        if isinstance(v, np.generic):
-            v = v.item()
-        safe.append(v)
-    return tuple(safe)
+_CREATE_ML_STATS_SQLITE = """
+    CREATE TABLE IF NOT EXISTS ml_live_stats (
+        bucket_type TEXT NOT NULL,
+        bucket_key  TEXT NOT NULL,
+        wins        INTEGER DEFAULT 0,
+        losses      INTEGER DEFAULT 0,
+        pnl         REAL DEFAULT 0.0,
+        PRIMARY KEY (bucket_type, bucket_key)
+    )
+"""
+
+_CREATE_ML_STATS_PG = """
+    CREATE TABLE IF NOT EXISTS ml_live_stats (
+        bucket_type TEXT NOT NULL,
+        bucket_key  TEXT NOT NULL,
+        wins        INTEGER DEFAULT 0,
+        losses      INTEGER DEFAULT 0,
+        pnl         REAL DEFAULT 0.0,
+        PRIMARY KEY (bucket_type, bucket_key)
+    )
+"""
+
+
+def _ml_stats_init_table():
+    """Create the ml_live_stats table (idempotent) so ML/score dashboards survive restarts."""
+    try:
+        if USE_PG:
+            conn = psycopg2.connect(DATABASE_URL)
+            conn.autocommit = True
+            cur = conn.cursor()
+            cur.execute(_CREATE_ML_STATS_PG)
+            cur.close(); conn.close()
+        else:
+            conn = sqlite3.connect("touch_trades.db")
+            conn.execute(_CREATE_ML_STATS_SQLITE)
+            conn.commit(); conn.close()
+    except Exception as e:
+        logger.error(f"ml_live_stats table init error: {e}")
+
+
+def _ml_stats_save(bucket_type: str, bucket_key: str, stats: dict):
+    """Upsert one bucket's live wins/losses/pnl into the DB (Neon-backed when USE_PG)."""
+    try:
+        if USE_PG:
+            conn = psycopg2.connect(DATABASE_URL)
+            conn.autocommit = True
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO ml_live_stats (bucket_type,bucket_key,wins,losses,pnl) "
+                "VALUES (%s,%s,%s,%s,%s) "
+                "ON CONFLICT (bucket_type,bucket_key) DO UPDATE SET "
+                "wins=EXCLUDED.wins, losses=EXCLUDED.losses, pnl=EXCLUDED.pnl",
+                (bucket_type, bucket_key, stats["wins"], stats["losses"], stats["pnl"]),
+            )
+            cur.close(); conn.close()
+        else:
+            conn = sqlite3.connect("touch_trades.db")
+            conn.execute(_CREATE_ML_STATS_SQLITE)
+            conn.execute(
+                "INSERT INTO ml_live_stats (bucket_type,bucket_key,wins,losses,pnl) "
+                "VALUES (?,?,?,?,?) "
+                "ON CONFLICT(bucket_type,bucket_key) DO UPDATE SET "
+                "wins=excluded.wins, losses=excluded.losses, pnl=excluded.pnl",
+                (bucket_type, bucket_key, stats["wins"], stats["losses"], stats["pnl"]),
+            )
+            conn.commit(); conn.close()
+    except Exception as e:
+        logger.error(f"ml_live_stats save error: {e}")
+
+
+def _ml_stats_load_all():
+    """Restore _ml_conf_live_stats / _ml_score_live_stats from the DB after a restart."""
+    global _ml_conf_live_stats, _ml_score_live_stats
+    try:
+        _ml_stats_init_table()
+        rows = _db_fetch("SELECT bucket_type, bucket_key, wins, losses, pnl FROM ml_live_stats")
+        for bucket_type, bucket_key, wins, losses, pnl in rows:
+            target = _ml_conf_live_stats if bucket_type == "conf" else _ml_score_live_stats
+            target[bucket_key] = {
+                "wins": int(wins or 0), "losses": int(losses or 0), "pnl": float(pnl or 0.0),
+            }
+        logger.info(
+            f"ML live stats restored from DB: {len(_ml_conf_live_stats)} conf buckets, "
+            f"{len(_ml_score_live_stats)} score buckets"
+        )
+    except Exception as e:
+        logger.error(f"ml_live_stats load error: {e}")
 
 
 def _db_writer():
@@ -1530,85 +1375,32 @@ def _db_writer():
         cur  = conn.cursor()
         cur.execute(_CREATE_TABLE_PG)
         # Add market_session column if missing (older PG schema)
-        cur.execute("""
-            DO $body$ BEGIN
-                ALTER TABLE trades ADD COLUMN market_session TEXT;
-            EXCEPTION WHEN duplicate_column THEN NULL;
-            END $body$;
-        """)
-        cur.execute("""
-            DO $body$ BEGIN
-                ALTER TABLE trades ADD COLUMN is_recovery INTEGER;
-            EXCEPTION WHEN duplicate_column THEN NULL;
-            END $body$;
-        """)
+        cur.execute("ALTER TABLE touch_trades ADD COLUMN IF NOT EXISTS market_session TEXT")
         def _write(item):
             cur.execute(
-                f"INSERT INTO trades ({_INSERT_COLS}) "
-                f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                _pg_safe_row(item),
+                f"INSERT INTO touch_trades ({_INSERT_COLS}) "
+                f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                item,
             )
-            cur.execute("SELECT COUNT(*) FROM trades")
+            cur.execute("SELECT COUNT(*) FROM touch_trades")
             return cur.fetchone()[0]
     else:
-        conn = sqlite3.connect("trades.db")
+        conn = sqlite3.connect("touch_trades.db")
         conn.execute(_CREATE_TABLE_SQLITE)
         try:
-            conn.execute("ALTER TABLE trades ADD COLUMN market_session TEXT")
+            conn.execute("ALTER TABLE touch_trades ADD COLUMN market_session TEXT")
         except sqlite3.OperationalError:
             pass
-        try:
-            conn.execute("ALTER TABLE trades ADD COLUMN is_recovery INTEGER")
-        except sqlite3.OperationalError:
-            pass
-        conn.execute(_CREATE_SF_SQLITE)   # signal_features table
-        conn.execute(_CREATE_REJ_SQLITE)  # rejected_signals table
         conn.commit()
 
     # ── PostgreSQL path: write immediately (autocommit) ──────────────────
     if USE_PG:
-        cur.execute(_CREATE_SF_PG)    # ensure signal_features table exists
-        cur.execute(_CREATE_REJ_PG)   # ensure rejected_signals table exists
         while True:
             item = db_queue.get()
             if item is None:
                 break
-            # Signal-features dict item
-            if isinstance(item, dict) and item.get("type") == "sf":
-                try:
-                    cur.execute(
-                        f"INSERT INTO signal_features ({_SF_COLS}) "
-                        f"VALUES ({','.join(['%s'] * _SF_N)})",
-                        _pg_safe_row(item["data"]),
-                    )
-                    cur.execute("SELECT COUNT(*) FROM signal_features WHERE win IN (0,1)")
-                    n_sf = cur.fetchone()[0]
-                    if n_sf > 0 and n_sf % 100 == 0:
-                        threading.Thread(target=_pattern_discovery, daemon=True, name="PatDisc").start()
-                except Exception as e:
-                    logger.error(f"SF write error (PG): {e}")
-                continue
-            if isinstance(item, dict) and item.get("type") == "rej":
-                try:
-                    cur.execute(
-                        f"INSERT INTO rejected_signals ({_REJ_COLS}) "
-                        f"VALUES ({','.join(['%s'] * _REJ_N)})",
-                        _pg_safe_row(item["data"]),
-                    )
-                except Exception as e:
-                    logger.error(f"Rejected-signal write error (PG): {e}")
-                continue
-            if isinstance(item, dict) and item.get("type") == "rej_update":
-                try:
-                    cur.execute(
-                        "UPDATE rejected_signals SET would_have_won=%s "
-                        "WHERE timestamp=%s AND symbol=%s AND would_have_won IS NULL",
-                        (item["win"], item["timestamp"], item["symbol"]),
-                    )
-                except Exception as e:
-                    logger.error(f"Rejected-signal update error (PG): {e}")
-                continue
             try:
+                item = tuple(_pg_safe(v) for v in item)
                 total = _write(item)
                 _ml_maybe_retrain(total)
             except Exception as e:
@@ -1629,13 +1421,13 @@ def _db_writer():
             with conn:
                 for it in _batch:
                     conn.execute(
-                        f"INSERT INTO trades ({_INSERT_COLS}) "
+                        f"INSERT INTO touch_trades ({_INSERT_COLS}) "
                         f"VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         it,
                     )
             _batch.clear()
             _last_flush[0] = time.time()
-            return conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+            return conn.execute("SELECT COUNT(*) FROM touch_trades").fetchone()[0]
         except Exception as exc:
             logger.error(f"DB batch flush error: {exc}")
             return 0
@@ -1660,48 +1452,6 @@ def _db_writer():
             except Exception:
                 pass
             break
-
-        # Signal-features dict item — write immediately, no batching
-        if isinstance(item, dict) and item.get("type") == "sf":
-            try:
-                conn.execute(
-                    f"INSERT INTO signal_features ({_SF_COLS}) "
-                    f"VALUES ({','.join(['?'] * _SF_N)})",
-                    item["data"],
-                )
-                conn.commit()
-                n_sf = conn.execute(
-                    "SELECT COUNT(*) FROM signal_features WHERE win IN (0,1)"
-                ).fetchone()[0]
-                if n_sf > 0 and n_sf % 100 == 0:
-                    threading.Thread(target=_pattern_discovery, daemon=True, name="PatDisc").start()
-            except Exception as e:
-                logger.error(f"SF write error (SQLite): {e}")
-            continue
-
-        if isinstance(item, dict) and item.get("type") == "rej":
-            try:
-                conn.execute(
-                    f"INSERT INTO rejected_signals ({_REJ_COLS}) "
-                    f"VALUES ({','.join(['?'] * _REJ_N)})",
-                    item["data"],
-                )
-                conn.commit()
-            except Exception as e:
-                logger.error(f"Rejected-signal write error (SQLite): {e}")
-            continue
-
-        if isinstance(item, dict) and item.get("type") == "rej_update":
-            try:
-                conn.execute(
-                    "UPDATE rejected_signals SET would_have_won=? "
-                    "WHERE timestamp=? AND symbol=? AND would_have_won IS NULL",
-                    (item["win"], item["timestamp"], item["symbol"]),
-                )
-                conn.commit()
-            except Exception as e:
-                logger.error(f"Rejected-signal update error (SQLite): {e}")
-            continue
 
         _batch.append(item)
         now = time.time()
@@ -1736,74 +1486,17 @@ def _watch_thread(target, args=(), name="Worker", restartable=True):
 def get_recent_trades(limit=8):
     return _db_fetch(
         "SELECT timestamp, symbol, direction, profit, win, score "
-        "FROM trades WHERE (barrier IS NULL OR barrier != 'backtest') "
-        "ORDER BY id DESC LIMIT ?", (limit,)
-    )
-
-
-def get_score_bucket_perf_fine():
-    """Fine-grained score-bucket performance (75-79/80-84/85-89/90-94/95-100),
-    lifetime, from signal_features (preferred, has score+win+profit) falling
-    back to trades. Pure SQL aggregation — no extra compute on Render."""
-    sql = (
-        "SELECT "
-        "  CASE WHEN score >= 95 THEN '95-100' WHEN score >= 90 THEN '90-94' "
-        "       WHEN score >= 85 THEN '85-89'  WHEN score >= 80 THEN '80-84' "
-        "       WHEN score >= 75 THEN '75-79'  ELSE '<75' END as bucket, "
-        "  COUNT(*) as trades, "
-        "  SUM(CASE WHEN win=1 THEN 1 ELSE 0 END) as wins, "
-        "  SUM(CASE WHEN win=0 THEN 1 ELSE 0 END) as losses, "
-        "  SUM(CASE WHEN win=1 THEN profit ELSE 0 END) as gross_win, "
-        "  SUM(CASE WHEN win=0 THEN profit ELSE 0 END) as gross_loss, "
-        "  SUM(profit) as pnl "
-        "FROM {table} WHERE win IN (0,1) {extra} "
-        "GROUP BY bucket ORDER BY MIN(score) DESC"
-    )
-    rows = _db_fetch(sql.format(table="signal_features", extra=""))
-    if not rows:
-        rows = _db_fetch(sql.format(
-            table="trades", extra="AND (barrier IS NULL OR barrier != 'backtest')"
-        ))
-    return rows
-
-
-def get_martingale_perf():
-    """Compare normal entries vs martingale/recovery re-entries, lifetime."""
-    return _db_fetch(
-        "SELECT COALESCE(is_recovery, 0) as is_recovery, "
-        "  COUNT(*) as trades, "
-        "  SUM(CASE WHEN win=1 THEN 1 ELSE 0 END) as wins, "
-        "  SUM(CASE WHEN win=1 THEN profit ELSE 0 END) as gross_win, "
-        "  SUM(CASE WHEN win=0 THEN profit ELSE 0 END) as gross_loss, "
-        "  SUM(profit) as pnl "
-        "FROM trades WHERE win IN (0,1) AND (barrier IS NULL OR barrier != 'backtest') "
-        "GROUP BY is_recovery"
-    )
-
-
-def get_rejection_effectiveness():
-    """Lifetime rejected-signal outcomes, grouped by filter category — answers
-    'is this filter actually saving us money, or costing us wins?'"""
-    return _db_fetch(
-        "SELECT filter_category, "
-        "  COUNT(*) as total, "
-        "  SUM(CASE WHEN would_have_won IS NOT NULL THEN 1 ELSE 0 END) as checked, "
-        "  SUM(CASE WHEN would_have_won=1 THEN 1 ELSE 0 END) as would_have_won "
-        "FROM rejected_signals "
-        "GROUP BY filter_category ORDER BY total DESC"
+        "FROM touch_trades ORDER BY id DESC LIMIT ?", (limit,)
     )
 
 
 def get_db_summary():
     # win=-1 rows are VOID/unresolved contracts (never confirmed win or loss) —
     # excluded from the count so win-rate isn't diluted by unresolved trades.
-    # Excludes barrier='backtest' rows (synthetic trades inserted by backtest.py) —
-    # those only exist to train the ML model, never to count as real live performance.
     rows = _db_fetch(
         "SELECT SUM(CASE WHEN win IN (0,1) THEN 1 ELSE 0 END), SUM(profit), "
         "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), "
-        "SUM(CASE WHEN win=0 THEN 1 ELSE 0 END) FROM trades "
-        "WHERE (barrier IS NULL OR barrier != 'backtest')"
+        "SUM(CASE WHEN win=0 THEN 1 ELSE 0 END) FROM touch_trades"
     )
     return rows[0] if rows else (0, 0, 0, 0)
 
@@ -1812,8 +1505,7 @@ def get_alltime_symbol_stats(limit=10):
     return _db_fetch(
         "SELECT symbol, SUM(CASE WHEN win IN (0,1) THEN 1 ELSE 0 END), "
         "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), SUM(profit) "
-        "FROM trades WHERE win IN (0,1) AND (barrier IS NULL OR barrier != 'backtest') "
-        "GROUP BY symbol ORDER BY SUM(profit) DESC LIMIT ?", (limit,)
+        "FROM touch_trades WHERE win IN (0,1) GROUP BY symbol ORDER BY SUM(profit) DESC LIMIT ?", (limit,)
     )
 
 
@@ -1823,8 +1515,7 @@ def get_alltime_daily_stats(limit=7):
     return _db_fetch(
         "SELECT date(timestamp) as day, SUM(CASE WHEN win IN (0,1) THEN 1 ELSE 0 END), "
         "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), SUM(profit) "
-        "FROM trades WHERE win IN (0,1) AND (barrier IS NULL OR barrier != 'backtest') "
-        "GROUP BY day ORDER BY day DESC LIMIT ?", (limit,)
+        "FROM touch_trades WHERE win IN (0,1) GROUP BY 1 ORDER BY 1 DESC LIMIT ?", (limit,)
     )
 
 
@@ -1834,9 +1525,8 @@ def get_7day_full_breakdown():
         sql = (
             "SELECT DATE(timestamp), market_session, COUNT(*), "
             "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), SUM(profit) "
-            "FROM trades "
+            "FROM touch_trades "
             "WHERE DATE(timestamp) >= CURRENT_DATE - INTERVAL '7 days' AND win IN (0,1) "
-            "AND (barrier IS NULL OR barrier != 'backtest') "
             "GROUP BY DATE(timestamp), market_session "
             "ORDER BY DATE(timestamp) DESC, SUM(profit) DESC"
         )
@@ -1844,9 +1534,8 @@ def get_7day_full_breakdown():
         sql = (
             "SELECT date(timestamp), market_session, COUNT(*), "
             "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), SUM(profit) "
-            "FROM trades "
+            "FROM touch_trades "
             "WHERE date(timestamp) >= date('now', '-7 days') AND win IN (0,1) "
-            "AND (barrier IS NULL OR barrier != 'backtest') "
             "GROUP BY date(timestamp), market_session "
             "ORDER BY date(timestamp) DESC, SUM(profit) DESC"
         )
@@ -1858,8 +1547,7 @@ def get_session_alltime_stats():
     return _db_fetch(
         "SELECT market_session, COUNT(*), "
         "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END), SUM(profit) "
-        "FROM trades WHERE market_session IS NOT NULL AND win IN (0,1) "
-        "AND (barrier IS NULL OR barrier != 'backtest') "
+        "FROM touch_trades WHERE market_session IS NOT NULL AND win IN (0,1) "
         "GROUP BY market_session ORDER BY SUM(profit) DESC"
     )
 
@@ -1881,8 +1569,8 @@ def get_ml_confidence_buckets():
         "  COUNT(*) as trades, "
         "  SUM(CASE WHEN win=1 THEN 1 ELSE 0 END) as wins, "
         "  SUM(profit) as pnl "
-        "FROM trades WHERE win IN (0,1) AND (barrier IS NULL OR barrier != 'backtest') "
-        "GROUP BY bucket ORDER BY MIN(score) DESC"
+        "FROM touch_trades WHERE win IN (0,1) "
+        "GROUP BY 1 ORDER BY MIN(score) DESC"
     )
     return rows
 
@@ -1970,8 +1658,8 @@ def _compute_advanced_stats(rows) -> dict:
 def get_alltime_advanced_stats() -> Optional[dict]:
     """All-time trading metrics derived from every confirmed trade in the DB."""
     rows = _db_fetch(
-        "SELECT profit, win, symbol, market_session FROM trades "
-        "WHERE win IN (0,1) AND (barrier IS NULL OR barrier != 'backtest') ORDER BY id ASC"
+        "SELECT profit, win, symbol, market_session FROM touch_trades "
+        "WHERE win IN (0,1) ORDER BY id ASC"
     )
     return _compute_advanced_stats(rows)
 
@@ -1979,13 +1667,11 @@ def get_alltime_advanced_stats() -> Optional[dict]:
 def get_today_advanced_stats() -> Optional[dict]:
     """Today's (UTC) trading metrics derived from confirmed trades in the DB."""
     if USE_PG:
-        sql = ("SELECT profit, win, symbol, market_session FROM trades "
-               "WHERE DATE(timestamp) = CURRENT_DATE AND win IN (0,1) "
-               "AND (barrier IS NULL OR barrier != 'backtest') ORDER BY id ASC")
+        sql = ("SELECT profit, win, symbol, market_session FROM touch_trades "
+               "WHERE DATE(timestamp) = CURRENT_DATE AND win IN (0,1) ORDER BY id ASC")
     else:
-        sql = ("SELECT profit, win, symbol, market_session FROM trades "
-               "WHERE date(timestamp) = date('now') AND win IN (0,1) "
-               "AND (barrier IS NULL OR barrier != 'backtest') ORDER BY id ASC")
+        sql = ("SELECT profit, win, symbol, market_session FROM touch_trades "
+               "WHERE date(timestamp) = date('now') AND win IN (0,1) ORDER BY id ASC")
     rows = _db_fetch(sql)
     return _compute_advanced_stats(rows)
 
@@ -1996,7 +1682,7 @@ def _strategy_header() -> str:
     return (
         f"🧬 <b>Strategy {STRATEGY_VERSION}</b>  ·  Expiry {DURATION}m  ·  "
         f"Score ≥{SCORE_THRESHOLD}  ·  ML ≥{ML_CONFIDENCE_MIN*100:.0f}%  ·  "
-        f"Rise/Fall  ·  Martingale {'ON' if MARTINGALE_ENABLED else 'OFF'}\n"
+        f"Barrier {ATR_BARRIER_MULT}×ATR\n"
     )
 
 
@@ -2096,12 +1782,12 @@ def update_indicators(symbol: str) -> bool:
             return False
         df = raw[["Open", "High", "Low", "Close"]].copy()
 
-    # EMA Slow (for fallback direction only)
+    # EMA Slow (long-term trend / fallback direction)
     df["EMA_SLOW"] = df["Close"].ewm(span=EMA_SLOW, adjust=False).mean()
-    # EMA Fast (50) for trend display
-    df["EMA_FAST"] = df["Close"].ewm(span=50, adjust=False).mean()
-    # Rate of Change (10-period) for momentum display
-    df["ROC"] = df["Close"].pct_change(10) * 100
+    # EMA Fast (medium trend, Sober Book trend-strength component)
+    df["EMA_FAST"] = df["Close"].ewm(span=EMA_FAST, adjust=False).mean()
+    # Rate of Change (momentum display / scoring)
+    df["ROC"] = df["Close"].pct_change(ROC_PERIOD) * 100
 
     # ATR
     hi, lo, pc = df["High"], df["Low"], df["Close"].shift(1)
@@ -2163,7 +1849,7 @@ def update_indicators(symbol: str) -> bool:
     with _lock:
         ind = indicators[symbol]
         ind["ema_slow"]         = df["EMA_SLOW"].iloc[-1]
-        ind["ema_fast"]         = df["EMA_FAST"].iloc[-1]   # EMA 50
+        ind["ema_fast"]         = df["EMA_FAST"].iloc[-1]
         roc_val = df["ROC"].iloc[-1]
         ind["roc"]              = round(float(roc_val), 4) if pd.notna(roc_val) else None
         ind["atr"]              = df["ATR"].iloc[-1]
@@ -2309,8 +1995,6 @@ def _detect_sd_zones(df: pd.DataFrame, atr: float) -> dict:
     Detect Supply & Demand zones:
       Drop-Base-Rally → Demand zone (bullish reversal)
       Rally-Base-Drop → Supply zone (bearish reversal)
-      Rally-Base-Rally → Demand continuation
-      Drop-Base-Drop   → Supply continuation
     Returns nearest zone type + ATR-normalised distance from current price.
     """
     try:
@@ -2402,11 +2086,6 @@ def _detect_sd_zones(df: pd.DataFrame, atr: float) -> dict:
 def _detect_candle_pattern(df: pd.DataFrame) -> dict:
     """
     Detect Sober Trading Book candlestick patterns from the last 3 candles.
-    Bullish: Hammer, Inverted Hammer, Bullish Engulfing, Piercing Line,
-             Morning Star, Three White Soldiers.
-    Bearish: Hanging Man, Shooting Star, Bearish Engulfing, Evening Star,
-             Three Black Crows.
-    Neutral: Doji, Spinning Top.
     Returns {"name": str, "bias": "bullish"/"bearish"/"neutral"}.
     """
     try:
@@ -2438,60 +2117,34 @@ def _detect_candle_pattern(df: pd.DataFrame) -> dict:
         downtrend = is_bear(o1, c1) or is_bear(o2, c2)
         uptrend   = is_bull(o1, c1) or is_bull(o2, c2)
 
-        # ── Hammer (bullish reversal after downtrend) ────────────────
         if downtrend and b3 > 0 and lw3 >= 2.0 * b3 and uw3 < 0.3 * r3 and b3 < 0.4 * r3:
             return {"name": "Hammer 🔨", "bias": "bullish"}
-
-        # ── Inverted Hammer (bullish reversal) ───────────────────────
         if downtrend and b3 > 0 and uw3 >= 2.0 * b3 and lw3 < 0.3 * r3 and b3 < 0.4 * r3 and is_bull(o3, c3):
             return {"name": "Inverted Hammer", "bias": "bullish"}
-
-        # ── Shooting Star (bearish reversal after uptrend) ───────────
         if uptrend and b3 > 0 and uw3 >= 2.0 * b3 and lw3 < 0.3 * r3 and b3 < 0.4 * r3:
             return {"name": "Shooting Star ⭐", "bias": "bearish"}
-
-        # ── Hanging Man (bearish reversal after uptrend) ─────────────
         if uptrend and b3 > 0 and lw3 >= 2.0 * b3 and uw3 < 0.3 * r3 and b3 < 0.4 * r3 and is_bear(o3, c3):
             return {"name": "Hanging Man", "bias": "bearish"}
-
-        # ── Bullish Engulfing ────────────────────────────────────────
         if is_bear(o2, c2) and is_bull(o3, c3) and o3 <= c2 and c3 >= o2 and b3 > b2:
             return {"name": "Bullish Engulfing 📈", "bias": "bullish"}
-
-        # ── Bearish Engulfing ────────────────────────────────────────
         if is_bull(o2, c2) and is_bear(o3, c3) and o3 >= c2 and c3 <= o2 and b3 > b2:
             return {"name": "Bearish Engulfing 📉", "bias": "bearish"}
-
-        # ── Piercing Line (bullish) ──────────────────────────────────
         if is_bear(o2, c2) and is_bull(o3, c3) and o3 < c2 and c3 > (o2 + c2) / 2 and c3 < o2:
             return {"name": "Piercing Line", "bias": "bullish"}
-
-        # ── Morning Star (3-candle bullish reversal) ─────────────────
         if is_bear(o1, c1) and b2 < 0.4 * b1 and is_bull(o3, c3) and c3 > (o1 + c1) / 2:
             return {"name": "Morning Star 🌟", "bias": "bullish"}
-
-        # ── Evening Star (3-candle bearish reversal) ─────────────────
         if is_bull(o1, c1) and b2 < 0.4 * b1 and is_bear(o3, c3) and c3 < (o1 + c1) / 2:
             return {"name": "Evening Star 🌆", "bias": "bearish"}
-
-        # ── Three White Soldiers (bullish continuation) ──────────────
         if (is_bull(o1,c1) and is_bull(o2,c2) and is_bull(o3,c3)
                 and c2 > c1 and c3 > c2 and o2 > o1 and o3 > o2):
             return {"name": "Three White Soldiers 🪖", "bias": "bullish"}
-
-        # ── Three Black Crows (bearish continuation) ──────────────────
         if (is_bear(o1,c1) and is_bear(o2,c2) and is_bear(o3,c3)
                 and c2 < c1 and c3 < c2 and o2 < o1 and o3 < o2):
             return {"name": "Three Black Crows 🐦", "bias": "bearish"}
-
-        # ── Doji (indecision) ────────────────────────────────────────
         if b3 < 0.05 * r3:
             return {"name": "Doji ✚", "bias": "neutral"}
-
-        # ── Spinning Top (indecision) ────────────────────────────────
         if b3 < 0.35 * r3 and uw3 > 0.2 * r3 and lw3 > 0.2 * r3:
             return {"name": "Spinning Top ⬆️⬇️", "bias": "neutral"}
-
         return {"name": "none", "bias": "neutral"}
     except Exception:
         return {"name": "none", "bias": "neutral"}
@@ -2502,17 +2155,18 @@ def _detect_candle_pattern(df: pd.DataFrame) -> dict:
 # ══════════════════════════════════════════════════════════════════════
 def score_signal(symbol: str, candle: dict) -> tuple:
     """
-    Calibrated 100-point scoring system.
+    Calibrated 100-point scoring system (Sober Trading Book edition).
 
     Component breakdown:
       1. Market Structure   — 25 pts  (HH+HL/LH+LL, BOS, CHoCH)
-      2. Trend Strength     — 20 pts  (EMA50/200, slope, ADX)
-      3. Supply/Demand Zone — 20 pts  (freshness, proximity, wick, retests)
+      2. Trend Strength     — 20 pts  (EMA50/200, Supertrend, ADX)
+      3. Supply/Demand Zone — 20 pts  (freshness, proximity, wick)
       4. Entry Timing       — 15 pts  (pullback depth, wick, RSI/StochRSI)
       5. Momentum           — 10 pts  (MACD, ROC, ATR expansion)
       6. Candle Confirm     — 10 pts  (engulfing, pin-bar, body quality)
 
-    Grades: A+ ≥ 95 · A ≥ 90 · B+ ≥ 85 · B ≥ 75 · NO TRADE < 75
+    A hard "Sober Gate" penalises/blocks signals where market structure
+    contradicts the trade direction (see below).
     """
     with _lock:
         ind = dict(indicators[symbol])
@@ -2543,18 +2197,15 @@ def score_signal(symbol: str, candle: dict) -> tuple:
     ms_ll    = ind.get("market_struct_ll", False)
 
     ms_pts = 0
-    # Full swing structure: HH+HL for UP, LH+LL for DOWN → 20 pts
     if   direction == "UP"   and ms_hh and ms_hl: ms_pts += 20
     elif direction == "DOWN" and ms_lh and ms_ll: ms_pts += 20
     elif direction == "UP"   and (ms_hh or ms_hl): ms_pts += 10   # partial
     elif direction == "DOWN" and (ms_lh or ms_ll): ms_pts += 10
-    # BOS in direction → +5
     if ms_bos and (
         (direction == "UP"   and ms_type == "bullish") or
         (direction == "DOWN" and ms_type == "bearish")
     ):
         ms_pts += 5
-    # CHoCH against direction → bearish reversal signal against our trade → −10
     if ms_choch and not (
         (direction == "UP"   and ms_type == "bullish") or
         (direction == "DOWN" and ms_type == "bearish")
@@ -2577,31 +2228,28 @@ def score_signal(symbol: str, candle: dict) -> tuple:
     # ══════════════════════════════════════════════════════════════════
     # 2. TREND STRENGTH  (max 20, can go negative)
     # ══════════════════════════════════════════════════════════════════
-    adx_val  = float(ind.get("adx") or 0.0)
-    di_bull  = bool(ind.get("di_bullish", False))
+    adx_val = float(ind.get("adx") or 0.0)
+    di_bull = bool(ind.get("di_bullish", False))
 
     tr_pts = 0
-    # EMA50 vs EMA200 alignment → +8
     ema_aligned = (
         (direction == "UP"   and ema_fast > ema_slow) or
         (direction == "DOWN" and ema_fast < ema_slow)
     )
     if ema_aligned: tr_pts += 8
 
-    # EMA slope proxy: Supertrend aligns with EMA alignment → +4
     st_aligned = (
         (direction == "UP"   and st_dir == 1) or
         (direction == "DOWN" and st_dir == -1)
     )
     if st_aligned: tr_pts += 4
 
-    # ADX trend strength — banded scoring (very high ADX can mean exhaustion)
-    if   adx_val >= 45: tr_pts += 6    # very strong but possibly extended
-    elif adx_val >= 35: tr_pts += 8    # sweet spot — strong, not exhausted
-    elif adx_val >= 25: tr_pts += 5    # moderate trend
-    elif adx_val >= 20: tr_pts += 3    # mild trend forming
-    elif adx_val >= 15: tr_pts += 0    # borderline — no bonus, no penalty
-    else:               tr_pts -= 5    # weak/choppy — penalise
+    if   adx_val >= 45: tr_pts += 6
+    elif adx_val >= 35: tr_pts += 8
+    elif adx_val >= 25: tr_pts += 5
+    elif adx_val >= 20: tr_pts += 3
+    elif adx_val >= 15: tr_pts += 0
+    else:               tr_pts -= 5
 
     score += tr_pts
     details.update({
@@ -2614,12 +2262,12 @@ def score_signal(symbol: str, candle: dict) -> tuple:
     # ══════════════════════════════════════════════════════════════════
     # 3. SUPPLY & DEMAND ZONE  (max 20 pts)
     # ══════════════════════════════════════════════════════════════════
-    sd_zone   = ind.get("sd_zone", "none") or "none"
-    sd_dist   = float(ind.get("sd_zone_dist") or 99.0)
-    sd_fresh  = bool(ind.get("sd_zone_fresh", False))
-    sd_tests  = int(ind.get("sd_zone_tests") or 0)
-    uw        = float(ind.get("upper_wick_atr") or 0.0)
-    lw        = float(ind.get("lower_wick_atr") or 0.0)
+    sd_zone  = ind.get("sd_zone", "none") or "none"
+    sd_dist  = float(ind.get("sd_zone_dist") or 99.0)
+    sd_fresh = bool(ind.get("sd_zone_fresh", False))
+    sd_tests = int(ind.get("sd_zone_tests") or 0)
+    uw       = float(ind.get("upper_wick_atr") or 0.0)
+    lw       = float(ind.get("lower_wick_atr") or 0.0)
 
     sd_zone_agree = (
         (direction == "UP"   and sd_zone == "demand") or
@@ -2627,19 +2275,17 @@ def score_signal(symbol: str, candle: dict) -> tuple:
     )
     sd_pts = 0
     if sd_zone != "none" and sd_zone_agree:
-        # Freshness tiers — zone loses strength with each retest
         if sd_fresh:
-            sd_pts += 12                              # untouched: maximum strength
+            sd_pts += 12
         elif sd_tests <= 1:
-            sd_pts += 4                               # first retest: still valid
+            sd_pts += 4
         elif sd_tests == 2:
-            sd_pts += 1                               # second retest: weakening
+            sd_pts += 1
         else:
-            sd_pts -= 2                               # third+ retest: over-tested
-        if   sd_dist <= 0.5:  sd_pts += 5            # price AT zone
-        elif sd_dist <= 1.5:  sd_pts += 3            # approaching
-        elif sd_dist <= 3.0:  sd_pts += 1            # within range
-        # Strong rejection wick at zone → confirms reaction
+            sd_pts -= 2
+        if   sd_dist <= 0.5:  sd_pts += 5
+        elif sd_dist <= 1.5:  sd_pts += 3
+        elif sd_dist <= 3.0:  sd_pts += 1
         if (direction == "UP" and lw >= 0.5) or (direction == "DOWN" and uw >= 0.5):
             sd_pts += 7
 
@@ -2661,12 +2307,9 @@ def score_signal(symbol: str, candle: dict) -> tuple:
     body_r    = float(ind.get("body_ratio") or 0.0)
 
     et_pts = 0
-    # Pullback depth: price pulling back to ST/EMA rather than over-extended
     if   extension <= 1.0: et_pts += 5
     elif extension <= 2.0: et_pts += 2
-    # > 2.0: over-extended entry → 0 pts
 
-    # Rejection wick (buyers/sellers defending zone)
     wick_pts = 0
     if direction == "UP":
         if   lw >= 0.5:   wick_pts = 5
@@ -2676,26 +2319,23 @@ def score_signal(symbol: str, candle: dict) -> tuple:
         elif uw >= 0.25:  wick_pts = 2
     et_pts += wick_pts
 
-    # RSI / StochRSI zone score (5 pts max, partial for neutral zones)
     osc_pts = 0
     if srsi_k is not None:
         if direction == "UP":
-            if   srsi_k < 25: osc_pts = 5   # oversold — prime
-            elif srsi_k < 45: osc_pts = 3   # neutral-bearish — ok
-            elif srsi_k < 65: osc_pts = 1   # mid — caution
-            # ≥65: overbought for UP → 0
+            if   srsi_k < 25: osc_pts = 5
+            elif srsi_k < 45: osc_pts = 3
+            elif srsi_k < 65: osc_pts = 1
         else:
-            if   srsi_k > 75: osc_pts = 5   # overbought — prime
-            elif srsi_k > 55: osc_pts = 3   # neutral-bullish — ok
-            elif srsi_k > 35: osc_pts = 1   # mid — caution
-            # ≤35: oversold for DOWN → 0
+            if   srsi_k > 75: osc_pts = 5
+            elif srsi_k > 55: osc_pts = 3
+            elif srsi_k > 35: osc_pts = 1
     elif rsi is not None:
         if direction == "UP":
-            if 35 <= rsi <= 60:                            osc_pts = 5
-            elif 25 <= rsi < 35 or 60 < rsi <= 72:        osc_pts = 3
+            if 35 <= rsi <= 60:                     osc_pts = 5
+            elif 25 <= rsi < 35 or 60 < rsi <= 72:   osc_pts = 3
         else:
-            if 40 <= rsi <= 65:                            osc_pts = 5
-            elif 28 <= rsi < 40 or 65 < rsi <= 75:        osc_pts = 3
+            if 40 <= rsi <= 65:                     osc_pts = 5
+            elif 28 <= rsi < 40 or 65 < rsi <= 75:   osc_pts = 3
     et_pts += osc_pts
 
     score += et_pts
@@ -2711,36 +2351,33 @@ def score_signal(symbol: str, candle: dict) -> tuple:
     # ══════════════════════════════════════════════════════════════════
     # 5. MOMENTUM  (max 10 pts)
     # ══════════════════════════════════════════════════════════════════
-    macd_bullish    = bool(ind.get("macd_bullish", False))
+    macd_bullish     = bool(ind.get("macd_bullish", False))
     macd_hist_rising = bool(ind.get("macd_hist_rising", False))
     roc              = ind.get("roc")
 
     mom_pts = 0
-    # MACD: direction + histogram momentum
     macd_ok = (
         (direction == "UP"   and macd_bullish     and macd_hist_rising) or
         (direction == "DOWN" and not macd_bullish and macd_hist_rising)
     )
     if macd_ok: mom_pts += 5
 
-    # ROC direction
     roc_ok = (
         (direction == "UP"   and roc is not None and roc > 0) or
         (direction == "DOWN" and roc is not None and roc < 0)
     )
     if roc_ok: mom_pts += 3
 
-    # Volume expansion proxy: ATR expanding (Deriv synthetics have no real volume)
     if ind.get("atr_rising") and (ind.get("atr") or 0) > (ind.get("atr_ma") or 0):
         mom_pts += 2
 
     score += mom_pts
     details.update({
-        "momentum":          mom_pts,
-        "volatility":        mom_pts,   # alias for signal-card compat
-        "macd_bullish":      macd_bullish,
-        "macd_hist_rising":  macd_hist_rising,
-        "roc":               roc,
+        "momentum":         mom_pts,
+        "volatility":       mom_pts,   # alias for signal-card compat
+        "macd_bullish":     macd_bullish,
+        "macd_hist_rising": macd_hist_rising,
+        "roc":              roc,
     })
 
     # ══════════════════════════════════════════════════════════════════
@@ -2764,13 +2401,11 @@ def score_signal(symbol: str, candle: dict) -> tuple:
         if   "engulfing"                               in pat_n: cc_pts += 5
         elif "pin" in pat_n or "hammer" in pat_n or \
              "star"  in pat_n or "shoot" in pat_n:               cc_pts += 4
-        else:                                                     cc_pts += 3  # strong close
+        else:                                                     cc_pts += 3
 
-    # Spinning top / doji AGAINST trade direction → −5 (indecision against us)
     if pat_against and ("spinning" in pat_n or "doji" in pat_n):
         cc_pts -= 5
 
-    # Weak body weakens confirmation
     if body_r < 0.20:
         cc_pts = min(cc_pts, 2)
 
@@ -2783,8 +2418,6 @@ def score_signal(symbol: str, candle: dict) -> tuple:
 
     # ══════════════════════════════════════════════════════════════════
     # SOBER GATE: hard structure filter
-    # Structure must confirm direction OR a CHoCH reversal must be present.
-    # Sideways → 20% penalty; directly contradicting → cap below threshold.
     # ══════════════════════════════════════════════════════════════════
     structure_ok = (
         (direction == "UP"   and ms_type == "bullish") or
@@ -2801,39 +2434,36 @@ def score_signal(symbol: str, candle: dict) -> tuple:
     else:
         details["sober_gate"] = "passed"
 
-    # Clamp [0, 100]
     score = max(0, min(score, 100))
 
-    # ── Confluence summary (used by ML feature vector) ────────────────
-    confluence_count  = int(ema_aligned) + int(macd_ok) + int(roc_ok)
-    confluence        = tr_pts + mom_pts
+    # ── Confluence summary (used by ML feature vector + UI compat) ────
+    confluence_count = int(ema_aligned) + int(macd_ok) + int(roc_ok)
+    confluence       = tr_pts + mom_pts
     bb_pos = ind.get("bb_position")
 
-    # ── DB-compat column remapping ────────────────────────────────────
+    # DB-compat column remapping
     st_dir_f  = float(st_dir)
     st_dist_f = abs(price - (st_val or price)) / atr
     wick_atr  = (float(candle.get("High", price)) - float(candle.get("Low", price))) / atr
 
     details.update({
-        "total_score":           score,
-        "atr":                   float(ind.get("atr")) if ind.get("atr") is not None else None,
-        "atr_ma":                float(ind.get("atr_ma")) if ind.get("atr_ma") is not None else None,
-        "adx":                   adx_val,
-        "macd_hist":             ind.get("macd_hist"),
-        "bb_position":           round(bb_pos, 2) if bb_pos is not None else None,
-        "confluence":            confluence,
-        "confluence_count":      confluence_count,
+        "total_score":            score,
+        "atr":                    float(ind.get("atr")) if ind.get("atr") is not None else None,
+        "atr_ma":                 float(ind.get("atr_ma")) if ind.get("atr_ma") is not None else None,
+        "adx":                    adx_val,
+        "macd_hist":              ind.get("macd_hist"),
+        "bb_position":            round(bb_pos, 2) if bb_pos is not None else None,
+        "confluence":             confluence,
+        "confluence_count":       confluence_count,
         "confluence_gate_passed": confluence_count >= 2,
-        "ema200_agree":          ema_aligned,
-        "ema_fast_val":          float(ema_fast) if ema_fast is not None else None,
-        "roc":                   roc,
-        "price":                 price,
-        "ema_slow_val":          float(ema_slow) if ema_slow is not None else None,
+        "ema200_agree":           ema_aligned,
+        "roc":                    roc,
+        "price":                  price,
         # DB column remapping (legacy ML feature names)
-        "ema_fast_sl":           st_dir_f,   # Supertrend direction
-        "ema_slow_sl":           adx_val,    # ADX value
-        "ema_distance":          st_dist_f,  # ST distance / ATR
-        "wick_atr_ratio":        float(round(wick_atr, 3)),
+        "ema_fast_sl":            st_dir_f,   # Supertrend direction
+        "ema_slow_sl":            adx_val,    # ADX value
+        "ema_distance":           st_dist_f,  # ST distance / ATR
+        "wick_atr_ratio":         float(round(wick_atr, 3)),
     })
     return score, direction, details
 
@@ -2953,21 +2583,12 @@ def _process_closed_candle(symbol: str, closed: dict, ws) -> None:
                     "lock_time": now,
                 }
             if not already_locked:
-                ms_t   = details.get("market_structure", "sideways")
-                ms_ico = "↑" if ms_t == "bullish" else "↓" if ms_t == "bearish" else "→"
-                pat    = details.get("candle_pattern", "none")
-                sd_z   = details.get("sd_zone", "none")
-                sd_d   = details.get("sd_zone_dist", 99.0)
-                sd_s   = f"{sd_z} {sd_d:.1f}×ATR" if sd_z != "none" else "none"
-                bos_s  = "  BOS✅" if details.get("market_struct_bos") else ""
                 _send_tg(
-                    f"🔒 <b>LOCKED</b> — <code>{symbol}</code>  {'📈' if direction=='UP' else '📉'} {direction}\n"
-                    f"Score <b>{score}/100</b>  |  "
-                    f"Entry {details.get('entry_quality',0)}/38 "
-                    f"(ext {details.get('extension_atr',0):.2f}×ATR)\n"
-                    f"MktStr: {ms_ico}{ms_t}{bos_s}  |  S&amp;D: {sd_s}\n"
-                    f"Pattern: {pat}  |  "
-                    f"{('⏱ Cooldown ' + str(cooldown_left) + 'm remaining' if cooldown_left else '✅ Armed — waiting for tick momentum')}"
+                    f"🔒 <b>LOCKED</b> — {symbol}\n"
+                    f"Score <b>{score}/100</b> {direction}  |  "
+                    f"Entry {details.get('entry_quality',0)}/30 "
+                    f"(ext {details.get('extension_atr',0):.2f}×ATR)  |  "
+                    f"{('cooldown ' + str(cooldown_left) + 'm' if cooldown_left else 'armed')}"
                 )
         else:
             with _lock:
@@ -2981,14 +2602,15 @@ def _process_closed_candle(symbol: str, closed: dict, ws) -> None:
 # ══════════════════════════════════════════════════════════════════════
 #  BARRIER HELPER
 # ══════════════════════════════════════════════════════════════════════
-def _get_contract_type(direction: str) -> str:
-    """Return Deriv contract type for Rise/Fall based on direction."""
-    return CONTRACT_TYPE_RISE if direction == "UP" else CONTRACT_TYPE_FALL
-
-
 def _compute_barrier(symbol: str, direction: str = "UP", barrier_mult: float = None) -> str:
-    """Not used for Rise/Fall — kept as stub for legacy compatibility."""
-    return ""
+    mult = ATR_BARRIER_MULT if barrier_mult is None else barrier_mult
+    with _lock:
+        atr = (indicators.get(symbol) or {}).get("atr") or 0.0
+    if atr <= 0:
+        return "+0.20" if direction == "UP" else "-0.20"
+    offset = atr * mult
+    sign   = "+" if direction == "UP" else "-"
+    return f"{sign}{offset:.2f}"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -3055,95 +2677,16 @@ def _send_tg_wait(text: str, reply_markup=None, parse_mode: str = "HTML", timeou
             logger.debug(f"send_tg_wait timeout/error: {e}")
 
 
-def _rejection_filter_category(reason: str) -> str:
-    """Bucket a free-text rejection reason into a stable category for reporting."""
-    r = reason.lower()
-    if "m15" in r:
-        return "m15_disagreement"
-    if "m5" in r:
-        return "m5_disagreement"
-    if "ml confidence" in r:
-        return "ml_confidence"
-    if "risk gate" in r or "cooldown" in r or "daily limit" in r or "paused" in r:
-        return "risk_gate"
-    if "confirmation" in r:
-        return "no_confirmation"
-    if "payout" in r:
-        return "payout"
-    return "other"
-
-
-def _setup_quality(score) -> str:
-    """Reporting-only label for a signal score — does not affect execution."""
-    try:
-        s = float(score)
-    except (TypeError, ValueError):
-        return "Unknown"
-    if s >= 95:  return "Elite"
-    if s >= 90:  return "Strong"
-    if s >= 80:  return "Normal"
-    return "Weak"
-
-
-def _send_rejection(symbol: str, direction: str, score: int, reason: str,
-                     details: dict = None, entry_price: float = None):
-    """Send a detailed trade-rejected card to Telegram immediately and write to log.
-    Also persists a slim row to `rejected_signals` (barrier='backtest' trades never
-    call this) so /rejections can later report whether the market would have paid
-    out anyway — a cheap, reporting-only check, no extra live compute per tick."""
-    _log(f"❌ {symbol} {direction} rejected [{score}/100] — {reason}")
-
-    if entry_price is not None:
-        try:
-            grade, _ = _trade_grade(score, (details or {}).get("ml_confidence"))
-            now_dt   = datetime.now(timezone.utc)
-            check_at = now_dt + timedelta(minutes=DURATION)
-            db_queue.put({"type": "rej", "data": (
-                now_dt.isoformat(), symbol, direction, float(score), grade,
-                _rejection_filter_category(reason), reason, float(entry_price),
-                check_at.isoformat(), None,
-            )})
-        except Exception as e:
-            logger.error(f"Rejected-signal enqueue failed: {e}")
-    now_str  = datetime.now(timezone.utc).strftime("%H:%M UTC")
-    mkt_sess = _get_session_name()
-    sess_ico = SESSION_EMOJIS.get(mkt_sess, "")
-
-    # Build a compact score breakdown from details if available
-    breakdown = ""
-    if details:
-        t   = details.get("trend", 0)
-        eq  = details.get("entry_quality", 0)
-        v   = details.get("volatility", 0)
-        m   = details.get("momentum", 0)
-        cf  = details.get("confluence", 0)
-        ms  = details.get("market_struct_pts", 0)
-        sdp = details.get("sd_zone_pts", 0)
-        pp  = details.get("candle_pattern_pts", 0)
-        pat = details.get("candle_pattern", "none")
-        ms_type = details.get("market_structure", "sideways")
-        sd_zone = details.get("sd_zone", "none")
-        sd_dist = details.get("sd_zone_dist", 99.0)
-        conf = details.get("ml_confidence")
-        conf_s = f"  ML: {conf*100:.0f}%\n" if conf is not None else ""
-        ms_icon = "↑" if ms_type == "bullish" else "↓" if ms_type == "bearish" else "→"
-        sd_s = f"{sd_zone} {sd_dist:.1f}×ATR" if sd_zone != "none" else "none"
-        breakdown = (
-            f"  Trend {t}/30 · Entry {eq}/30 · Vol {v}/15\n"
-            f"  Mom {m}/10 · Conf {cf}/25 · MktStr {ms}/10\n"
-            f"  S&amp;D {sdp}/8 ({sd_s}) · Pattern {pp}/7\n"
-            f"  Structure: {ms_icon}{ms_type}  |  Pattern: {pat}\n"
-            f"{conf_s}"
-        )
-
+def _send_rejection(symbol: str, direction: str, score: int, reason: str):
+    """Send a concise trade-rejected card to Telegram and write to log."""
+    _log(f"❌ {symbol} {direction} rejected — {reason}")
+    # Escape defensively — `reason` is free-form text (e.g. "conf 65% < 75% gate")
+    # and a raw "<"/">" breaks Telegram's HTML parser, silently dropping the alert.
+    safe_reason = _html.escape(reason)
     _send_tg(
-        f"🚫 <b>REJECTED</b>  <code>{symbol}</code>  {'📈' if direction=='UP' else '📉'} {direction}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🕐 {now_str}  {sess_ico} {mkt_sess}\n"
-        f"🎯 Score  : <b>{score}/100</b>\n"
-        f"❌ Reason : <i>{_html.escape(reason)}</i>\n"
-        f"{breakdown}"
-        f"━━━━━━━━━━━━━━━━━━━━"
+        f"🚫 <b>REJECTED</b> — <code>{symbol}</code> {direction}\n"
+        f"Score: <b>{score}/100</b>\n"
+        f"Reason: <i>{safe_reason}</i>"
     )
 
 
@@ -3171,101 +2714,6 @@ def _conf_str(conf: Optional[float]) -> str:
     return f"{emoji} {pct:.1f}%"
 
 
-def _trade_grade(score: int, conf: Optional[float]) -> tuple:
-    """Return (grade_str, stars_str) based on score and ML confidence."""
-    combined = score * 0.7 + (conf * 100 if conf else 75) * 0.3
-    if combined >= 96:   return "A+", "⭐⭐⭐⭐⭐"
-    elif combined >= 91: return "A",  "⭐⭐⭐⭐"
-    elif combined >= 85: return "B+", "⭐⭐⭐"
-    elif combined >= 80: return "B",  "⭐⭐"
-    else:                return "C",  "⭐"
-
-
-def _adx_label(adx: float) -> str:
-    if adx >= 40:   return "Very Strong"
-    elif adx >= 25: return "Strong"
-    elif adx >= 20: return "Moderate"
-    else:           return "Weak"
-
-
-def _ml_top_reasons(direction: str, details: dict) -> str:
-    """Build ML top-reasons checklist from signal details."""
-    checks = []
-    ms_type  = details.get("market_structure", "sideways")
-    ms_bos   = details.get("market_struct_bos", False)
-    sd_agree = details.get("sd_zone_agree", False)
-    sd_zone  = details.get("sd_zone", "none")
-    macd_b   = details.get("macd_bullish", False)
-    macd_r   = details.get("macd_hist_rising", False)
-    momentum = details.get("momentum", 0)
-    trend    = details.get("trend", 0)
-    pat_name = details.get("candle_pattern", "none")
-    pat_bias = details.get("candle_pattern_bias", "neutral")
-    ema200   = details.get("ema200_agree", False)
-    roc      = details.get("roc")
-    adx_val  = details.get("adx") or 0
-
-    struct_confirms = (
-        (direction == "UP" and ms_type == "bullish") or
-        (direction == "DOWN" and ms_type == "bearish")
-    )
-    pat_confirms = (
-        (direction == "UP" and pat_bias == "bullish") or
-        (direction == "DOWN" and pat_bias == "bearish")
-    )
-    macd_confirms = (
-        (direction == "UP" and macd_b and macd_r) or
-        (direction == "DOWN" and not macd_b and macd_r)
-    )
-
-    if struct_confirms:
-        struct_lbl = "Bullish" if direction == "UP" else "Bearish"
-        bos_tag = " + BOS" if ms_bos else ""
-        checks.append(f"  ✔ {struct_lbl} market structure{bos_tag}")
-    else:
-        checks.append(f"  ✖ Structure not confirmed")
-
-    if sd_agree and sd_zone != "none":
-        zone_lbl = "Demand rejection" if direction == "UP" else "Supply rejection"
-        checks.append(f"  ✔ {zone_lbl} zone")
-    else:
-        checks.append(f"  ✖ No aligned S&amp;D zone")
-
-    if trend >= 25:
-        checks.append(f"  ✔ Trend continuation (ST aligned)")
-    else:
-        checks.append(f"  ✖ Trend weak")
-
-    if macd_confirms:
-        checks.append(f"  ✔ MACD momentum aligned")
-    else:
-        checks.append(f"  ✖ MACD not confirmed")
-
-    if pat_confirms:
-        checks.append(f"  ✔ {pat_name}")
-    elif pat_name != "none":
-        checks.append(f"  ✖ {pat_name} (opposing)")
-    else:
-        checks.append(f"  ✖ No candlestick confirmation")
-
-    if ema200 and adx_val >= 25:
-        checks.append(f"  ✔ EMA200 + ADX {adx_val:.0f} trending")
-
-    return "\n".join(checks)
-
-
-def _compute_risk(score: int, conf: Optional[float], atr: Optional[float]) -> tuple:
-    """Return (continuation_pct, reversal_pct, expected_atr) for risk section."""
-    base = score * 0.65 + (conf * 100 if conf else 75) * 0.35
-    cont_pct = min(95, max(50, base))
-    rev_pct  = 100 - cont_pct
-    atr_val  = atr or 1.0
-    # Expected move: stronger signals project bigger moves
-    move_atr = round(1.0 + (score - 80) / 40, 1) if score >= 80 else 1.0
-    move_atr = max(0.8, min(2.5, move_atr))
-    return round(cont_pct, 1), round(rev_pct, 1), move_atr
-
-
 def _signal_card(sym: str, score: int, direction: str, details: dict) -> str:
     with _lock:
         wc, lc, pnl = win_count, loss_count, total_pnl
@@ -3274,132 +2722,34 @@ def _signal_card(sym: str, score: int, direction: str, details: dict) -> str:
     pnl_str = f"{'+'if pnl>=0 else ''}${pnl:.2f}"
     session_line = f"#{total + 1}  |  {wc}W/{lc}L  {wr:.0f}%WR  |  P&L {pnl_str}"
     mkt_session  = _get_session_name()
+    conf = details.get("ml_confidence")
+    conf_line = f"🤖 ML Conf : <b>{_conf_str(conf)}</b>\n" if conf is not None else ""
 
-    conf    = details.get("ml_confidence")
-    grade, stars = _trade_grade(score, conf)
+    t  = details.get("trend", 0)
+    eq = details.get("entry_quality", 0)
+    v  = details.get("volatility", 0)
+    m  = details.get("momentum", 0)
+    cf = details.get("confluence", 0)
+    cc = details.get("confluence_count", 0)
 
-    # ── Score components ────────────────────────────────────────────────
-    t   = details.get("trend", 0)
-    eq  = details.get("entry_quality", 0)
-    v   = details.get("volatility", 0)
-    m   = details.get("momentum", 0)
-    cf  = details.get("confluence", 0)
-    ms  = details.get("market_struct_pts", 0)
-    sdp = details.get("sd_zone_pts", 0)
-    pp  = details.get("candle_pattern_pts", 0)
-    raw_sum = t + eq + v + m + cf + ms + sdp + pp
+    st_dir  = details.get("ema_fast_sl", 0)
+    adx_val = details.get("ema_slow_sl", 0) or 0
 
-    # ── Market Structure ────────────────────────────────────────────────
-    ms_type  = details.get("market_structure", "sideways")
-    ms_bos   = details.get("market_struct_bos", False)
-    ms_choch = details.get("market_struct_choch", False)
-    ms_hh    = details.get("market_struct_hh", False)
-    ms_hl    = details.get("market_struct_hl", False)
-    ms_lh    = details.get("market_struct_lh", False)
-    ms_ll    = details.get("market_struct_ll", False)
-    ms_str   = "↑ Bullish" if ms_type == "bullish" else "↓ Bearish" if ms_type == "bearish" else "→ Sideways"
-    sober_gate = details.get("sober_gate", "passed")
-
-    # ── Supply & Demand ─────────────────────────────────────────────────
-    sd_zone  = details.get("sd_zone", "none")
-    sd_dist  = details.get("sd_zone_dist", 99.0)
-    sd_fresh = details.get("sd_zone_fresh", False)
-    sd_agree = details.get("sd_zone_agree", False)
-
-    # ── Trend ───────────────────────────────────────────────────────────
-    st_dir   = details.get("ema_fast_sl", 0)
-    adx_val  = float(details.get("ema_slow_sl") or details.get("adx") or 0)
-    ema50    = details.get("ema_fast_val")
-    ema200   = details.get("ema_slow_val")
-    price    = details.get("price")
-    ema_rel  = ""
-    if ema50 is not None and ema200 is not None:
-        if ema50 > ema200:
-            ema_rel = "EMA50 &gt; EMA200 ✅" if direction == "UP" else "EMA50 &gt; EMA200 ⚠️"
-        else:
-            ema_rel = "EMA50 &lt; EMA200 ✅" if direction == "DOWN" else "EMA50 &lt; EMA200 ⚠️"
-    adx_lbl = _adx_label(adx_val)
-    slope_icon = "↑" if st_dir > 0 else "↓"
-
-    # ── Entry ───────────────────────────────────────────────────────────
-    rsi      = details.get("rsi")
-    srsi_k   = details.get("stochrsi_k")
-    ext_atr  = details.get("extension_atr", 0)
-    uw       = (details.get("atr") or 0) and details.get("entry_quality", 0) > 0   # proxy
-    pullback = ext_atr <= 1.5
-    wick_pts = details.get("wick_pts", 0)
-    rejection_ok = wick_pts >= 4
-    rsi_disp = f"{srsi_k:.0f}" if srsi_k is not None else (f"{rsi:.0f}" if rsi else "—")
-
-    # ── Momentum ────────────────────────────────────────────────────────
-    macd_bull = details.get("macd_bullish", False)
-    macd_rise = details.get("macd_hist_rising", False)
-    roc_val   = details.get("roc")
-    if direction == "UP":
-        macd_ok = macd_bull and macd_rise
-        roc_ok  = roc_val is not None and roc_val > 0
-    else:
-        macd_ok = not macd_bull and macd_rise
-        roc_ok  = roc_val is not None and roc_val < 0
-
-    # ── Risk ────────────────────────────────────────────────────────────
-    cont_pct, rev_pct, exp_move = _compute_risk(score, conf, details.get("atr"))
-
-    # ── ML reasons ──────────────────────────────────────────────────────
-    ml_reasons = _ml_top_reasons(direction, details)
-
-    # ── Header ──────────────────────────────────────────────────────────
-    dir_icon = "🟢 📈 RISE" if direction == "UP" else "🔴 📉 FALL"
-    gate_warn = "" if sober_gate == "passed" else "  ⚠️ <i>sideways mkt</i>" if "sideways" in sober_gate else ""
-
-    lines = [
-        f"{dir_icon}  <code>{sym}</code>",
-        f"━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"🏆 Grade: <b>{grade}</b>  {stars}",
-        f"📊 Score: <b>{score}/100</b>  [{_score_bar_str(score)}]  (raw sum: {raw_sum}){gate_warn}",
-        f"━━ Market Structure ━━",
-        f"  BOS {'✅' if ms_bos else '✗'}   CHoCH {'✅' if ms_choch else '✗'}",
-        f"  HH {'✅' if ms_hh else '✗'}  HL {'✅' if ms_hl else '✗'}  "
-        f"LH {'✅' if ms_lh else '✗'}  LL {'✅' if ms_ll else '✗'}",
-        f"  Strength: <b>{ms_str}</b>",
-        f"━━ Supply &amp; Demand ━━",
-    ]
-
-    if sd_zone != "none":
-        fresh_icon = "✅" if sd_fresh else "⚠️ stale"
-        agree_icon = "✅" if sd_agree else "⚠️ opposing"
-        lines += [
-            f"  {sd_zone.capitalize()} Zone  {agree_icon}",
-            f"  Fresh: {fresh_icon}   Distance: {sd_dist:.2f} ATR",
-        ]
-    else:
-        lines.append("  No zone detected")
-
-    lines += [
-        f"━━ Trend ━━",
-    ]
-    if ema_rel:
-        lines.append(f"  {ema_rel}")
-    lines += [
-        f"  Slope {slope_icon}   ADX {adx_val:.0f} ({adx_lbl})",
-        f"━━ Entry ━━",
-        f"  Pullback {'✅' if pullback else '✗'}   Rejection {'✅' if rejection_ok else '✗'}",
-        f"  StochRSI/RSI: {rsi_disp}   Entry Quality: {eq}/38",
-        f"━━ Momentum ━━",
-        f"  MACD {'✅ Bullish' if direction=='UP' and macd_ok else '✅ Bearish' if direction=='DOWN' and macd_ok else '✗ Weak'}"
-        f"   ROC {'✅ +' if roc_ok and roc_val and roc_val>0 else '✅ -' if roc_ok else '✗'}",
-        f"━━ ML Analysis ━━",
-        f"🤖 Confidence: <b>{_conf_str(conf)}</b>",
-        ml_reasons,
-        f"━━ Risk ━━",
-        f"  Continuation : <b>{cont_pct:.0f}%</b>   Reversal : {rev_pct:.0f}%",
-        f"  Expected Move: {exp_move:.1f} ATR",
-        f"━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"💵 Stake: ${STAKE:.2f}  →  win ~${STAKE*1.87:.2f}",
-        f"⏱ {DURATION} min  |  {SESSION_EMOJIS.get(mkt_session,'')} {mkt_session}",
-        f"📊 {session_line}",
-    ]
-    return "\n".join(lines)
+    return (
+        f"{'🟢' if direction == 'UP' else '🔴'} <b>SIGNAL</b>  <code>{sym}</code>  "
+        f"{'📈 UP' if direction == 'UP' else '📉 DOWN'}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 Score   : <b>{score}/100</b>  [{_score_bar_str(score)}]\n"
+        f"   Trend   : {t}/30  [{_component_bar(t,30)}]  ST {'↑Bullish' if st_dir>0 else '↓Bearish'}\n"
+        f"   Entry   : {eq}/30  [{_component_bar(eq,30)}]  RSI {details.get('rsi','—')}\n"
+        f"   Volatility: {v}/15  [{_component_bar(v,15)}]  ADX {adx_val:.0f}\n"
+        f"   Momentum: {m}/10  [{_component_bar(m,10)}]\n"
+        f"   Confluence: {cf}/20  [{_component_bar(cf,20)}]  ({cc}/3 factors)\n"
+        f"{conf_line}"
+        f"💵 Stake  : ${STAKE:.2f}  →  win ~${STAKE + TARGET_PROFIT:.2f}\n"
+        f"🕐 Session: {SESSION_EMOJIS.get(mkt_session,'')} {mkt_session}\n"
+        f"📋 Session : {session_line}\n"
+    )
 
 
 def _make_footer_text() -> str:
@@ -3416,228 +2766,37 @@ def _result_card(sym: str, profit: float, win: bool, details: dict,
     Pass _wc/_lc/_pnl/_cl snapshots captured *before* any session reset so the
     card always shows the stats that include this trade.
     """
-    try:
-        if _wc is None:
-            with _lock:
-                _wc, _lc, _pnl, _cl = win_count, loss_count, total_pnl, consecutive_losses
-        # Safety: ensure numeric types
-        _wc   = int(_wc  or 0)
-        _lc   = int(_lc  or 0)
-        _pnl  = float(_pnl or 0.0)
-        _cl   = int(_cl  or 0)
-        profit = float(profit or 0.0)
-
-        total  = _wc + _lc
-        wr     = _wc / total * 100 if total else 0
-        mkt_sess = _get_session_name()
-        score    = int(details.get("total_score", 0) or 0)
-        direction = details.get("direction", "")
-        conf    = details.get("ml_confidence")
-        grade, _ = _trade_grade(score, conf)
-        mlevel  = int(details.get("martingale_level", 0) or 0)
-        stake   = float(details.get("stake_used", STAKE) or STAKE)
-
-        dir_icon = "📈" if direction == "UP" else "📉"
-        pnl_sign = "+" if profit > 0 else ""
-
-        # ── Header ────────────────────────────────────────────────────
-        if win:
-            hdr_emoji = "🏆"
-            result_lbl = "WIN"
-        else:
-            hdr_emoji = "💀"
-            result_lbl = "LOSS"
-
-        # ── Streak display ────────────────────────────────────────────
-        if win:
-            streak_str = "🟢 Streak cleared"
-        elif _cl >= 3:
-            streak_str = "🔴 " * min(_cl, 5) + f"  ({_cl} in a row)"
-        elif _cl > 0:
-            streak_str = "🔴 " * _cl + f"  ({_cl})"
-        else:
-            streak_str = "🟢 None"
-
-        # ── Entry context ──────────────────────────────────────────────
-        ms_type  = details.get("market_structure", "")
-        sd_zone  = details.get("sd_zone", "none")
-        pat_name = details.get("candle_pattern", "none")
-        has_conf = details.get("has_confirmation")
-        conf_tag = "  ✅ confirmed" if has_conf else ("  ⚠️ no confirmation" if has_conf is False else "")
-
-        entry_parts = []
-        if ms_type and ms_type != "sideways":
-            entry_parts.append(f"{ms_type.capitalize()} structure")
-        if sd_zone != "none":
-            entry_parts.append(f"{sd_zone} zone")
-        if pat_name not in ("none", "", None):
-            entry_parts.append(pat_name)
-        entry_str = "  ·  ".join(entry_parts) if entry_parts else "—"
-
-        martin_line = (f"\n  Martingale step {mlevel}  ·  Stake ${stake:.2f}" if mlevel > 0 else "")
-
-        ml_line = (f"\n🤖 ML  : <b>{_conf_str(conf)}</b>  ·  Grade <b>{grade}</b>{conf_tag}"
-                   if conf is not None else f"\n🏅 Grade: <b>{grade}</b>{conf_tag}")
-
-        pnl_sess_sign = "+" if _pnl >= 0 else ""
-
-        return (
-            f"{hdr_emoji} <b>{result_lbl}</b>  ·  <code>{sym}</code>  {dir_icon} {direction}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"💵 Result : <b>{pnl_sign}${profit:.2f}</b>  ·  Score <b>{score}/100</b>"
-            f"{ml_line}{martin_line}\n"
-            f"━━ Entry Context ━━\n"
-            f"  {entry_str}\n"
-            f"━━ Session ━━\n"
-            f"  P&amp;L  : <b>{pnl_sess_sign}${_pnl:.2f}</b>  ·  {_wc}W/{_lc}L  {wr:.0f}%WR\n"
-            f"  Streak: {streak_str}\n"
-            f"  Market: {SESSION_EMOJIS.get(mkt_sess,'')} {mkt_sess}\n"
-        )
-    except Exception as _e:
-        logger.error(f"_result_card exception for {sym}: {_e}")
-        p_sign = "+" if (profit or 0) > 0 else ""
-        _dir = details.get("direction", "") if details else ""
-        return (
-            f"{'🏆 WIN' if win else '💀 LOSS'}  <code>{sym}</code>  {_dir}\n"
-            f"Result: <b>{p_sign}${float(profit or 0):.2f}</b>  Score: {details.get('total_score','?') if details else '?'}/100\n"
-            f"Session: {int(_wc or 0)}W/{int(_lc or 0)}L\n"
-        )
-
-
-def _run_backtest():
-    """
-    Historical backtest using existing OHLCV data.
-    For each symbol, simulates Rise/Fall outcomes over the last 200 candles
-    and reports per-symbol win rates. Also kicks off ML bootstrap if needed.
-    """
-    _send_tg(
-        "🔬 <b>Backtest running…</b>\n"
-        "Simulating Rise/Fall outcomes on recent history.\n"
-        "<i>Results will arrive in a few seconds.</i>"
-    )
-
-    results   = {}
-    bar_width = 8
-
-    for sym in SYMBOLS:
+    if _wc is None:
         with _lock:
-            if sym not in ohlcv or len(ohlcv[sym]) < 30:
-                continue
-            df  = ohlcv[sym].copy()
-            ind = dict(indicators.get(sym, {}))
+            _wc, _lc, _pnl, _cl = win_count, loss_count, total_pnl, consecutive_losses
+    total  = _wc + _lc
+    wr     = _wc / total * 100 if total else 0
+    pnl_str = f"+${profit:.2f}" if profit > 0 else f"${profit:.2f}"
+    conf    = details.get("ml_confidence")
+    conf_line = f"🤖 ML Conf : <b>{_conf_str(conf)}</b>\n" if conf is not None else ""
+    mkt_sess = _get_session_name()
+    score    = details.get("total_score", 0)
+    direction = details.get("direction", "")
+    dir_icon  = "📈" if direction == "UP" else "📉"
 
-        if not ind.get("ready"):
-            continue
-
-        st_dir = ind.get("supertrend_dir", 0)
-        if st_dir == 0:
-            continue
-        direction = "UP" if st_dir == 1 else "DOWN"
-
-        check_from = max(10, len(df) - 200)
-        check_to   = len(df) - DURATION - 1
-        if check_to <= check_from:
-            continue
-
-        wins = losses = 0
-        for i in range(check_from, check_to):
-            entry_close  = float(df.iloc[i]["Close"])
-            future_close = float(df.iloc[i + DURATION]["Close"])
-            won = (future_close > entry_close if direction == "UP"
-                   else future_close < entry_close)
-            if won: wins += 1
-            else:   losses += 1
-
-        total = wins + losses
-        if total < 5:
-            continue
-
-        wr = wins / total * 100
-        adx_v = float(ind.get("adx") or 0)
-        results[sym] = {
-            "dir": direction, "wins": wins, "losses": losses,
-            "wr": wr, "adx": adx_v,
-        }
-
-    if not results:
-        _send_tg(
-            "🔬 <b>Backtest</b>: Not enough historical data yet.\n"
-            "<i>Wait for the history loader to finish, then try again.</i>"
-        )
-        return
-
-    sorted_r    = sorted(results.items(), key=lambda x: -x[1]["wr"])
-    total_wins  = sum(v["wins"]   for v in results.values())
-    total_loss  = sum(v["losses"] for v in results.values())
-    total_trades = total_wins + total_loss
-    overall_wr   = total_wins / total_trades * 100 if total_trades else 0
-    breakeven_wr = 100 / (1 + PROFIT_MIN)   # e.g. 62.5% at 60% payout
-
-    profitable = sum(1 for v in results.values() if v["wr"] >= breakeven_wr)
-
-    lines = [
-        "🔬 <b>Backtest Report</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"  Symbols tested  : <b>{len(results)}</b>",
-        f"  Candles/symbol  : last 200  (1-min candles)",
-        f"  Outcome window  : <b>{DURATION} candles ahead</b>",
-        f"  Payout          : {PROFIT_MIN*100:.0f}%  (min)",
-        "",
-        "<b>📊 Overall</b>",
-        f"  Simulated trades: <b>{total_trades}</b>  ({total_wins}W / {total_loss}L)",
-        f"  Simulated WR    : <b>{overall_wr:.1f}%</b>",
-        f"  Breakeven WR    : <b>{breakeven_wr:.1f}%</b>  (at {PROFIT_MIN*100:.0f}% payout)",
-        f"  Profitable syms : <b>{profitable}/{len(results)}</b>  above breakeven",
-        "",
-        "<b>📈 Per Symbol  (sorted by WR)</b>",
-        "<code>Symbol    Dir  W    L   WR    Bar      ADX</code>",
-        "<code>──────────────────────────────────────────</code>",
-    ]
-
-    for sym, r in sorted_r:
-        bar_f = max(0, min(bar_width, int(r["wr"] / 100 * bar_width)))
-        bar   = "█" * bar_f + "░" * (bar_width - bar_f)
-        status = "✅" if r["wr"] >= breakeven_wr else ("⚠️" if r["wr"] >= 50 else "❌")
-        dir_c  = "↑" if r["dir"] == "UP" else "↓"
-        adx_s  = f"{r['adx']:.0f}" if r["adx"] else "—"
-        lines.append(
-            f"{status} <code>{sym:<9}{dir_c}  "
-            f"{r['wins']:>3}W/{r['losses']:<3}L  "
-            f"{r['wr']:>4.0f}%  [{bar}]  {adx_s:>3}</code>"
-        )
-
-    lines += [
-        "",
-        f"<i>✅ above {breakeven_wr:.0f}%  ⚠️ above 50%  ❌ below 50%</i>",
-        "",
-        "<b>🤖 ML Model</b>",
-    ]
-
-    with ml_lock:
-        _ml_ready  = ml_model is not None
-        _ml_trades = ml_trained_on
-
-    if _ml_ready:
-        lines.append(
-            f"  Status  : ✅ Trained on <b>{_ml_trades}</b> samples\n"
-            f"  Gate    : ≥{ML_CONFIDENCE_MIN*100:.0f}% confidence required"
-        )
+    if win:
+        header = f"🎊 <b>WIN!</b>  <code>{sym}</code>  {dir_icon} {direction}"
     else:
-        lines.append(
-            f"  Status  : ⏳ Not yet trained ({ml_total_trades}/{ML_MIN_TRADES} real trades)\n"
-            f"  Bootstrapping from historical data now…"
-        )
+        header = f"💀 <b>LOSS</b>  <code>{sym}</code>  {dir_icon} {direction}"
 
-    _send_tg("\n".join(lines))
+    streak_str = ("🔴 " * min(_cl, 5)).strip() if _cl else "🟢 none"
 
-    # Kick off ML bootstrap if model isn't ready yet
-    with ml_lock:
-        needs_boot = ml_model is None
-    if needs_boot:
-        try:
-            MLBootstrap()
-        except Exception as _be:
-            logger.error(f"Backtest MLBootstrap failed: {_be}")
+    return (
+        f"{header}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💵 <b>Trade P&amp;L  :</b> <b>{pnl_str}</b>\n"
+        f"🎯 <b>Score      :</b> {score}/100\n"
+        f"{conf_line}"
+        f"📊 <b>Session    :</b> {'+' if _pnl >= 0 else ''}${_pnl:.2f}  "
+        f"({_wc}W / {_lc}L  {wr:.0f}%WR)\n"
+        f"🔥 <b>Streak     :</b> {streak_str}\n"
+        f"🕐 <b>Session    :</b> {SESSION_EMOJIS.get(mkt_sess,'')} {mkt_sess}\n"
+    )
 
 
 def _session_summary_text(snap: dict) -> str:
@@ -3750,44 +2909,22 @@ def _release_trade_slot(symbol: str):
 #  PROPOSAL / BUY
 # ══════════════════════════════════════════════════════════════════════
 def request_proposal(ws, symbol: str, details: dict, direction: str, barrier_mult: float = None):
-    # ── Clear stale timing fields from previous trade ─────────────────
-    # Re-entry details are copied from the settling contract's details dict,
-    # which carries buy_sent_at / proposal_id from that older trade.
-    # The pending-timeout loop checks buy_sent_at and fires "ack missing"
-    # immediately if it sees a timestamp that is 60+ s old — killing the
-    # step-2 (and any higher-step) martingale re-entry before Deriv even
-    # responds to the new proposal.  Clear them here so every call to
-    # request_proposal starts with a clean timing slate.
-    details.pop("buy_sent_at",  None)
-    details.pop("proposal_id",  None)
-    # ── Martingale: stake doubles on each consecutive loss ────────────
-    if MARTINGALE_ENABLED:
-        with _lock:
-            mlevel = martingale_level.get(symbol, 0)
-        m_stake = round(STAKE * (MARTINGALE_MULTIPLIER ** mlevel), 2)
-    else:
-        mlevel  = 0
-        m_stake = STAKE
-    details["direction"]              = direction
-    details["proposal_time"]          = datetime.now(timezone.utc)
-    details["martingale_level"]       = mlevel
-    details["stake_used"]             = m_stake
-    details["_is_martingale_reentry"] = mlevel > 0
+    details["direction"]     = direction
+    details["proposal_time"] = datetime.now(timezone.utc)
+    details.setdefault("barrier_retries", 0)
+    details["last_barrier_mult"] = barrier_mult if barrier_mult is not None else ATR_BARRIER_MULT
     with _lock:
         pending_signals[symbol] = details
-    contract_type = _get_contract_type(direction)
-    if mlevel > 0:
-        _log(f"📈 Martingale {symbol}: step {mlevel}  stake ${m_stake:.2f}  "
-             f"(base ${STAKE:.2f} × {MARTINGALE_MULTIPLIER**mlevel:.0f}×)")
     ws.send(json.dumps({
         "proposal": 1,
-        "amount": m_stake,
+        "amount": STAKE,
         "basis": "stake",
-        "contract_type": contract_type,
+        "contract_type": CONTRACT_TYPE,
         "currency": "USD",
         "duration": DURATION,
         "duration_unit": "m",
         "symbol": symbol,
+        "barrier": _compute_barrier(symbol, direction, barrier_mult),
     }))
 
 
@@ -3800,119 +2937,70 @@ def on_proposal(ws, msg: dict, symbol: str):
         if pending_signals[symbol].get("proposal_id"):
             return
         pending_signals[symbol]["proposal_id"] = pid
-        m_stake = pending_signals[symbol].get("stake_used", STAKE)  # martingale stake
     if not pid:
         return
 
-    # ── Payout quality gate — check profit RATIO (not dollar amount) ──
-    # Rise/Fall payout ratio is typically 70–95% depending on symbol/time.
+    # ── Payout quality gate ────────────────────────────────────────────
     try:
         offered_payout = float(prop.get("payout", 0))
-        # profit ratio = (total_payout - stake) / stake
-        offered_ratio = round((offered_payout - m_stake) / m_stake, 4) if m_stake > 0 else 0.0
+        offered_profit = round(offered_payout - STAKE, 4)
     except (TypeError, ValueError):
-        offered_ratio = 0.0
+        offered_profit = 0.0
 
-    if offered_ratio < PROFIT_MIN:
+    MAX_BARRIER_RETRIES = 2
+
+    if offered_profit < PROFIT_MIN or offered_profit > PROFIT_MAX:
         with _lock:
-            details = pending_signals.pop(symbol, None)
-        is_martin_reentry = (details or {}).get("_is_martingale_reentry", False)
-        if not is_martin_reentry:
-            _release_trade_slot(symbol)
-        else:
-            # Martingale never reserved a slot — just reset the level cleanly
-            with _lock:
-                martingale_level[symbol] = 0
-        _record_funnel_rejection("Payout below minimum")
+            details = pending_signals.get(symbol)
+        retries   = (details or {}).get("barrier_retries", 0)
+        cur_mult  = (details or {}).get("last_barrier_mult", ATR_BARRIER_MULT)
         direction = (details or {}).get("direction", "UP")
+
+        if details is not None and retries < MAX_BARRIER_RETRIES:
+            # ── Adaptive retry: nudge the barrier toward the target band
+            # instead of giving up on the first miss. ONETOUCH payout rises
+            # as the barrier gets farther away (harder to touch) — so an
+            # over-shoot means "move barrier closer", an under-shoot means
+            # "move it farther". 20% step per retry, converges within 2 tries
+            # for most symbols/volatility regimes.
+            step     = 0.80 if offered_profit > PROFIT_MAX else 1.20
+            new_mult = max(0.05, round(cur_mult * step, 3))
+
+            with _lock:
+                pending_signals.pop(symbol, None)
+            _log(f"🔁 {symbol} proposal profit ${offered_profit:.2f} outside band — "
+                 f"retry {retries+1}/{MAX_BARRIER_RETRIES} with mult {cur_mult}→{new_mult}")
+            # Clear per-attempt fields — otherwise the proposal_id guard in
+            # on_proposal() would ignore the retry's response (it thinks a
+            # proposal was already accepted for this symbol), and the
+            # pending proposal would just time out and release the slot
+            # instead of actually retrying.
+            details.pop("proposal_id", None)
+            details.pop("buy_sent_at", None)
+            details["barrier_retries"] = retries + 1
+            request_proposal(ws, symbol, details, direction, barrier_mult=new_mult)
+            return
+
+        # Out of retries (or no details) — cancel cleanly
+        with _lock:
+            pending_signals.pop(symbol, None)
+        _release_trade_slot(symbol)
+        _record_funnel_rejection("Payout outside target band")
         _send_tg(
-            f"💸 <b>Payout rejected</b> — <code>{symbol}</code> ({direction})\n"
-            f"Offered ratio: <b>{offered_ratio*100:.1f}%</b>  "
-            f"(min {PROFIT_MIN*100:.0f}%) — skipping."
+            f"💸 <b>Payout rejected</b> — <code>{symbol}</code>\n"
+            f"Offered profit: <b>${offered_profit:.2f}</b>  "
+            f"(target ${PROFIT_MIN:.2f}–${PROFIT_MAX:.2f})\n"
+            f"Barrier too {'close' if offered_profit < PROFIT_MIN else 'far'} after "
+            f"{MAX_BARRIER_RETRIES} adaptive retries — skipping."
         )
-        _log(f"💸 {symbol} proposal rejected — profit ratio {offered_ratio*100:.1f}% below "
-             f"minimum {PROFIT_MIN*100:.0f}%")
+        _log(f"💸 {symbol} proposal rejected — profit ${offered_profit:.2f} outside "
+             f"[${PROFIT_MIN}–${PROFIT_MAX}] after {MAX_BARRIER_RETRIES} retries")
         return
 
-    ws.send(json.dumps({"buy": pid, "price": m_stake}))
+    ws.send(json.dumps({"buy": pid, "price": STAKE}))
     with _lock:
         if symbol in pending_signals:
             pending_signals[symbol]["buy_sent_at"] = datetime.now(timezone.utc)
-
-
-def _adopt_orphan_contract(symbol: str, direction: str, details: dict, c: dict):
-    """A buy ack never arrived, but Deriv's portfolio shows a real open
-    contract matching this symbol/direction — adopt it into active_contracts
-    so it gets tracked to settlement normally, instead of silently
-    abandoning a real position with money on it."""
-    cid = c.get("contract_id")
-    if not cid or cid in active_contracts:
-        return False
-    with _lock:
-        active_contracts[cid] = {
-            "symbol":      symbol,
-            "direction":   direction,
-            "barrier":     None,
-            "stake":       c.get("buy_price", details.get("stake_used", STAKE)),
-            "payout":      c.get("payout"),
-            "entry_time":  datetime.now(timezone.utc),
-            "entry_price": last_price.get(symbol, 0),
-            "details":     details,
-            "settled":     False,
-        }
-    ws = ws_registry.get(symbol)
-    if ws is not None:
-        try:
-            ws.send(json.dumps({
-                "proposal_open_contract": 1,
-                "contract_id": int(cid),
-                "subscribe": 1,
-            }))
-        except Exception as e:
-            logger.warning(f"{symbol} adopt-orphan subscribe failed: {e}")
-    _record_execution()
-    _send_tg(
-        f"🔎 <b>Recovered untracked contract</b> — <code>{symbol}</code>\n"
-        f"Buy ack was lost, but Deriv's portfolio confirms contract #{cid} "
-        f"is really open. Now tracking it to settlement."
-    )
-    _log(f"🔎 {symbol} adopted orphan contract cid={cid} (buy ack was lost)")
-    return True
-
-
-def on_portfolio(ws, msg: dict, symbol: str):
-    """Response to our own {'portfolio': 1} safety check, fired when a buy
-    ack goes missing — confirms whether a contract actually opened before we
-    give up and reset/release, so we never abandon a real open position."""
-    check = _portfolio_checks.pop(symbol, None)
-    if check is None:
-        return
-    details   = check["details"]
-    direction = details.get("direction", "UP")
-    want_type = _get_contract_type(direction)
-    contracts = (msg.get("portfolio", {}) or {}).get("contracts", []) or []
-    since = check["requested_at"] - timedelta(seconds=30)
-    for c in contracts:
-        if c.get("symbol") != symbol or c.get("contract_type") != want_type:
-            continue
-        with _lock:
-            already_tracked = c.get("contract_id") in active_contracts
-        if already_tracked:
-            continue
-        purchase_time = c.get("purchase_time") or c.get("date_start")
-        try:
-            pt = datetime.fromtimestamp(int(purchase_time), tz=timezone.utc) if purchase_time else None
-        except (TypeError, ValueError):
-            pt = None
-        if pt is not None and pt < since:
-            continue  # too old — not the contract we're looking for
-        if _adopt_orphan_contract(symbol, direction, details, c):
-            unconfirmed_buys.pop(symbol, None)
-            return
-    # No matching open contract found — genuinely never executed. Let the
-    # timeout loop's normal cleanup (reset martingale / release slot) proceed.
-    with _lock:
-        _portfolio_checks.pop(symbol, None)
 
 
 def on_buy(ws, msg: dict, symbol: str):
@@ -3957,7 +3045,7 @@ def on_buy(ws, msg: dict, symbol: str):
 #  CONTRACT UPDATE  (result checking + sessions)
 # ══════════════════════════════════════════════════════════════════════
 def on_contract_update(ws, msg: dict, symbol: str):
-    global total_pnl, daily_total_pnl, win_count, loss_count, consecutive_losses, paused, pause_until
+    global total_pnl, win_count, loss_count, consecutive_losses, paused, pause_until
     global daily_trades, _auto_resume_active, peak_equity, max_drawdown, session_start
     global session_symbol_stats, daily_session_log, _daily_session_log_date
     global market_session_stats, _market_session_date, ml_total_trades
@@ -3978,18 +3066,12 @@ def on_contract_update(ws, msg: dict, symbol: str):
         if spot:
             last_price[symbol] = float(spot)
 
-        # ── Settlement detection: require a definitive outcome ──────────
-        # is_expired can fire before Deriv has calculated profit/status
-        # (mid-settlement). Only settle when we have a confirmed outcome.
+        # ── RESULT FIX: accept is_expired OR is_sold OR explicit status ──
         status = contract.get("status", "")
-        profit_raw = contract.get("profit")
         is_settled = (
-            status in ("won", "lost", "void")
+            bool(contract.get("is_expired"))
             or bool(contract.get("is_sold"))
-            or (bool(contract.get("is_expired")) and (
-                status in ("won", "lost", "void")
-                or (profit_raw is not None and float(profit_raw) != 0)
-            ))
+            or status in ("won", "lost", "void")
         )
         if not is_settled:
             return
@@ -4021,7 +3103,7 @@ def on_contract_update(ws, msg: dict, symbol: str):
                 d.get("total_score", 0), d.get("wick_atr_ratio", 0),
                 d.get("atr", 0), d.get("atr_ma", 0),
                 d.get("ema_fast_sl", 0), d.get("ema_slow_sl", 0), d.get("ema_distance", 0),
-                mkt_session, int(bool(d.get("_is_martingale_reentry"))),
+                mkt_session,
             ))
             _log(f"VOID  {symbol}  contract {cid} unresolved — excluded from win/loss stats")
             return
@@ -4046,48 +3128,7 @@ def on_contract_update(ws, msg: dict, symbol: str):
             # Clear any open second-entry window on a loss
             second_entry_eligible.pop(symbol, None)
 
-        # ── Martingale level update + re-entry flag ──────────────────
-        do_martingale_reentry = False
-        reentry_direction     = info["direction"]
-        reentry_details       = dict(d)   # copy signal details for re-entry proposal
-
-        if MARTINGALE_ENABLED:
-            cur_ml = martingale_level.get(symbol, 0)
-            if win:
-                if cur_ml > 0:
-                    _log(f"↩️  Martingale {symbol}: WIN at step {cur_ml} — "
-                         f"resetting to base ${STAKE:.2f}")
-                martingale_level[symbol] = 0
-                # win cooldown already handled by ALLOW_SECOND_ENTRY above
-            elif cur_ml < MARTINGALE_MAX_STEPS:
-                # Smart gate: only re-enter if the original signal was high quality.
-                # Blindly doubling on a weak setup is the most dangerous part of
-                # martingale — require A-grade score AND strong ML confidence.
-                _m_score = float(d.get("total_score", 0) or 0)
-                _m_conf  = float(d.get("ml_confidence") or 0.0)
-                if _m_score >= 90 and _m_conf >= 0.90:
-                    new_ml = cur_ml + 1
-                    next_s = round(STAKE * (MARTINGALE_MULTIPLIER ** new_ml), 2)
-                    martingale_level[symbol] = new_ml
-                    do_martingale_reentry   = True   # re-entry queued
-                    _log(f"📈 Martingale {symbol}: LOSS → step {new_ml}  "
-                         f"stake ${next_s:.2f}  "
-                         f"(smart gate ✅ score={_m_score:.0f} ML={_m_conf*100:.0f}%)")
-                else:
-                    martingale_level[symbol] = 0
-                    _log(f"↩️  Martingale {symbol}: LOSS — smart gate blocked re-entry "
-                         f"(score={_m_score:.0f} <90 or ML={_m_conf*100:.0f}% <90%) "
-                         f"→ reset to base ${STAKE:.2f}")
-            else:
-                # All steps exhausted — reset and impose standard cooldown
-                _log(f"↩️  Martingale {symbol}: all {MARTINGALE_MAX_STEPS} steps exhausted — "
-                     f"resetting, applying {COOLDOWN_MINUTES}-min cooldown")
-                martingale_level[symbol] = 0
-                cooldown_until[symbol]   = (datetime.now(timezone.utc)
-                                            + timedelta(minutes=COOLDOWN_MINUTES))
-
-        total_pnl       += profit
-        daily_total_pnl += profit   # persists across session resets; resets at UTC midnight
+        total_pnl   += profit
         peak_equity  = max(peak_equity, total_pnl)
         max_drawdown = max(max_drawdown, peak_equity - total_pnl)
 
@@ -4181,13 +3222,6 @@ def on_contract_update(ws, msg: dict, symbol: str):
             if needs_resume_thread:
                 _auto_resume_active = True
         resume_at = pause_until
-        # Capture state AFTER all triggers so snapshots are accurate.
-        # MUST be inside the lock and AFTER trigger_consec / session_reset_trigger
-        # are evaluated — reading session_reset_trigger before it is assigned
-        # would cause UnboundLocalError (Python treats assigned locals as local
-        # throughout the whole function).
-        _paused_snap     = paused
-        _sess_reset_snap = session_reset_trigger
 
     # Instantly bump ML trade counter so status display stays accurate.
     # The DB batch may not flush for ~2 s; this eliminates the display lag.
@@ -4201,6 +3235,9 @@ def on_contract_update(ws, msg: dict, symbol: str):
             if win: _bst["wins"]   += 1
             else:   _bst["losses"] += 1
             _bst["pnl"] += profit
+            _conf_bkt_snapshot = (_bkt, dict(_bst))
+        else:
+            _conf_bkt_snapshot = None
         # Update live signal-score tracker so we can see whether raw score bands
         # (independent of ML confidence) actually make money.
         _score_val = d.get("total_score", 0)
@@ -4209,6 +3246,14 @@ def on_contract_update(ws, msg: dict, symbol: str):
         if win: _sbst["wins"]   += 1
         else:   _sbst["losses"] += 1
         _sbst["pnl"] += profit
+        _score_bkt_snapshot = (_sbkt, dict(_sbst))
+
+    # Persist the updated buckets to Neon (fire-and-forget thread — never block settlement)
+    def _persist_ml_stats():
+        if _conf_bkt_snapshot:
+            _ml_stats_save("conf", _conf_bkt_snapshot[0], _conf_bkt_snapshot[1])
+        _ml_stats_save("score", _score_bkt_snapshot[0], _score_bkt_snapshot[1])
+    threading.Thread(target=_persist_ml_stats, daemon=True, name="MLStatsSave").start()
 
     # DB write — includes market_session
     db_queue.put((
@@ -4217,100 +3262,15 @@ def on_contract_update(ws, msg: dict, symbol: str):
         d.get("total_score", 0), d.get("wick_atr_ratio", 0),
         d.get("atr", 0), d.get("atr_ma", 0),
         d.get("ema_fast_sl", 0), d.get("ema_slow_sl", 0), d.get("ema_distance", 0),
-        mkt_session, int(bool(d.get("_is_martingale_reentry"))),
-    ))
-
-    # Signal-features write (rich 39-column log for advanced ML + analytics)
-    _sf_grade, _ = _trade_grade(d.get("total_score", 0), d.get("ml_confidence"))
-    db_queue.put({"type": "sf", "data": (
-        datetime.now(timezone.utc).isoformat(),
-        symbol, info["direction"], DURATION,
-        float(d.get("total_score", 0) or 0),
-        _sf_grade,
-        d.get("ml_confidence"),
-        float(d.get("market_struct_pts", 0) or 0),
-        d.get("market_structure", "sideways"),
-        int(bool(d.get("market_struct_bos"))),
-        int(bool(d.get("market_struct_choch"))),
-        int(bool(d.get("market_struct_hh"))),
-        int(bool(d.get("market_struct_hl"))),
-        int(bool(d.get("market_struct_lh"))),
-        int(bool(d.get("market_struct_ll"))),
-        float(d.get("ema_fast_val", 0) or 0),
-        float(d.get("ema_slow_val", 0) or 0),
-        int(bool(d.get("ema_aligned"))),
-        float(d.get("adx", 0) or 0),
-        float(d.get("rsi", 0) or 0) if d.get("rsi") is not None else None,
-        float(d.get("stochrsi_k", 0) or 0) if d.get("stochrsi_k") is not None else None,
-        float(d.get("entry_quality", 0) or 0),
-        float(d.get("momentum", 0) or 0),
-        int(bool(d.get("macd_bullish"))),
-        int(bool(d.get("macd_hist_rising"))),
-        float(d.get("roc", 0) or 0) if d.get("roc") is not None else None,
-        d.get("sd_zone", "none"),
-        float(d.get("sd_zone_dist", 99.0) or 99.0),
-        int(bool(d.get("sd_zone_fresh"))),
-        float(d.get("sd_zone_pts", 0) or 0),
-        float(d.get("candle_pattern_pts", 0) or 0),
-        d.get("candle_pattern", "none"),
-        d.get("candle_pattern_bias", "neutral"),
-        float(d.get("atr", 0) or 0),
-        float(d.get("atr_ma", 0) or 0),
-        float(d.get("wick_atr_ratio", 0) or 0),
         mkt_session,
-        int(win),
-        float(profit),
-    )})
+    ))
+    _log_signal_features(symbol, d, mkt_session, win, profit)
 
     # Pass pre-reset stat snapshot so card always shows correct cumulative figures
-    try:
-        result_msg = _result_card(symbol, profit, win, d,
-                                  _wc=rc_wc, _lc=rc_lc, _pnl=rc_pnl, _cl=rc_cl)
-    except Exception as _rce:
-        logger.error(f"_result_card build error for {symbol}: {_rce}")
-        p_sign = "+" if profit > 0 else ""
-        result_msg = (
-            f"{'🏆 WIN' if win else '💀 LOSS'}  <code>{symbol}</code>  "
-            f"{d.get('direction','')}\n"
-            f"Result: <b>{p_sign}${profit:.2f}</b>  Score: {d.get('total_score','?')}/100\n"
-            f"Session: {rc_wc}W/{rc_lc}L\n"
-        )
-    logger.info(f"Sending result card for {symbol} win={win} profit={profit:.2f}")
-    _send_tg(result_msg)
+    _send_tg(_result_card(symbol, profit, win, d,
+                          _wc=rc_wc, _lc=rc_lc, _pnl=rc_pnl, _cl=rc_cl))
     _log(f"{'WIN' if win else 'LOSS'}  {symbol}  ${profit:+.2f}  total=${pnl_snap:+.2f}  "
          f"session={mkt_session}")
-
-    # ── Martingale instant re-entry (fires immediately, no signal gates) ──
-    if do_martingale_reentry and not _paused_snap and not _sess_reset_snap:
-        _ml_new   = martingale_level.get(symbol, 0)
-        _ml_stake = round(STAKE * (MARTINGALE_MULTIPLIER ** _ml_new), 2)
-        _dir_lbl  = "🟢 Rise (UP)" if reentry_direction == "UP" else "🔴 Fall (DOWN)"
-        # Always use the live ws from the registry — the on_contract_update ws
-        # may be the same, but ws_registry ensures we have a fresh connection.
-        _reentry_ws = ws_registry.get(symbol) or ws
-        if _reentry_ws is None:
-            _log(f"⚠  Martingale re-entry for {symbol} skipped — no live WS")
-            with _lock:
-                martingale_level[symbol] = 0
-        else:
-            _send_tg(
-                f"⚡ <b>Martingale Re-entry — Step {_ml_new}/{MARTINGALE_MAX_STEPS}</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"Symbol    : <code>{symbol}</code>\n"
-                f"Direction : {_dir_lbl}  <i>(same as losing trade)</i>\n"
-                f"Stake     : <b>${_ml_stake:.2f}</b>  "
-                f"(×{int(MARTINGALE_MULTIPLIER**_ml_new)} base ${STAKE:.2f})\n"
-                f"<i>Bypassing signal gates — instant recovery entry.</i>"
-            )
-            request_proposal(_reentry_ws, symbol, reentry_details, reentry_direction)
-            _log(f"⚡ Martingale re-entry {symbol} {reentry_direction}  "
-                 f"step={_ml_new}  stake=${_ml_stake:.2f}")
-    elif do_martingale_reentry and (_paused_snap or _sess_reset_snap):
-        # Bot paused or session ended — suppress re-entry, reset level cleanly
-        with _lock:
-            martingale_level[symbol] = 0
-        reason = "session reset" if _sess_reset_snap else "bot paused"
-        _log(f"↩️  Martingale {symbol}: re-entry suppressed ({reason}) — level reset to 0")
 
     if session_snapshot:
         _send_tg(_session_summary_text(session_snapshot))
@@ -4336,7 +3296,7 @@ def on_contract_update(ws, msg: dict, symbol: str):
             _send_tg(
                 f"🔔 <b>New Session Started!</b>\n"
                 f"{sess_emoji} <b>{sess_name}</b> session is now active.\n"
-                f"▶ Bot is back to trading. Let's go! 💪"
+                f"▶ Bot is back to trading. Good luck Ibrahim! 💪"
             )
         threading.Thread(target=_session_wait, daemon=True, name="SessionWait").start()
 
@@ -4649,8 +3609,9 @@ def _on_message(ws, message: str, symbol: str):
                             # lock stays — will re-check on next OHLC update
                         else:
                             # Confirmed momentum: attempt entry
-                            # For Rise/Fall the entry fires immediately on tick-momentum
-                            # confirmation — the M5 + ML gates below are the quality control.
+                            # entry_passed is always True for ONETOUCH contracts —
+                            # a pullback gate hurts ONETOUCH (price moves AWAY from barrier);
+                            # real quality control is the M5 + ML gates below.
                             with _lock:
                                 locked_symbols.pop(symbol, None)
 
@@ -4669,16 +3630,14 @@ def _on_message(ws, message: str, symbol: str):
                                 _record_funnel_rejection("M5 Supertrend disagreement")
                                 _send_rejection(symbol, direction, score,
                                                 f"M5 Supertrend disagrees "
-                                                f"({'↑' if m5_dir==1 else '↓'} on M5 vs {direction} on M1)",
-                                                details, entry_price=row_c["Close"])
+                                                f"({'↑' if m5_dir==1 else '↓'} on M5 vs {direction} on M1)")
                             elif (m15_ready and m15_dir != 0
                                     and ((direction == "UP" and m15_dir != 1)
                                          or (direction == "DOWN" and m15_dir != -1))):
                                 _record_funnel_rejection("M15 Supertrend disagreement")
                                 _send_rejection(symbol, direction, score,
                                                 f"M15 Supertrend disagrees "
-                                                f"({'↑' if m15_dir==1 else '↓'} on M15 vs {direction} on M1)",
-                                                details, entry_price=row_c["Close"])
+                                                f"({'↑' if m15_dir==1 else '↓'} on M15 vs {direction} on M1)")
                             else:
                                 # ── ML gate: second-entry requires higher confidence ────
                                 now_t = datetime.now(timezone.utc)
@@ -4696,9 +3655,8 @@ def _on_message(ws, message: str, symbol: str):
                                     conf = details.get("ml_confidence", 0)
                                     _record_funnel_rejection("ML confidence below gate")
                                     _send_rejection(symbol, direction, score,
-                                                    f"ML confidence {conf*100:.1f}% below {_gate_lbl} gate "
-                                                    f"[{_get_symbol_class(symbol)}]",
-                                                    details, entry_price=row_c["Close"])
+                                                    f"ML confidence {conf*100:.1f}% < {_gate_lbl} gate "
+                                                    f"[{_get_symbol_class(symbol)}]")
                                 elif _is_second:
                                     if _reserve_trade_slot(symbol, now_t):
                                         # Success — consume the second-entry window now
@@ -4717,52 +3675,17 @@ def _on_message(ws, message: str, symbol: str):
                                         # Gate blocked this tick — window stays open, retry next tick
                                         _record_funnel_rejection("Risk gate closed (paused/cooldown/daily limit)")
                                         _send_rejection(symbol, direction, score,
-                                                        "Risk gate closed for 2nd entry (paused / daily limit)",
-                                                        details, entry_price=row_c["Close"])
+                                                        "Risk gate closed for 2nd entry (paused / daily limit)")
                                 elif _reserve_trade_slot(symbol, now_t):
-                                    # ── Confirmation gate ────────────────────────────────────
-                                    # Require at least one momentum confirmation before firing.
-                                    # Prevents "perfect structure, early entry" trades that
-                                    # have no actual seller/buyer returning to the zone yet.
-                                    _has_conf = True   # default: pass if gate disabled
-                                    if CONFIRMATION_GATE_ENABLED:
-                                        _pat = details.get("candle_pattern", "none")
-                                        _pat_bias = details.get("candle_pattern_bias", "neutral")
-                                        _pat_ok = (
-                                            _pat not in ("none", "", None) and
-                                            ((direction == "UP"   and _pat_bias == "bullish") or
-                                             (direction == "DOWN" and _pat_bias == "bearish"))
-                                        )
-                                        _macd_b = details.get("macd_bullish", False)
-                                        _macd_r = details.get("macd_hist_rising", False)
-                                        _macd_ok = (
-                                            (direction == "UP"   and _macd_b and _macd_r) or
-                                            (direction == "DOWN" and not _macd_b and _macd_r)
-                                        )
-                                        _roc = details.get("roc")
-                                        _roc_ok = (
-                                            (direction == "UP"   and _roc is not None and _roc > 0) or
-                                            (direction == "DOWN" and _roc is not None and _roc < 0)
-                                        )
-                                        _wick_ok = details.get("wick_pts", 0) >= 4
-                                        _has_conf = _pat_ok or _macd_ok or _roc_ok or _wick_ok
-                                        details["has_confirmation"] = _has_conf
-
-                                    if not _has_conf:
-                                        _release_trade_slot(symbol)
-                                        _record_funnel_rejection("No entry confirmation (MACD/ROC/pattern/wick)")
-                                        _log(f"⏳ {symbol} {direction} score={score}/100 — no confirmation yet, holding")
-                                    else:
-                                        request_proposal(ws, symbol, details, direction)
-                                        _log(f"🎯 {symbol} {direction} TICK-ENTRY  score={score}/100  "
-                                             f"momentum={len(tick_history.get(symbol,[]))}ticks  "
-                                             f"conf={details.get('ml_confidence',1.0)*100:.0f}%  "
-                                             f"class={_get_symbol_class(symbol)}")
+                                    request_proposal(ws, symbol, details, direction)
+                                    _log(f"🎯 {symbol} {direction} TICK-ENTRY  score={score}/100  "
+                                         f"momentum={len(tick_history.get(symbol,[]))}ticks  "
+                                         f"conf={details.get('ml_confidence',1.0)*100:.0f}%  "
+                                         f"class={_get_symbol_class(symbol)}")
                                 else:
                                     _record_funnel_rejection("Risk gate closed (paused/cooldown/daily limit)")
                                     _send_rejection(symbol, direction, score,
-                                                    "Risk gate closed (paused / cooldown / daily limit)",
-                                                    details, entry_price=row_c["Close"])
+                                                    "Risk gate closed (paused / cooldown / daily limit)")
 
                 with _lock:
                     current_candle[symbol] = dict(c)
@@ -4773,35 +3696,15 @@ def _on_message(ws, message: str, symbol: str):
             on_buy(ws, msg, symbol)
         elif mtype == "proposal_open_contract":
             on_contract_update(ws, msg, symbol)
-        elif mtype == "portfolio":
-            on_portfolio(ws, msg, symbol)
         elif mtype == "error":
             err = msg.get("error", {})
-            err_msg = err.get("message", err)
-            logger.error(f"{symbol} API error: {err_msg}")
+            logger.error(f"{symbol} API error: {err.get('message', err)}")
             with _lock:
-                det = pending_signals.pop(symbol, None)
-                ub  = unconfirmed_buys.pop(symbol, None)
-                if ub and det is None:
-                    det = ub.get("details")
-            if det is not None:
-                is_reentry = _cleanup_failed_entry(symbol, det)
-                _send_tg(
-                    f"⚠️ <b>Trade request failed</b> — <code>{symbol}</code>\n"
-                    f"Deriv API error: {err_msg}\n"
-                    + ("Martingale step reset to base — no trade was opened."
-                       if is_reentry else "Slot released.")
-                )
-        elif mtype not in (None, "authorize", "ping"):
-            # Diagnostic net: log any message type we don't explicitly route,
-            # so a repeat of the "buy sent, ack never arrives" incident shows
-            # exactly what (if anything) Deriv actually sent back, instead of
-            # leaving us guessing between a dropped request and a misrouted
-            # response. "authorize"/"ping" are expected, already-handled-
-            # elsewhere connection housekeeping — never worth logging, and
-            # authorize's payload includes account balance/email, so it must
-            # not be dumped into the log on every (re)connect.
-            logger.warning(f"{symbol} unhandled msg_type={mtype}: {msg}")
+                if symbol in pending_signals:
+                    det = pending_signals[symbol]
+                    if not det.get("proposal_id"):
+                        pending_signals.pop(symbol, None)
+                        _release_trade_slot(symbol)
 
     except json.JSONDecodeError as e:
         logger.error(f"{symbol} bad JSON: {e}")
@@ -4811,23 +3714,6 @@ def _on_message(ws, message: str, symbol: str):
 
 def _on_error(ws, error):
     logger.error(f"WS error: {error}")
-
-
-def _cleanup_failed_entry(symbol: str, det: dict):
-    """Common cleanup for any proposal/buy that never completed (timeout or
-    explicit API error). Martingale re-entries never reserve a daily-trade
-    slot (see request_proposal / on_contract_update comments), so releasing
-    one for them would wrongly decrement daily_trades and wipe the symbol's
-    cooldown. They also need martingale_level reset — otherwise a technical
-    failure (no trade ever opened) silently escalates the NEXT real signal's
-    stake as if it were continuing a real loss streak.
-    """
-    is_reentry = bool((det or {}).get("_is_martingale_reentry"))
-    if is_reentry:
-        martingale_level[symbol] = 0
-    else:
-        _release_trade_slot(symbol)
-    return is_reentry
 
 
 def _pending_trade_timeout_loop():
@@ -4850,44 +3736,17 @@ def _pending_trade_timeout_loop():
                         continue
                     if (now - det.get("proposal_time", now)).total_seconds() > 30:
                         pending_signals.pop(symbol, None)
-                        _cleanup_failed_entry(symbol, det)
+                        _release_trade_slot(symbol)
                         _log(f"⏰ {symbol} pending proposal timed out — slot released")
                 for symbol in list(unconfirmed_buys.keys()):
-                    entry = unconfirmed_buys[symbol]
-                    if now < entry["expires_at"]:
-                        continue
-                    # Before giving up, confirm with Deriv's own portfolio
-                    # that no contract actually opened — a lost ack does not
-                    # mean a lost trade; the buy may have gone through with
-                    # only the confirmation dropped. Give that check ~15s.
-                    if not entry.get("portfolio_checked_at"):
-                        ws2 = ws_registry.get(symbol)
-                        if ws2 is not None:
-                            try:
-                                ws2.send(json.dumps({"portfolio": 1}))
-                                _portfolio_checks[symbol] = {
-                                    "details": entry.get("details"),
-                                    "requested_at": now,
-                                }
-                                entry["portfolio_checked_at"] = now
-                                entry["expires_at"] = now + timedelta(seconds=15)
-                                _log(f"🔎 {symbol} checking Deriv portfolio before declaring "
-                                     f"trade unconfirmed")
-                                continue
-                            except Exception as e:
-                                logger.warning(f"{symbol} portfolio safety check failed: {e}")
-                        # No live WS to check with — fall through and finalize as before.
-                    det = unconfirmed_buys.pop(symbol, None)
-                    _portfolio_checks.pop(symbol, None)
-                    is_reentry = _cleanup_failed_entry(symbol, (det or {}).get("details"))
-                    _send_tg(
-                        f"⚠️ <b>UNCONFIRMED TRADE EXPIRED</b> — {symbol}\n"
-                        f"Buy order sent but no ack within 3 min "
-                        f"(confirmed via Deriv portfolio — no contract opened).\n"
-                        + (f"Martingale step reset to base — no trade was opened.\n"
-                           if is_reentry else
-                           f"Slot released — check your Deriv account.\n")
-                    )
+                    if now >= unconfirmed_buys[symbol]["expires_at"]:
+                        unconfirmed_buys.pop(symbol, None)
+                        _release_trade_slot(symbol)
+                        _send_tg(
+                            f"⚠️ <b>UNCONFIRMED TRADE EXPIRED</b> — {symbol}\n"
+                            f"Buy order sent but no ack within 3 min.\n"
+                            f"Slot released — check your Deriv account."
+                        )
         except Exception as e:
             logger.error(f"pending_trade_timeout_loop: {e}")
 
@@ -4948,10 +3807,8 @@ def _main_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🌏 Sessions Breakdown",      callback_data="market_sessions")],
         [InlineKeyboardButton("📆 7-Day P&L",               callback_data="seven_day_pnl"),
          InlineKeyboardButton("🤖 ML Confidence Perf",      callback_data="ml_conf_perf")],
-        [InlineKeyboardButton("🔬 Run Backtest",            callback_data="backtest"),
-         InlineKeyboardButton("📊 Export Trades CSV",       callback_data="export_csv_quick")],
-        [InlineKeyboardButton("📉 Performance Analytics",   callback_data="analytics"),
-         InlineKeyboardButton("🧬 Pattern Discovery",       callback_data="patterns")],
+        [InlineKeyboardButton("📊 Full Analytics",          callback_data="analytics"),
+         InlineKeyboardButton("🔍 Pattern Discovery",       callback_data="patterns")],
         # ── Control ──────────────────────────────────────────────────────
         [InlineKeyboardButton(pause_lbl,                    callback_data="toggle_pause"),
          InlineKeyboardButton("⏭ Skip a Symbol",           callback_data="skip_menu")],
@@ -4977,8 +3834,6 @@ def _test_group_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📊 Volatility  (R_*)",     callback_data="tg_vol")],
         [InlineKeyboardButton("⚡ Volatility 1s (1HZ*)",  callback_data="tg_vol1s")],
         [InlineKeyboardButton("📉 Range Break (RD*)",     callback_data="tg_rdb")],
-        [InlineKeyboardButton("🪜 Step Index",             callback_data="tg_step")],
-        [InlineKeyboardButton("⚡ Jump Indices (JD*)",    callback_data="tg_jump")],
         [InlineKeyboardButton("🔙 Back",                  callback_data="main_menu")],
     ])
 
@@ -4988,8 +3843,6 @@ def _test_sym_kb(group: str) -> InlineKeyboardMarkup:
         "tg_vol":   SYNTH_VOLATILITY,
         "tg_vol1s": SYNTH_VOLATILITY_1S,
         "tg_rdb":   SYNTH_RANGE_BREAK,
-        "tg_step":  SYNTH_STEP,
-        "tg_jump":  SYNTH_JUMP,
     }
     syms = groups.get(group, SYNTH_VOLATILITY)
     rows = []
@@ -5028,7 +3881,7 @@ def _status_text():
     state_emoji = "⏸" if is_paused else "▶"
 
     lines = [
-        f"📊 <b>DERIV SNIPER BOT — STATUS</b>  <i>{now.strftime('%H:%M:%S UTC')}</i>",
+        f"📊 <b>DERIV TOUCH BOT — STATUS</b>  <i>{now.strftime('%H:%M:%S UTC')}</i>",
         "━━━━━━━━━━━━━━━━━━━━",
         f"{state_emoji} State : <b>{'PAUSED' if is_paused else 'RUNNING'}</b>",
         f"🌐 Time  : <b>Deriv Server Time (UTC)</b>",
@@ -5125,6 +3978,159 @@ def _live_session_report_text():
     )
 
 
+def _pattern_discovery_text() -> str:
+    """
+    Bucket settled trades by (market structure, S&D zone, ADX band, ML-confidence
+    band) and report which combinations are actually profitable. Needs ≥10 trades
+    per combo (and ≥50 total rows) before a combo is reported, to avoid noise.
+    """
+    try:
+        rows = _db_fetch(
+            "SELECT ms_type, sd_zone, adx_val, candle_pattern, win, profit "
+            "FROM signal_features ORDER BY id"
+        )
+    except Exception as e:
+        return f"⚠️ Pattern discovery unavailable: <code>{e}</code>"
+
+    if not rows:
+        return ("🔍 <b>PATTERN DISCOVERY</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+                "No signal data logged yet — patterns appear once trades settle.")
+    if len(rows) < 50:
+        return (f"🔍 <b>PATTERN DISCOVERY</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+                f"Only {len(rows)} trades logged — need ≥50 before patterns are reliable.")
+
+    def _adx_band(v):
+        v = float(v or 0)
+        if v >= 35: return "ADX≥35"
+        if v >= 25: return "ADX 25-35"
+        if v >= 15: return "ADX 15-25"
+        return "ADX&lt;15"
+
+    buckets: dict = {}
+    for ms_type, sd_zone, adx_val, candle_pattern, win, profit in rows:
+        key = (ms_type or "sideways", sd_zone or "none", _adx_band(adx_val))
+        b = buckets.setdefault(key, {"n": 0, "wins": 0, "pnl": 0.0})
+        b["n"] += 1
+        if win: b["wins"] += 1
+        b["pnl"] += float(profit or 0)
+
+    qualified = [(k, v) for k, v in buckets.items() if v["n"] >= 10]
+    if not qualified:
+        return (f"🔍 <b>PATTERN DISCOVERY</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+                f"{len(rows)} trades logged, but no combo has ≥10 samples yet.")
+
+    qualified.sort(key=lambda kv: kv[1]["pnl"] / kv[1]["n"], reverse=True)
+
+    lines = ["🔍 <b>PATTERN DISCOVERY</b>", "━━━━━━━━━━━━━━━━━━━━",
+             f"{len(rows)} trades analyzed · showing combos with ≥10 samples\n"]
+    for (ms_type, sd_zone, adx_band), v in qualified[:10]:
+        wr = v["wins"] / v["n"] * 100
+        avg = v["pnl"] / v["n"]
+        emoji = "🟢" if avg > 0 else ("🔴" if avg < 0 else "⚪")
+        lines.append(
+            f"{emoji} <b>{ms_type}</b> / {sd_zone} / {adx_band}\n"
+            f"    n={v['n']}  WR={wr:.0f}%  avg={'+' if avg>=0 else ''}${avg:.2f}  "
+            f"total={'+' if v['pnl']>=0 else ''}${v['pnl']:.2f}"
+        )
+    return "\n".join(lines)
+
+
+def _performance_analytics_text() -> str:
+    """Win-rate breakdowns by score band, ADX band, candle pattern, session,
+    S&D-zone distance, and ML-confidence band — from signal_features."""
+    try:
+        rows = _db_fetch(
+            "SELECT score, adx_val, candle_pattern, session, sd_dist, "
+            "ml_confidence, win, profit FROM signal_features ORDER BY id"
+        )
+    except Exception as e:
+        return f"⚠️ Analytics unavailable: <code>{e}</code>"
+
+    if not rows:
+        return ("📈 <b>PERFORMANCE ANALYTICS</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+                "No signal data logged yet.")
+
+    def _bucket_stats(rows, keyfn):
+        buckets: dict = {}
+        for r in rows:
+            k = keyfn(r)
+            b = buckets.setdefault(k, {"n": 0, "wins": 0, "pnl": 0.0})
+            b["n"] += 1
+            if r[-2]: b["wins"] += 1
+            b["pnl"] += float(r[-1] or 0)
+        return buckets
+
+    def _fmt(buckets, order=None):
+        keys = order if order else sorted(buckets.keys())
+        out = []
+        for k in keys:
+            if k not in buckets: continue
+            v = buckets[k]
+            if v["n"] == 0: continue
+            wr = v["wins"] / v["n"] * 100
+            out.append(f"  {k:<14}: n={v['n']:<4} WR={wr:5.1f}%  pnl={'+' if v['pnl']>=0 else ''}${v['pnl']:.2f}")
+        return "\n".join(out) if out else "  (no data)"
+
+    def score_band(r):
+        s = r[0] or 0
+        if s >= 95: return "A+ (95-100)"
+        if s >= 90: return "A (90-94)"
+        if s >= 85: return "B+ (85-89)"
+        if s >= 75: return "B (75-84)"
+        return "C (&lt;75)"
+
+    def adx_band(r):
+        a = float(r[1] or 0)
+        if a >= 35: return "ADX≥35"
+        if a >= 25: return "ADX 25-35"
+        if a >= 15: return "ADX 15-25"
+        return "ADX&lt;15"
+
+    def conf_band(r):
+        c = r[5]
+        if c is None: return "no-model"
+        c = float(c)
+        if c >= 0.90: return "≥90%"
+        if c >= 0.80: return "80-90%"
+        if c >= 0.75: return "75-80%"
+        return "&lt;75%"
+
+    def sd_band(r):
+        d = float(r[4] or 99.0)
+        if d <= 0.5: return "at zone"
+        if d <= 1.5: return "near"
+        if d <= 3.0: return "within range"
+        return "far/none"
+
+    lines = ["📈 <b>PERFORMANCE ANALYTICS</b>", "━━━━━━━━━━━━━━━━━━━━",
+              f"{len(rows)} trades analyzed\n"]
+
+    lines.append("<b>By Score Band</b>")
+    lines.append(_fmt(_bucket_stats(rows, score_band),
+                       ["A+ (95-100)", "A (90-94)", "B+ (85-89)", "B (75-84)", "C (&lt;75)"]))
+
+    lines.append("\n<b>By ADX Band</b>")
+    lines.append(_fmt(_bucket_stats(rows, adx_band),
+                       ["ADX≥35", "ADX 25-35", "ADX 15-25", "ADX&lt;15"]))
+
+    lines.append("\n<b>By Candle Pattern</b>")
+    pat_buckets = _bucket_stats(rows, lambda r: r[2] or "none")
+    top_pats = sorted(pat_buckets.items(), key=lambda kv: kv[1]["n"], reverse=True)[:6]
+    lines.append(_fmt(dict(top_pats)))
+
+    lines.append("\n<b>By Market Session</b>")
+    lines.append(_fmt(_bucket_stats(rows, lambda r: r[3] or "?")))
+
+    lines.append("\n<b>By S&D Zone Distance</b>")
+    lines.append(_fmt(_bucket_stats(rows, sd_band),
+                       ["at zone", "near", "within range", "far/none"]))
+
+    lines.append("\n<b>By ML Confidence</b>")
+    lines.append(_fmt(_bucket_stats(rows, conf_band), ["≥90%", "80-90%", "75-80%", "&lt;75%", "no-model"]))
+
+    return "\n".join(lines)
+
+
 def _alltime_text():
     db_sum = get_db_summary()
     at, ap, aw, al = db_sum if db_sum[0] else (0, 0, 0, 0)
@@ -5205,87 +4211,8 @@ def _alltime_text():
 
     lines += [
         "━━━━━━━━━━━━━━━━━━━━",
-        "<i>Persists across restarts (stored in trades.db).</i>",
+        "<i>Persists across restarts (stored in Neon PostgreSQL).</i>",
     ]
-    return "\n".join(lines)
-
-
-def _score_bucket_perf_text():
-    """Lifetime fine-grained score-bucket dashboard — reporting only, cheap SQL."""
-    rows = get_score_bucket_perf_fine()
-    order = ["95-100", "90-94", "85-89", "80-84", "75-79", "<75"]
-    data = {r[0]: r for r in rows} if rows else {}
-    lines = ["📊 <b>SCORE BUCKET PERFORMANCE</b>  (lifetime)", "━━━━━━━━━━━━━━━━━━━━"]
-    any_data = False
-    for bucket in order:
-        r = data.get(bucket)
-        label = _setup_quality(
-            {"95-100": 97, "90-94": 92, "85-89": 87, "80-84": 82, "75-79": 77, "<75": 50}[bucket]
-        )
-        if not r or r[1] == 0:
-            lines.append(f"  <b>{bucket:>6}</b> ({label:<6}) — no trades yet —")
-            continue
-        any_data = True
-        _, trades, wins, losses, gwin, gloss, pnl = r
-        wr = wins / trades * 100 if trades else 0
-        pf = (gwin / abs(gloss)) if gloss else (float("inf") if gwin > 0 else 0.0)
-        pf_s = f"{pf:.2f}" if pf != float("inf") else "∞"
-        sign = "+" if pnl >= 0 else ""
-        lines.append(
-            f"  <b>{bucket:>6}</b> ({label:<6})  {trades} trades  {wins}W/{losses}L  "
-            f"({wr:.0f}%WR)  PF {pf_s}  <b>{sign}${pnl:.2f}</b>"
-        )
-    if not any_data:
-        lines.append("<i>No scored trades logged yet.</i>")
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("<i>PF = profit factor (gross win ÷ gross loss). Reporting only — no thresholds changed.</i>")
-    return "\n".join(lines)
-
-
-def _martingale_perf_text():
-    """Normal entries vs martingale/recovery re-entries — is Gale-1 pulling its weight?"""
-    rows = get_martingale_perf()
-    data = {int(r[0]): r for r in rows} if rows else {}
-    lines = ["🎯 <b>NORMAL vs RECOVERY (Martingale) TRADES</b>  (lifetime, live only)", "━━━━━━━━━━━━━━━━━━━━"]
-    any_data = False
-    for flag, label in ((0, "Normal"), (1, "Recovery (Gale-1)")):
-        r = data.get(flag)
-        if not r or r[1] == 0:
-            lines.append(f"  {label:<20} — no trades yet —")
-            continue
-        any_data = True
-        _, trades, wins, gwin, gloss, pnl = r
-        losses = trades - wins
-        wr = wins / trades * 100 if trades else 0
-        pf = (gwin / abs(gloss)) if gloss else (float("inf") if gwin > 0 else 0.0)
-        pf_s = f"{pf:.2f}" if pf != float("inf") else "∞"
-        sign = "+" if pnl >= 0 else ""
-        lines.append(
-            f"  {label:<20} {trades} trades  {wins}W/{losses}L  ({wr:.0f}%WR)  "
-            f"PF {pf_s}  <b>{sign}${pnl:.2f}</b>"
-        )
-    if not any_data:
-        lines.append("<i>No live trades recorded yet.</i>")
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
-    return "\n".join(lines)
-
-
-def _rejection_effectiveness_text():
-    """Lifetime filter-rejection effectiveness — of what we rejected, how much
-    of it would have actually won? A filter with a high 'would-have-won' rate
-    on a small sample is a candidate to loosen; this is reporting only."""
-    rows = get_rejection_effectiveness()
-    lines = ["🧪 <b>FILTER EFFECTIVENESS</b>  (lifetime, rejected signals)", "━━━━━━━━━━━━━━━━━━━━"]
-    if not rows:
-        lines.append("<i>No rejected signals logged yet.</i>")
-        return "\n".join(lines)
-    for cat, total, checked, would_win in rows:
-        checked   = checked or 0
-        would_win = would_win or 0
-        pct = f"{would_win/checked*100:.0f}%" if checked else "—"
-        lines.append(f"  {cat:<20} rejected {total:>4}  checked {checked:>4}  would've won {pct}")
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("<i>'Checked' rows are ones far enough past to have an outcome yet.</i>")
     return "\n".join(lines)
 
 
@@ -5355,40 +4282,6 @@ def _funnel_report_lines(funnel: dict) -> list:
     return lines
 
 
-def _daily_market_session_lines() -> list:
-    """Compact per-market-session (Asian/London/NY, fixed UTC windows) mini
-    breakdown for today — these windows are fixed clock ranges and never
-    overlap, unlike the TP/SL-triggered 'rounds' listed below them, which
-    can start and end mid-session. Kept separate so the two concepts don't
-    get conflated in the report."""
-    _roll_market_session_stats_if_needed()
-    with _lock:
-        ms_snap = {k: dict(v) for k, v in market_session_stats.items()}
-    broad_groups = {
-        "Midnight": ["Midnight"], "Asian": ["Early Asian", "Late Asian"],
-        "London": ["London"], "New York": ["Early New York", "Late New York"],
-    }
-    out = ["<b>By Market Session (today, fixed UTC windows)</b>"]
-    any_data = False
-    for broad, subs in broad_groups.items():
-        w = l = 0; pnl = 0.0
-        for sub in subs:
-            s = ms_snap.get(sub, {"wins": 0, "losses": 0, "pnl": 0.0})
-            w += s["wins"]; l += s["losses"]; pnl += s["pnl"]
-        tot = w + l
-        if tot == 0:
-            continue
-        any_data = True
-        wr = w / tot * 100 if tot else 0
-        sign = "+" if pnl >= 0 else ""
-        tag = "🏅" if pnl > 0 else ("💔" if pnl < 0 else "➖")
-        out.append(f"  {SESSION_EMOJIS.get(broad,'')} {broad:<9} {tag} {sign}${pnl:.2f}  ({w}W/{l}L {wr:.0f}%WR)")
-    if not any_data:
-        out.append("  — no trades yet today —")
-    out.append("<i>Full breakdown incl. all-time: 🌏 Sessions Breakdown button.</i>")
-    return out
-
-
 def _daily_history_text() -> str:
     global daily_session_log, _daily_session_log_date
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -5401,45 +4294,33 @@ def _daily_history_text() -> str:
     funnel = _funnel_snapshot()
     funnel_lines = _funnel_report_lines(funnel)
 
-    # Always source the headline figure from the dedicated daily accumulator
-    # (persists across TP/SL round resets, only zeroed at UTC midnight) —
-    # NOT from summing closed rounds, which used to be blank/wrong whenever
-    # no TP/SL round had closed yet today even though real trades happened.
-    with _lock:
-        live_pnl, live_peak, live_mdd = total_pnl, peak_equity, max_drawdown
-        live_trades, live_wins, live_losses = daily_trades, win_count, loss_count
-        day_pnl_total = daily_total_pnl
-
     if not log:
-        day_wr = live_wins / (live_wins + live_losses) * 100 if (live_wins + live_losses) else 0
-        lines = [
-            "📅 <b>Daily Session History</b>", "━━━━━━━━━━━━━━━━━━━━",
-            _strategy_header(),
-            f"Date: {today}",
-            f"Day P&L    : <b>{'+' if day_pnl_total >= 0 else ''}${day_pnl_total:.2f}</b>",
-            f"Trades     : {live_trades}   Wins: {live_wins}   Losses: {live_losses}   WR: {day_wr:.1f}%",
-            f"📉 Drawdown : -${live_mdd:.2f}",
-            "",
-            "— No TP or SL round has closed yet today —",
-            "",
-            *_daily_market_session_lines(),
-            "",
-            *funnel_lines,
-            "",
-            "<i>Each time the bot hits its daily TP or SL it resets and a new round begins below. Resets at midnight UTC.</i>",
-        ]
-        return "\n".join(lines)
+        return (
+            "📅 <b>Daily Session History</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+            + _strategy_header() +
+            f"Date: {today}\n\n"
+            "— No TP or SL hits yet today. —\n\n"
+            + "\n".join(funnel_lines) +
+            "\n\n<i>Each time the bot hits its daily TP or SL it resets and this record is updated.</i>"
+        )
 
     tp_hits = sum(1 for e in log if e["reason"] == "TP")
     sl_hits = sum(1 for e in log if e["reason"] == "SL")
-    total_day_trades = sum(e["trades"] for e in log) + live_trades
-    total_day_wins   = sum(e["wins"]   for e in log) + live_wins
-    total_day_losses = sum(e["losses"] for e in log) + live_losses
+    total_day_pnl    = sum(e["pnl"]    for e in log)
+    total_day_trades = sum(e["trades"] for e in log)
+    total_day_wins   = sum(e["wins"]   for e in log)
+    total_day_losses = sum(e["losses"] for e in log)
     total_possible   = total_day_wins + total_day_losses
     day_wr = total_day_wins / total_possible * 100 if total_possible else 0
-    day_avg_trade  = day_pnl_total / total_day_trades if total_day_trades else 0.0
+    day_avg_trade  = total_day_pnl / total_day_trades if total_day_trades else 0.0
     day_max_dd     = max((e.get("max_dd", 0.0) for e in log), default=0.0)
     day_max_dd_sess = max(log, key=lambda e: e.get("max_dd", 0.0)) if log else None
+
+    # Include the still-running current session's live drawdown so "today"
+    # reflects the in-progress session too, not just closed TP/SL sessions.
+    with _lock:
+        live_pnl, live_peak, live_mdd = total_pnl, peak_equity, max_drawdown
+        live_trades, live_wins, live_losses = daily_trades, win_count, loss_count
     day_max_dd = max(day_max_dd, live_mdd)
 
     adv_today = get_today_advanced_stats()
@@ -5450,8 +4331,8 @@ def _daily_history_text() -> str:
         _strategy_header(),
         f"Date   : {today}",
         f"🎯 TP hits: <b>{tp_hits}</b>   🛑 SL hits: <b>{sl_hits}</b>",
-        f"Day P&L    : <b>{'+' if day_pnl_total >= 0 else ''}${day_pnl_total:.2f}</b>",
-        f"Total Trades: {total_day_trades}  <i>(incl. current round)</i>",
+        f"Day P&L    : <b>{'+' if total_day_pnl >= 0 else ''}${total_day_pnl:.2f}</b>",
+        f"Total Trades: {total_day_trades}",
         f"Total Wins  : {total_day_wins}",
         f"Total Losses: {total_day_losses}",
         f"Win Rate    : {day_wr:.1f}%",
@@ -5490,9 +4371,7 @@ def _daily_history_text() -> str:
                 f"{'+' if adv_today['worst_session_pnl']>=0 else ''}${adv_today['worst_session_pnl']:.2f}"
             )
 
-    lines += ["", *_daily_market_session_lines(), "", *funnel_lines, "━━━━━━━━━━━━━━━━━━━━",
-              "<b>TP/SL Rounds today</b>  <i>(each starts on the previous reset, ends on the next "
-              "TP/SL hit — a round can span more than one market session above)</i>"]
+    lines += ["", *funnel_lines, "━━━━━━━━━━━━━━━━━━━━"]
 
     for i, e in enumerate(log, 1):
         icon  = "🎯" if e["reason"] == "TP" else "🛑"
@@ -5502,8 +4381,8 @@ def _daily_history_text() -> str:
         ms_name  = e.get("market_session", "—")
         e_wr  = e["wins"] / (e["wins"] + e["losses"]) * 100 if (e["wins"] + e["losses"]) else 0
         entry = (
-            f"{icon} <b>Round {i}</b>  [{e['time']}]  {dur_str}  "
-            f"ended in {SESSION_EMOJIS.get(ms_name,'')} {ms_name}\n"
+            f"{icon} <b>Session {i}</b>  [{e['time']}]  {dur_str}  "
+            f"{SESSION_EMOJIS.get(ms_name,'')} {ms_name}\n"
             f"   P&L: <b>{sign}${e['pnl']:.2f}</b>  ·  "
             f"Trades: {e['trades']} ({e['wins']}W/{e['losses']}L  {e_wr:.0f}%WR)\n"
             f"   Peak: ${e.get('peak', 0.0):.2f}  ·  Max DD: -${e.get('max_dd', 0.0):.2f}"
@@ -5521,7 +4400,7 @@ def _daily_history_text() -> str:
     if live_trades or live_wins or live_losses:
         live_wr = live_wins / (live_wins + live_losses) * 100 if (live_wins + live_losses) else 0
         lines.append(
-            f"▶ <b>Current round (still running)</b>\n"
+            f"▶ <b>Current session (still running)</b>\n"
             f"   P&L: <b>{'+' if live_pnl >= 0 else ''}${live_pnl:.2f}</b>  ·  "
             f"Trades: {live_trades} ({live_wins}W/{live_losses}L  {live_wr:.0f}%WR)\n"
             f"   Peak: ${live_peak:.2f}  ·  Max DD: -${live_mdd:.2f}"
@@ -5802,13 +4681,9 @@ def _settings_text():
         f"  ML Gate (2nd)  : <b>≥{SECOND_ENTRY_ML_MIN*100:.0f}%</b>  stricter re-entry bar\n"
         f"  Cooldown (2nd) : <b>{SECOND_ENTRY_COOLDOWN} min</b>  after win\n"
         f"  Window         : <b>{SECOND_ENTRY_WINDOW} min</b>  re-entry window\n"
-        f"\n<b>Martingale</b>\n"
-        f"  Status   : {'✅ ENABLED' if MARTINGALE_ENABLED else '❌ OFF'}\n"
-        f"  Steps    : base (${STAKE:.2f}) → ×{MARTINGALE_MULTIPLIER:.0f} → ×{MARTINGALE_MULTIPLIER**2:.0f}  "
-        f"(max {MARTINGALE_MAX_STEPS} recovery steps)\n"
         f"\n<b>Engine</b>\n"
         f"  Supertrend     : period={SUPERTREND_PERIOD}  mult={SUPERTREND_ATR_MULT}\n"
-        f"  Contract       : Rise/Fall  (Deriv API: CALL=Rise / PUT=Fall)\n"
+        f"  Barrier        : ATR × {ATR_BARRIER_MULT}\n"
         f"\n{_ml_progress_text()}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<i>Tap ⚙ Adjust to change any value live. Or: /set &lt;param&gt; &lt;value&gt;</i>\n"
@@ -5822,23 +4697,20 @@ def _settings_adj_kb() -> InlineKeyboardMarkup:
     _mod = _sys.modules[__name__]
 
     # Friendly labels for each key (order matters for display)
+    # Trimmed to the params actually worth adjusting live from a phone.
+    # ml2_gate / retrain / ml_min / second_cd / second_win are "set once and
+    # forget" tuning knobs — still changeable via /set <param> <value> if needed,
+    # just not cluttering the quick +/- keyboard.
     _LABELS = [
+        ("ml_gate",    "ML Gate"),
+        ("score",      "Score Gate"),
         ("stake",      "Stake $"),
         ("duration",   "Duration"),
-        ("score",      "Score Gate"),
-        ("ml_gate",    "ML Gate"),
-        ("ml2_gate",   "ML 2nd Gate"),
         ("cooldown",   "Cooldown"),
         ("tp",         "Session TP"),
         ("sl",         "Session SL"),
         ("max_loss",   "Max C.Loss"),
-        ("m_mult",     "M Multiplier"),
-        ("m_steps",    "M Max Steps"),
-        ("retrain",    "ML Retrain"),
-        ("ml_min",     "ML Min Trades"),
         ("pause_min",  "Pause Min"),
-        ("second_cd",  "2nd Cooldown"),
-        ("second_win", "2nd Window"),
     ]
 
     def _row(key: str, label: str) -> list:
@@ -5890,7 +4762,7 @@ def _run_test_trade(symbol: str):
         f"Symbol   : <code>{symbol}</code>\n"
         f"Stake    : ${STAKE:.2f}\n"
         f"Expiry   : {DURATION} min\n"
-        f"Type     : Rise/Fall\n"
+        f"Type     : {CONTRACT_TYPE}\n"
         f"<i>Step 1/4 – Connecting to Deriv…</i>"
     )
 
@@ -5938,54 +4810,74 @@ def _run_test_trade(symbol: str):
         else:
             direction = "UP" if spot_now > ema_slow else "DOWN"
 
-        contract_type = _get_contract_type(direction)
         tg(
             f"🧪 <b>Test Trade</b>  –  ✅ Authorised\n"
             f"Account  : <code>{account}</code>\n"
             f"Spot now : {spot_now}\n"
-            f"Direction: {'🟢 Rise (UP)' if direction == 'UP' else '🔴 Fall (DOWN)'}\n"
-            f"Type     : {contract_type}  ({('Rise' if direction == 'UP' else 'Fall')})\n"
+            f"Direction: {'🟢 BUY' if direction == 'UP' else '🔴 SELL'}\n"
+            f"Barrier  : {_compute_barrier(symbol, direction)}  (ATR×{ATR_BARRIER_MULT})\n"
             f"<i>Step 2/4 – Requesting proposal…</i>"
         )
-        # ── Rise/Fall proposal — no barrier needed ────────────────────
-        ws.send(json.dumps({
-            "proposal": 1, "amount": STAKE, "basis": "stake",
-            "contract_type": contract_type, "currency": "USD",
-            "duration": DURATION, "duration_unit": "m",
-            "symbol": symbol,
-        }))
-        prop_msg = recv_typed("proposal", timeout=10)
-        if not prop_msg or "error" in prop_msg:
-            err = (prop_msg or {}).get("error", {}).get("message", "timeout")
-            tg(f"🧪 <b>Test Trade FAILED</b>\n❌ Proposal error: <code>{err}</code>")
-            return
-        prop   = prop_msg["proposal"]
-        pid    = prop["id"]
-        ask    = prop.get("ask_price", STAKE)
-        payout = prop.get("payout", 0)
-        try:
-            payout_f       = float(payout)
-            offered_ratio  = round((payout_f - STAKE) / STAKE, 4) if STAKE > 0 else 0.0
-        except (TypeError, ValueError):
-            offered_ratio = 0.0
+        # ── Payout gate with adaptive barrier retry (same rule as live
+        # trading) — nudge the barrier toward the target band instead of
+        # giving up on the first miss. ─────────────────────────────────
+        MAX_BARRIER_RETRIES = 2
+        cur_mult = ATR_BARRIER_MULT
+        for attempt in range(MAX_BARRIER_RETRIES + 1):
+            ws.send(json.dumps({
+                "proposal": 1, "amount": STAKE, "basis": "stake",
+                "contract_type": CONTRACT_TYPE, "currency": "USD",
+                "duration": DURATION, "duration_unit": "m",
+                "symbol": symbol,
+                "barrier": _compute_barrier(symbol, direction, cur_mult),
+            }))
+            prop_msg = recv_typed("proposal", timeout=10)
+            if not prop_msg or "error" in prop_msg:
+                err = (prop_msg or {}).get("error", {}).get("message", "timeout")
+                tg(f"🧪 <b>Test Trade FAILED</b>\n❌ Proposal error: <code>{err}</code>")
+                return
+            prop    = prop_msg["proposal"]
+            pid     = prop["id"]
+            ask     = prop.get("ask_price", STAKE)
+            payout  = prop.get("payout", 0)
+            try:
+                offered_profit = round(float(payout) - STAKE, 4)
+            except (TypeError, ValueError):
+                offered_profit = 0.0
 
-        if not (offered_ratio >= PROFIT_MIN):
+            if PROFIT_MIN <= offered_profit <= PROFIT_MAX:
+                break  # in band — proceed to buy
+
+            if attempt < MAX_BARRIER_RETRIES:
+                step     = 0.80 if offered_profit > PROFIT_MAX else 1.20
+                new_mult = max(0.05, round(cur_mult * step, 3))
+                tg(
+                    f"🔁 <b>Test Trade</b> – payout ${offered_profit:.2f} outside band, "
+                    f"retrying {attempt+1}/{MAX_BARRIER_RETRIES} "
+                    f"(barrier mult {cur_mult}→{new_mult})…"
+                )
+                cur_mult = new_mult
+                continue
+
             tg(
-                f"🧪 <b>Test Trade</b>  –  💸 Payout gate\n"
+                f"🧪 <b>Test Trade</b>  –  💸 Payout rejected\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"Profit ratio: <b>{offered_ratio*100:.1f}%</b>\n"
-                f"Minimum required: {PROFIT_MIN*100:.0f}%\n"
-                f"<i>Proceeding anyway (test mode bypasses payout gate).</i>"
+                f"Offered payout : ${payout}  (profit ${offered_profit:.2f})\n"
+                f"Target band    : ${PROFIT_MIN:.2f} – ${PROFIT_MAX:.2f}\n"
+                f"Barrier too {'close (easy touch → low payout)' if offered_profit < PROFIT_MIN else 'far (hard touch → high payout)'}.\n"
+                f"<i>Still outside band after {MAX_BARRIER_RETRIES} adaptive retries "
+                f"(last mult {cur_mult}).</i>"
             )
+            return
 
         tg(
             f"🧪 <b>Test Trade</b>  –  ✅ Proposal OK\n"
             f"Proposal ID : <code>{pid}</code>\n"
             f"Ask Price   : ${ask}\n"
-            f"Payout      : ${payout}  (profit ratio <b>{offered_ratio*100:.1f}%</b>)\n"
+            f"Payout      : ${payout}  (profit <b>${offered_profit:.2f}</b>)\n"
             f"<i>Step 3/4 – Buying contract…</i>"
         )
-        ws.send(json.dumps({"buy": pid, "price": STAKE}))   # test always uses base stake
+        ws.send(json.dumps({"buy": pid, "price": STAKE}))
         buy_msg = recv_typed("buy", timeout=10)
         if not buy_msg or "error" in buy_msg:
             err = (buy_msg or {}).get("error", {}).get("message", "timeout")
@@ -6044,10 +4936,8 @@ def _run_test_trade(symbol: str):
             f"P&L         : <b>{pstr}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"✅ Full pipeline confirmed: proposal → buy → settlement → result\n"
-            f"<i>Test trade itself does NOT affect session stats.</i>"
+            f"<i>Test trade does NOT affect session stats.</i>"
         )
-        if not win:
-            _fire_test_martingale_reentry(symbol, direction, tg)
     except Exception as e:
         logger.exception(f"🧪 {tag} unexpected error: {e}")
         tg(f"🧪 <b>Test Trade Error</b>\n<code>{e}</code>")
@@ -6061,53 +4951,12 @@ def _run_test_trade(symbol: str):
         _test_trade_sem.release()
 
 
-def _fire_test_martingale_reentry(symbol: str, direction: str, tg):
-    """A test trade lost — drive the REAL production martingale re-entry
-    path (request_proposal on the live per-symbol WS, same as a genuine
-    losing signal would) instead of the test harness's isolated one-shot
-    socket. This is the only way to actually exercise/validate the
-    re-entry pipeline on demand — unlike the base test trade, this places
-    a real contract at real (multiplied) stake and DOES flow into session
-    P&L / win-loss counts / DB history like any other martingale re-entry,
-    because it settles through the same on_contract_update() path.
-    """
-    if not MARTINGALE_ENABLED:
-        tg("🧪 <i>Martingale is disabled (MARTINGALE_ENABLED=False) — skipping re-entry test.</i>")
-        return
-    with _lock:
-        busy = (symbol in pending_signals or symbol in unconfirmed_buys
-                or any(c["symbol"] == symbol for c in active_contracts.values()))
-    if busy:
-        tg(f"🧪 <b>Martingale re-entry test skipped</b> — <code>{symbol}</code> already has "
-           f"a live/pending trade from the main engine. Try again once it's clear.")
-        return
-    ws2 = ws_registry.get(symbol)
-    if ws2 is None:
-        tg(f"🧪 <b>Martingale re-entry test skipped</b> — no live WS for <code>{symbol}</code>.")
-        return
-    with _lock:
-        new_ml = min(martingale_level.get(symbol, 0) + 1, MARTINGALE_MAX_STEPS)
-        martingale_level[symbol] = new_ml
-    m_stake = round(STAKE * (MARTINGALE_MULTIPLIER ** new_ml), 2)
-    tg(
-        f"⚡ <b>Test Martingale Re-entry — Step {new_ml}/{MARTINGALE_MAX_STEPS}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Symbol    : <code>{symbol}</code>\n"
-        f"Direction : {'🟢 Rise (UP)' if direction == 'UP' else '🔴 Fall (DOWN)'}  <i>(same as losing test trade)</i>\n"
-        f"Stake     : <b>${m_stake:.2f}</b>  (×{int(MARTINGALE_MULTIPLIER**new_ml)} base ${STAKE:.2f})\n"
-        f"<i>Real contract via live engine — this WILL count toward session P&amp;L and history "
-        f"(unlike the base test trade above). Watch for the normal WIN/LOSS result card.</i>"
-    )
-    request_proposal(ws2, symbol, {}, direction)
-    _log(f"🧪⚡ Test-triggered martingale re-entry {symbol} {direction} step={new_ml} stake=${m_stake:.2f}")
-
-
 # ══════════════════════════════════════════════════════════════════════
 #  TELEGRAM COMMAND HANDLERS
 # ══════════════════════════════════════════════════════════════════════
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 <b>Deriv Sniper Bot v3</b>\nSupertrend · Sessions · 93% Confidence Gate",
+        "🤖 <b>Deriv Touch Bot v1.0</b>\nOne-Touch Options · Sessions · Confidence Gate",
         reply_markup=_main_kb(), parse_mode="HTML",
     )
 
@@ -6155,41 +5004,15 @@ async def cmd_alltime(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(_NOT_READY_MSG, parse_mode="HTML"); return
     await update.message.reply_text(_alltime_text(), reply_markup=_main_kb(), parse_mode="HTML")
 
-async def cmd_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Win-rate breakdown by score, ADX, pattern, session, S&D distance, ML confidence."""
-    if not _bot_ready:
-        await update.message.reply_text(_NOT_READY_MSG, parse_mode="HTML"); return
-    await update.message.reply_text("⏳ Building analytics…", parse_mode="HTML")
-    text = _performance_analytics_text()
-    # Telegram message limit is 4096 chars; split if needed
-    for i in range(0, len(text), 4000):
-        await update.message.reply_text(text[i:i+4000], reply_markup=_main_kb(), parse_mode="HTML")
-
 async def cmd_patterns(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Run pattern discovery on demand."""
     if not _bot_ready:
         await update.message.reply_text(_NOT_READY_MSG, parse_mode="HTML"); return
-    await update.message.reply_text("🔬 Running pattern discovery…", parse_mode="HTML")
-    threading.Thread(target=_pattern_discovery, daemon=True, name="PatDiscCmd").start()
+    await update.message.reply_text(_pattern_discovery_text(), reply_markup=_main_kb(), parse_mode="HTML")
 
-async def cmd_scoreperf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Fine-grained score-bucket performance dashboard (75-79...95-100)."""
+async def cmd_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _bot_ready:
         await update.message.reply_text(_NOT_READY_MSG, parse_mode="HTML"); return
-    await update.message.reply_text(_score_bucket_perf_text(), parse_mode="HTML")
-
-async def cmd_martingale(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Normal vs recovery (Gale-1) trade performance."""
-    if not _bot_ready:
-        await update.message.reply_text(_NOT_READY_MSG, parse_mode="HTML"); return
-    await update.message.reply_text(_martingale_perf_text(), parse_mode="HTML")
-
-async def cmd_rejections(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Filter-rejection effectiveness: of what we rejected, how much would've won?"""
-    if not _bot_ready:
-        await update.message.reply_text(_NOT_READY_MSG, parse_mode="HTML"); return
-    await update.message.reply_text(_rejection_effectiveness_text(), parse_mode="HTML")
-
+    await update.message.reply_text(_performance_analytics_text(), reply_markup=_main_kb(), parse_mode="HTML")
 
 async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Send full trades.db CSV on demand."""
@@ -6197,14 +5020,14 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(_NOT_READY_MSG, parse_mode="HTML"); return
     await update.message.reply_text("⏳ Generating CSV export…", parse_mode="HTML")
     try:
-        rows = _db_fetch("SELECT * FROM trades ORDER BY id")
+        rows = _db_fetch("SELECT * FROM touch_trades ORDER BY id")
         if USE_PG:
             cols = ["id","timestamp","symbol","direction","barrier","stake","payout",
                     "profit","win","score","wick_atr_ratio","atr","atr_ma",
                     "ema_fast_slope","ema_slow_slope","ema_distance","market_session"]
         else:
-            conn = sqlite3.connect("trades.db")
-            desc = conn.execute("PRAGMA table_info(trades)").fetchall()
+            conn = sqlite3.connect("touch_trades.db")
+            desc = conn.execute("PRAGMA table_info(touch_trades)").fetchall()
             conn.close()
             cols = [d[1] for d in desc]
         buf  = io.StringIO()
@@ -6236,9 +5059,9 @@ async def cmd_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Use /export to download a CSV of all trades.",
             parse_mode="HTML",
         )
-    elif os.path.exists("trades.db"):
+    elif os.path.exists("touch_trades.db"):
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
-        with open("trades.db", "rb") as f:
+        with open("touch_trades.db", "rb") as f:
             await update.message.reply_document(
                 document=f,
                 filename=f"trades_{ts}.db",
@@ -6381,7 +5204,7 @@ async def cmd_upload_csv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     _rc = _pg2.connect(DATABASE_URL)
                     _rc.autocommit = False
                 else:
-                    _rc = sqlite3.connect("trades.db")
+                    _rc = sqlite3.connect("touch_trades.db")
 
                 _db_cols = [
                     "timestamp", "symbol", "direction", "barrier",
@@ -6399,13 +5222,13 @@ async def cmd_upload_csv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         if USE_PG:
                             dup = _rc.cursor()
                             dup.execute(
-                                "SELECT 1 FROM trades WHERE timestamp=%s AND symbol=%s "
+                                "SELECT 1 FROM touch_trades WHERE timestamp=%s AND symbol=%s "
                                 "AND direction=%s AND stake=%s LIMIT 1",
                                 (ts_val, sym_val, dir_val, stake_val),
                             )
                         else:
                             dup = _rc.execute(
-                                "SELECT 1 FROM trades WHERE timestamp=? AND symbol=? "
+                                "SELECT 1 FROM touch_trades WHERE timestamp=? AND symbol=? "
                                 "AND direction=? AND stake=? LIMIT 1",
                                 (ts_val, sym_val, dir_val, stake_val),
                             )
@@ -6422,7 +5245,7 @@ async def cmd_upload_csv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         vals = tuple(_cast(c, row.get(c)) for c in _db_cols)
                         ph = ",".join(["%s" if USE_PG else "?"] * len(_db_cols))
                         _ins = (
-                            f"INSERT INTO trades ({','.join(_db_cols)}) VALUES ({ph})"
+                            f"INSERT INTO touch_trades ({','.join(_db_cols)}) VALUES ({ph})"
                         )
                         if USE_PG:
                             cur = _rc.cursor(); cur.execute(_ins, vals)
@@ -6455,7 +5278,7 @@ async def cmd_upload_csv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             logger.info(f"Trades restore: inserted={inserted} skipped={skipped} errors={errors}")
 
             # Trigger ML retrain if we now have enough data (guard against concurrent runs)
-            total_now = _db_fetch("SELECT COUNT(*) FROM trades")
+            total_now = _db_fetch("SELECT COUNT(*) FROM touch_trades")
             if total_now and total_now[0][0] >= ML_MIN_TRADES:
                 if not ml_training_active:
                     threading.Thread(target=_ml_train, daemon=True, name="MLRetrain").start()
@@ -6516,14 +5339,14 @@ def _do_backup(what: str) -> None:
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
 
         if what in ("backup_csv", "backup_all"):
-            rows = _db_fetch("SELECT * FROM trades ORDER BY id")
+            rows = _db_fetch("SELECT * FROM touch_trades ORDER BY id")
             if USE_PG:
                 cols = ["id","timestamp","symbol","direction","barrier","stake","payout",
                         "profit","win","score","wick_atr_ratio","atr","atr_ma",
                         "ema_fast_slope","ema_slow_slope","ema_distance","market_session"]
             else:
-                conn = sqlite3.connect("trades.db")
-                desc = conn.execute("PRAGMA table_info(trades)").fetchall()
+                conn = sqlite3.connect("touch_trades.db")
+                desc = conn.execute("PRAGMA table_info(touch_trades)").fetchall()
                 conn.close()
                 cols = [d[1] for d in desc]
             buf = io.StringIO()
@@ -6565,24 +5388,21 @@ def _do_backup(what: str) -> None:
 # ══════════════════════════════════════════════════════════════════════
 # ── Shared parameter map for /set command and adj_ inline buttons ──────
 _ADJ_PARAMS = {
-    # key          : (global_var_name,          min,     max,   step,  is_pct,  display_fn)
-    "ml_gate"      : ("ML_CONFIDENCE_MIN",       0.60,    0.99,  0.01,  True,   lambda v: f"{v*100:.0f}%"),
-    "ml2_gate"     : ("SECOND_ENTRY_ML_MIN",     0.75,    0.99,  0.01,  True,   lambda v: f"{v*100:.0f}%"),
-    "score"        : ("SCORE_THRESHOLD",         70,      99,    1,     False,  lambda v: f"{v}/100"),
-    "stake"        : ("STAKE",                   0.35,    500,   0.5,   False,  lambda v: f"${v:.2f}"),
-    "duration"     : ("DURATION",                1,       60,    1,     False,  lambda v: f"{v} min"),
-    "cooldown"     : ("COOLDOWN_MINUTES",        1,       120,   5,     False,  lambda v: f"{v} min"),
-    "tp"           : ("DAILY_PROFIT_TARGET",     1,       9999,  1,     False,  lambda v: f"${v:.2f}"),
-    "sl"           : ("DAILY_LOSS_LIMIT",        -9999,  -1,    -1,    False,  lambda v: f"${v:.2f}"),
-    "max_loss"     : ("MAX_CONSECUTIVE_LOSSES",  1,       20,    1,     False,  lambda v: f"{int(v)}"),
-    "retrain"      : ("ML_RETRAIN_EVERY",        5,       5000,  10,    False,  lambda v: f"{int(v)} trades"),
-    "ml_min"       : ("ML_MIN_TRADES",           20,      5000,  10,    False,  lambda v: f"{int(v)} trades"),
-    "pause_min"    : ("PAUSE_MINUTES",           1,       1440,  5,     False,  lambda v: f"{int(v)} min"),
-    "second_cd"    : ("SECOND_ENTRY_COOLDOWN",   1,       60,    1,     False,  lambda v: f"{int(v)} min"),
-    "second_win"   : ("SECOND_ENTRY_WINDOW",     2,       120,   5,     False,  lambda v: f"{int(v)} min"),
-    # ── Martingale ─────────────────────────────────────────────────────────────
-    "m_mult"       : ("MARTINGALE_MULTIPLIER",   1.2,     5.0,   0.1,   False,  lambda v: f"×{v:.1f}"),
-    "m_steps"      : ("MARTINGALE_MAX_STEPS",    1,       5,     1,     False,  lambda v: f"{int(v)} steps"),
+    # key          : (global_var_name,      min,     max,   step,  is_pct,  display_fn)
+    "ml_gate"      : ("ML_CONFIDENCE_MIN",  0.60,    0.99,  0.01,  True,   lambda v: f"{v*100:.0f}%"),
+    "ml2_gate"     : ("SECOND_ENTRY_ML_MIN",0.75,    0.99,  0.01,  True,   lambda v: f"{v*100:.0f}%"),
+    "score"        : ("SCORE_THRESHOLD",    70,      99,    1,     False,  lambda v: f"{v}/100"),
+    "stake"        : ("STAKE",              0.35,    500,   0.5,   False,  lambda v: f"${v:.2f}"),
+    "duration"     : ("DURATION",           1,       60,    1,     False,  lambda v: f"{v} min"),
+    "cooldown"     : ("COOLDOWN_MINUTES",   1,       120,   5,     False,  lambda v: f"{v} min"),
+    "tp"           : ("DAILY_PROFIT_TARGET",1,       9999,  1,     False,  lambda v: f"${v:.2f}"),
+    "sl"           : ("DAILY_LOSS_LIMIT",   -9999,  -1,    -1,    False,  lambda v: f"${v:.2f}"),
+    "max_loss"     : ("MAX_CONSECUTIVE_LOSSES", 1,   20,    1,     False,  lambda v: f"{int(v)}"),
+    "retrain"      : ("ML_RETRAIN_EVERY",   5,       5000,  10,    False,  lambda v: f"{int(v)} trades"),
+    "ml_min"       : ("ML_MIN_TRADES",      20,      5000,  10,    False,  lambda v: f"{int(v)} trades"),
+    "pause_min"    : ("PAUSE_MINUTES",      1,       1440,  5,     False,  lambda v: f"{int(v)} min"),
+    "second_cd"    : ("SECOND_ENTRY_COOLDOWN", 1,    60,    1,     False,  lambda v: f"{int(v)} min"),
+    "second_win"   : ("SECOND_ENTRY_WINDOW",   2,    120,   5,     False,  lambda v: f"{int(v)} min"),
 }
 
 
@@ -6593,7 +5413,6 @@ def _apply_param(key: str, raw_val) -> tuple[bool, str]:
     global DURATION, COOLDOWN_MINUTES, DAILY_PROFIT_TARGET, DAILY_LOSS_LIMIT
     global MAX_CONSECUTIVE_LOSSES, ML_RETRAIN_EVERY, ML_MIN_TRADES, PAUSE_MINUTES
     global SECOND_ENTRY_COOLDOWN, SECOND_ENTRY_WINDOW
-    global MARTINGALE_MULTIPLIER, MARTINGALE_MAX_STEPS
 
     if key not in _ADJ_PARAMS:
         return False, f"Unknown param '{key}'. Valid: {', '.join(_ADJ_PARAMS)}"
@@ -6624,10 +5443,8 @@ def _apply_param(key: str, raw_val) -> tuple[bool, str]:
         "retrain":    lambda v: setattr(_sys.modules[__name__], "ML_RETRAIN_EVERY",    int(v)),
         "ml_min":     lambda v: setattr(_sys.modules[__name__], "ML_MIN_TRADES",       int(v)),
         "pause_min":  lambda v: setattr(_sys.modules[__name__], "PAUSE_MINUTES",       int(v)),
-        "second_cd":  lambda v: setattr(_sys.modules[__name__], "SECOND_ENTRY_COOLDOWN",   int(v)),
-        "second_win": lambda v: setattr(_sys.modules[__name__], "SECOND_ENTRY_WINDOW",     int(v)),
-        "m_mult":     lambda v: setattr(_sys.modules[__name__], "MARTINGALE_MULTIPLIER",   v),
-        "m_steps":    lambda v: setattr(_sys.modules[__name__], "MARTINGALE_MAX_STEPS",    int(v)),
+        "second_cd":  lambda v: setattr(_sys.modules[__name__], "SECOND_ENTRY_COOLDOWN", int(v)),
+        "second_win": lambda v: setattr(_sys.modules[__name__], "SECOND_ENTRY_WINDOW", int(v)),
     }
     _MAP[key](val)
 
@@ -6662,20 +5479,19 @@ async def _handle_adj_callback(q, d: str):
 
 
 async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global paused, pause_until, consecutive_losses, PROFIT_MIN
+    global paused, pause_until, consecutive_losses, PROFIT_MIN, PROFIT_MAX
     q = update.callback_query
     d = q.data
     logger.info(f"Button pressed: {d!r}")
     try:
         await q.answer()
     except Exception as e:
-        logger.debug(f"q.answer() failed: {e}")
-        return
+        logger.debug(f"q.answer() failed (non-fatal): {e}")
 
     try:
         if d in ("main_menu", "refresh"):
             await q.edit_message_text(
-                "🤖 <b>Deriv Sniper Bot v3</b>  –  Select an option:",
+                "🤖 <b>Deriv Touch Bot v1.0</b>  –  Select an option:",
                 reply_markup=_main_kb(), parse_mode="HTML",
             )
         elif d == "status":
@@ -6703,23 +5519,9 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif d == "ml_conf_perf":
             await q.edit_message_text(_ml_confidence_perf_text(), reply_markup=_main_kb(), parse_mode="HTML")
         elif d == "analytics":
-            await q.edit_message_text(
-                "⏳ Building analytics…",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]),
-                parse_mode="HTML",
-            )
-            text = _performance_analytics_text()
-            for i in range(0, len(text), 4000):
-                chunk = text[i:i+4000]
-                kb    = _main_kb() if i + 4000 >= len(text) else None
-                await q.message.reply_text(chunk, reply_markup=kb, parse_mode="HTML")
+            await q.edit_message_text(_performance_analytics_text(), reply_markup=_main_kb(), parse_mode="HTML")
         elif d == "patterns":
-            await q.edit_message_text(
-                "🔬 Running pattern discovery…",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]),
-                parse_mode="HTML",
-            )
-            threading.Thread(target=_pattern_discovery, daemon=True, name="PatDiscBtn").start()
+            await q.edit_message_text(_pattern_discovery_text(), reply_markup=_main_kb(), parse_mode="HTML")
         elif d == "export_csv_quick":
             await q.edit_message_text(
                 "⏳ Generating CSV export…",
@@ -6729,15 +5531,15 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             # Reuse existing export logic via a thread
             async def _do_export_quick():
                 try:
-                    rows = _db_fetch("SELECT * FROM trades ORDER BY id")
+                    rows = _db_fetch("SELECT * FROM touch_trades ORDER BY id")
                     if USE_PG:
                         cols = ["id","timestamp","symbol","direction","barrier","stake","payout",
                                 "profit","win","score","wick_atr_ratio","atr","atr_ma",
                                 "ema_fast_slope","ema_slow_slope","ema_distance","market_session"]
                     else:
                         import sqlite3 as _sl
-                        conn2 = _sl.connect("trades.db")
-                        desc2 = conn2.execute("PRAGMA table_info(trades)").fetchall()
+                        conn2 = _sl.connect("touch_trades.db")
+                        desc2 = conn2.execute("PRAGMA table_info(touch_trades)").fetchall()
                         conn2.close()
                         cols = [d2[1] for d2 in desc2]
                     buf = io.StringIO()
@@ -6757,26 +5559,31 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             asyncio.ensure_future(_do_export_quick())
         elif d == "payout_up":
             delta = 0.05
-            new_min = round(min(0.95, PROFIT_MIN + delta), 2)
-            PROFIT_MIN = new_min
+            # Widen/raise the target band, but keep min ≤ max and within hard limits
+            new_min = round(min(0.85, PROFIT_MIN + delta), 2)
+            new_max = round(min(1.20, PROFIT_MAX + delta), 2)
+            new_min = min(new_min, new_max)
+            PROFIT_MIN, PROFIT_MAX = new_min, new_max
             await q.edit_message_text(
-                f"💸 <b>Minimum payout raised</b>\n"
-                f"Min ratio : <b>{PROFIT_MIN*100:.0f}%</b>  (no upper limit)\n"
-                f"<i>Higher minimum = only takes the best payouts.</i>",
+                f"💸 <b>Payout band raised</b>\n"
+                f"Target profit : <b>${PROFIT_MIN:.2f} – ${PROFIT_MAX:.2f}</b> per trade\n"
+                f"<i>Higher band = harder barriers, usually better payout.</i>",
                 reply_markup=_main_kb(), parse_mode="HTML",
             )
-            _log(f"💸 Min payout raised to {PROFIT_MIN*100:.0f}%")
+            _log(f"💸 Payout band raised to ${PROFIT_MIN:.2f}–${PROFIT_MAX:.2f}")
         elif d == "payout_down":
             delta = 0.05
             new_min = round(max(0.10, PROFIT_MIN - delta), 2)
-            PROFIT_MIN = new_min
+            new_max = round(max(0.50, PROFIT_MAX - delta), 2)
+            new_min = min(new_min, new_max)
+            PROFIT_MIN, PROFIT_MAX = new_min, new_max
             await q.edit_message_text(
-                f"💸 <b>Minimum payout lowered</b>\n"
-                f"Min ratio : <b>{PROFIT_MIN*100:.0f}%</b>  (no upper limit)\n"
-                f"<i>Lower minimum = accepts more fills.</i>",
+                f"💸 <b>Payout band lowered</b>\n"
+                f"Target profit : <b>${PROFIT_MIN:.2f} – ${PROFIT_MAX:.2f}</b> per trade\n"
+                f"<i>Lower band = easier barriers, easier fills.</i>",
                 reply_markup=_main_kb(), parse_mode="HTML",
             )
-            _log(f"💸 Min payout lowered to {PROFIT_MIN*100:.0f}%")
+            _log(f"💸 Payout band lowered to ${PROFIT_MIN:.2f}–${PROFIT_MAX:.2f}")
         elif d == "noop" or d == "settings_adj":
             await q.answer()   # acknowledge silently — spacer / no-op buttons
         elif d == "settings":
@@ -6824,13 +5631,11 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"Bypasses signal filters — fires immediately.",
                 reply_markup=_test_group_kb(), parse_mode="HTML",
             )
-        elif d in ("tg_vol", "tg_vol1s", "tg_rdb", "tg_step", "tg_jump"):
+        elif d in ("tg_vol", "tg_vol1s", "tg_rdb"):
             labels = {
                 "tg_vol":   "📊 Volatility (R_*)",
                 "tg_vol1s": "⚡ Volatility 1s (1HZ*)",
                 "tg_rdb":   "📉 Range Break",
-                "tg_step":  "🪜 Step Index",
-                "tg_jump":  "⚡ Jump Indices",
             }
             await q.edit_message_text(
                 f"🧪 <b>Test Trade  –  {labels[d]}</b>\n━━━━━━━━━━━━━━━━━━━━\nSelect a symbol:",
@@ -6838,7 +5643,7 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         elif d.startswith("test_sym_"):
             sym = d[9:]
-            if sym not in ALL_RF_SYMBOLS:
+            if sym not in ALL_TOUCH_SYMBOLS:
                 await q.answer("Unknown symbol.", show_alert=True)
                 return
             await q.edit_message_text(
@@ -6855,15 +5660,6 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 target=_run_test_trade, args=(sym,),
                 daemon=True, name=f"TestTrade-{sym}"
             ).start()
-        elif d == "backtest":
-            await q.edit_message_text(
-                "🔬 <b>Backtest</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "Simulating Rise/Fall outcomes on historical candles…\n"
-                "<i>Results will arrive as a new message in a few seconds.</i>",
-                reply_markup=_main_kb(), parse_mode="HTML",
-            )
-            threading.Thread(target=_run_backtest, daemon=True, name="Backtest").start()
         elif d == "backup":
             await q.edit_message_text(
                 "📦 <b>Backup & Restore</b>\n━━━━━━━━━━━━━━━━━━━━\n"
@@ -6894,7 +5690,7 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ).start()
         else:
             await q.edit_message_text(
-                "🤖 <b>Deriv Sniper Bot v3</b>  –  Select an option:",
+                "🤖 <b>Deriv Touch Bot v1.0</b>  –  Select an option:",
                 reply_markup=_main_kb(), parse_mode="HTML",
             )
     except Exception as e:
@@ -6941,43 +5737,12 @@ async def heartbeat_job(ctx: ContextTypes.DEFAULT_TYPE):
     if ml_act:
         ml_line = "⏳ Retraining in progress…"
     elif ml_m is None:
-        pct_warm = min(100, int(ml_total / ML_MIN_TRADES * 100)) if ML_MIN_TRADES else 100
-        bar_warm = _ml_progress_bar(ml_total / ML_MIN_TRADES if ML_MIN_TRADES else 1.0, 10)
-        ml_line  = f"🔄 Warming up [{bar_warm}] {ml_total}/{ML_MIN_TRADES} ({pct_warm}%)"
+        ml_line = f"🔄 Warming up ({ml_total}/{ML_MIN_TRADES} trades needed)"
     else:
         nxt = max(0, ML_RETRAIN_EVERY - (ml_total - ml_t))
-        bar_retrain = _ml_progress_bar(1.0 - nxt / ML_RETRAIN_EVERY if ML_RETRAIN_EVERY else 1.0, 10)
-        ml_line = f"✅ Active [{bar_retrain}] trained={ml_t}  retrain in {nxt} trades"
+        ml_line = f"✅ Active · trained on {ml_t} · next retrain in {nxt} trades"
 
-    # ML confidence bracket performance (live session, from _ml_conf_live_stats)
-    with _lock:
-        conf_snap = dict(_ml_conf_live_stats)
-    ml_conf_lines = ""
-    if conf_snap:
-        ml_conf_lines = "<b>  ML Confidence Performance</b>\n"
-        for bucket in sorted(conf_snap.keys(), reverse=True):
-            s = conf_snap[bucket]
-            t_b = s.get("wins", 0) + s.get("losses", 0)
-            wr_b = s.get("wins", 0) / t_b * 100 if t_b else 0
-            pnl_b = s.get("pnl", 0.0)
-            sign = "+" if pnl_b >= 0 else ""
-            ml_conf_lines += (
-                f"  {bucket}% : {t_b} trades · {wr_b:.0f}% WR · {sign}${pnl_b:.2f}\n"
-            )
-    else:
-        ml_conf_lines = "  — no ML-filtered trades this session —\n"
-
-    # Next session countdown
-    next_dt   = _next_session_start(now)
-    secs_left = max(0, int((next_dt - now).total_seconds()))
-    hh_l, rem = divmod(secs_left, 3600)
-    mm_l      = rem // 60
-    nxt_countdown = f"{hh_l}h {mm_l}m" if hh_l else f"{mm_l}m"
-    next_sess = _get_session_name(next_dt)
-    next_line = (f"  ⏭ Next: {SESSION_EMOJIS.get(next_sess,'')} {next_sess} "
-                 f"in {nxt_countdown}  ({next_dt.strftime('%H:%M UTC')})\n")
-
-    # Top 5 hottest symbols right now (with Sober Book extras)
+    # Top 5 hottest symbols right now
     scored = []
     for sym in SYMBOLS:
         with _lock:
@@ -6986,24 +5751,19 @@ async def heartbeat_job(ctx: ContextTypes.DEFAULT_TYPE):
             try:
                 row_c = {"Close": float(cc.get("close", 0)), "Open": float(cc.get("open", 0)),
                          "High":  float(cc.get("high",  0)), "Low":  float(cc.get("low",  0))}
-                s, d, det = score_signal(sym, row_c)
-                scored.append((s, sym, d, det))
+                s, d, _ = score_signal(sym, row_c)
+                scored.append((s, sym, d))
             except Exception:
                 pass
     scored.sort(reverse=True)
     hot_lines = ""
-    for s, sym, d, det in scored[:5]:
-        heat  = "🔥🔥" if s >= SCORE_THRESHOLD else "🔥" if s >= SCORE_THRESHOLD - 15 else "  "
+    for s, sym, d in scored[:5]:
+        heat = "🔥🔥" if s >= SCORE_THRESHOLD else "🔥" if s >= SCORE_THRESHOLD - 15 else "  "
         m5d   = indicators_m5.get(sym,  {}).get("supertrend_dir", 0)
         m15d  = indicators_m15.get(sym, {}).get("supertrend_dir", 0)
         m5ic  = ("↑" if m5d  == 1 else "↓" if m5d  == -1 else "→") + "M5"
         m15ic = ("↑" if m15d == 1 else "↓" if m15d == -1 else "→") + "M15"
-        ms_t  = det.get("market_structure", "?")[:4]
-        pat   = det.get("candle_pattern", "—").split()[0]   # first word only
-        hot_lines += (
-            f"  {heat}<code>{sym:<10}</code> {s:>3}/100 {d} {m5ic} {m15ic}\n"
-            f"       MktStr:{ms_t}  Pat:{pat}\n"
-        )
+        hot_lines += f"  {heat}<code>{sym:<10}</code> {s:>3}/100 {d} {m5ic} {m15ic}\n"
     if not hot_lines:
         hot_lines = "  — no data yet —\n"
 
@@ -7012,45 +5772,21 @@ async def heartbeat_job(ctx: ContextTypes.DEFAULT_TYPE):
         _hb_t, _hb_trn = ml_total_trades, ml_trained_on
     _retrain_nxt = max(0, ML_RETRAIN_EVERY - max(0, _hb_t - _hb_trn))
 
-    # Per-session breakdown today
-    _roll_market_session_stats_if_needed()
-    with _lock:
-        all_sess = {k: dict(v) for k, v in market_session_stats.items()}
-    sess_detail = ""
-    for sess_n in ["Midnight", "Early Asian", "Late Asian", "London", "Early New York", "Late New York"]:
-        sv = all_sess.get(sess_n, {})
-        tr = sv.get("trades", 0)
-        if tr == 0:
-            continue
-        sw = sv.get("wins", 0); sl = sv.get("losses", 0); sp = sv.get("pnl", 0.0)
-        swr = sw / tr * 100 if tr else 0
-        is_cur = "◀" if sess_n == mkt_s else ""
-        sess_detail += (
-            f"  {SESSION_EMOJIS.get(sess_n,'')} {sess_n:<16} {tr}tr  {sw}W/{sl}L "
-            f"{swr:.0f}%  {'+' if sp >= 0 else ''}${sp:.2f} {is_cur}\n"
-        )
-    if not sess_detail:
-        sess_detail = "  — no session trades yet today —\n"
-
     msg = (
-        f"❤️ <b>Hourly Heartbeat</b>  –  {now.strftime('%H:%M UTC')}\n"
+        f"❤️ <b>Hourly Heartbeat</b>  ·  {now.strftime('%H:%M UTC')}  ·  Deriv Server Time\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"State   : {'⏸ PAUSED' if is_paused else '▶ RUNNING'}\n"
-        f"Market  : {SESSION_EMOJIS.get(mkt_s,'')} {mkt_s}  ·  Active: {ac}\n"
-        f"{next_line}"
-        f"\n"
-        f"<b>💰 P&amp;L</b>\n"
+        f"{'⏸ PAUSED' if is_paused else '▶ RUNNING'}  ·  "
+        f"{SESSION_EMOJIS.get(mkt_s,'')} {mkt_s}  ·  Active: {ac}\n"
+        "\n"
+        "<b>💰 Session P&amp;L</b>\n"
         f"  {'+' if pnl >= 0 else ''}${pnl:.2f}  ({total} trades  {wc}W/{lc}L  {wr:.0f}%WR)\n"
-        f"  Drawdown: -${cur_dd:.2f}  (max -${mdd:.2f})\n"
-        f"  Streak  : {'🔴×' + str(cl) if cl else '🟢 None'}\n"
-        f"\n"
+        f"  Drawdown: ${cur_dd:.2f}  ·  Max DD: ${mdd:.2f}\n"
+        f"  Streak: {'🔴×' + str(cl) if cl else '🟢 None'}\n"
+        "\n"
         f"{session_line}"
-        f"<b>📅 Today by Session</b>\n{sess_detail}"
-        f"\n"
-        f"<b>🤖 ML Engine</b>\n"
-        f"  {ml_line}\n"
-        f"{ml_conf_lines}"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>🤖 ML Engine</b>\n"
+        f"  {ml_line}  ·  next retrain in {_retrain_nxt} trades\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>🔥 Top Symbols</b>\n{hot_lines}"
         f"{_best_worst_line()}"
     )
@@ -7068,7 +5804,7 @@ def _make_header() -> Panel:
     with _lock:
         is_paused = paused
     mode = Text("⏸  PAUSED", style="bold yellow") if is_paused else Text("▶  RUNNING", style="bold green")
-    t = Text("  DERIV SNIPER BOT  v3.0   ", style="bold cyan")
+    t = Text("  DERIV TOUCH BOT  v1.0   ", style="bold cyan")
     t.append(f"  {now}  ", style="dim white")
     t.append(f"  [{_get_session_name()}]  ", style="bold magenta")
     t.append("    ")
@@ -7205,10 +5941,7 @@ def _make_pnl_panel() -> Panel:
     mkt_s = _get_session_name()
 
     t = Text()
-    dpnl     = daily_total_pnl
-    dpnl_col = "green" if dpnl >= 0 else "red"
     t.append("  Market Session: ", style="dim"); t.append(f"{SESSION_EMOJIS.get(mkt_s,'')} {mkt_s}\n", style="bold magenta")
-    t.append("  Daily P&L    : ", style="dim"); t.append(f"${dpnl:+.2f}", style=f"bold {dpnl_col}"); t.append("  (all sessions)\n", style="dim")
     t.append("  Session P&L  : ", style="dim"); t.append(f"${pnl:+.2f}\n", style=f"bold {col}")
     t.append("  Wins / Losses: ", style="dim")
     t.append(f"{wc}", style="bold green"); t.append(" / ")
@@ -7385,38 +6118,8 @@ def _scan_status_loop():
 # ══════════════════════════════════════════════════════════════════════
 #  MIDNIGHT BREAKDOWN  (00:00 UTC daily)
 # ══════════════════════════════════════════════════════════════════════
-def _rejected_signal_backfill_loop():
-    """Every 30s, check rejected signals whose contract window has elapsed and
-    fill in whether the market would have paid out anyway — using the live
-    price already being tracked for trading, so no extra API calls or compute."""
-    while True:
-        try:
-            time.sleep(30)
-            now_iso = datetime.now(timezone.utc).isoformat()
-            rows = _db_fetch(
-                "SELECT timestamp, symbol, direction, entry_price FROM rejected_signals "
-                "WHERE would_have_won IS NULL AND check_at <= ? LIMIT 200",
-                (now_iso,),
-            )
-            for ts, sym, direction, entry_price in rows:
-                with _lock:
-                    cc = current_candle.get(sym)
-                cur_price = float(cc["close"]) if cc else None
-                if cur_price is None or entry_price is None:
-                    continue
-                won = (direction == "UP" and cur_price > entry_price) or \
-                      (direction == "DOWN" and cur_price < entry_price)
-                db_queue.put({
-                    "type": "rej_update", "timestamp": ts, "symbol": sym,
-                    "win": int(won),
-                })
-        except Exception as e:
-            logger.error(f"Rejected-signal backfill error: {e}")
-
-
 def _midnight_breakdown_loop():
     """At every UTC midnight, send a full day breakdown by market session."""
-    global daily_total_pnl
     while True:
         try:
             now  = datetime.now(timezone.utc)
@@ -7436,7 +6139,6 @@ def _midnight_breakdown_loop():
                 ms_snap = {k: dict(v) for k, v in market_session_stats.items()}
                 log     = list(daily_session_log)
 
-            daily_total_pnl = 0.0   # reset daily accumulator for the new day
             _roll_market_session_stats_if_needed()
 
             total_day_pnl = sum(v["pnl"] for v in ms_snap.values())
@@ -7597,7 +6299,7 @@ def _pinned_dashboard_loop():
                         "<b>⚙ Engine</b>\n"
                         f"  ML    : {ml_s}  ·  retrain in <b>{_retrain_nxt}</b> trades\n"
                         f"  Gate  : score≥{SCORE_THRESHOLD}  ·  ML≥{ML_CONFIDENCE_MIN*100:.0f}%\n"
-                        f"  Payout  : min {PROFIT_MIN*100:.0f}% profit ratio (no upper cap)\n"
+                        f"  Payout: ${PROFIT_MIN:.2f}–${PROFIT_MAX:.2f}  ·  ATR×{ATR_BARRIER_MULT}\n"
                         "━━━━━━━━━━━━━━━━━━━━\n"
                         f"<b>🔥 Hot Signals</b>\n{hot}"
                         f"🕐 Next session: <b>{next_dt.strftime('%H:%M UTC')}</b> in {next_in} · "
@@ -7685,32 +6387,12 @@ def _session_change_monitor_loop():
 #  TELEGRAM STARTUP
 # ══════════════════════════════════════════════════════════════════════
 def _start_telegram():
-    # Re-read the token at call time so a late-injected env var is picked up
-    # after the first attempt, and so config changes don't need a full restart.
-    token = os.environ.get("TG_BOT_TOKEN") or TELEGRAM_BOT_TOKEN
-    if not token:
-        logger.warning(
-            "TG_BOT_TOKEN is not set — Telegram disabled. "
-            "Set the secret and restart the bot to enable it."
-        )
-        # Sleep a long time so the watch-thread does not spam-retry every 5 s.
-        time.sleep(300)
-        return
-
     async def _run():
         global telegram_app, _tg_loop
         # Clear readiness in case this is a restart
         _tg_ready.clear()
         _tg_loop = asyncio.get_running_loop()
-        try:
-            app = Application.builder().token(token).build()
-        except Exception as _tok_err:
-            logger.error(
-                f"Telegram Application build failed ({_tok_err}). "
-                "Check TG_BOT_TOKEN — sleeping 300 s before retry."
-            )
-            await asyncio.sleep(300)
-            return
+        app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         telegram_app = app
 
         async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7733,14 +6415,11 @@ def _start_telegram():
         app.add_handler(CommandHandler("history", cmd_history))
         app.add_handler(CommandHandler("session", cmd_session))
         app.add_handler(CommandHandler("alltime", cmd_alltime))
+        app.add_handler(CommandHandler("patterns", cmd_patterns))
+        app.add_handler(CommandHandler("analytics", cmd_analytics))
         app.add_handler(CommandHandler("export",  cmd_export))
         app.add_handler(CommandHandler("backup",  cmd_backup))
-        app.add_handler(CommandHandler("set",       cmd_set))
-        app.add_handler(CommandHandler("analytics", cmd_analytics))
-        app.add_handler(CommandHandler("patterns",  cmd_patterns))
-        app.add_handler(CommandHandler("scoreperf",  cmd_scoreperf))
-        app.add_handler(CommandHandler("martingale", cmd_martingale))
-        app.add_handler(CommandHandler("rejections", cmd_rejections))
+        app.add_handler(CommandHandler("set",     cmd_set))
         # CSV upload: catch ALL document messages and check filename inside the
         # handler — avoids MIME-type mismatches (mobile sends text/plain,
         # desktop sends text/csv, some clients send application/octet-stream).
@@ -7855,7 +6534,7 @@ def main():
     is_tty = sys.stdout.isatty()
     console.print(Panel(
         Align.center(Text(
-            f"\n  DERIV SNIPER BOT  v3.0  –  Supertrend Edition\n"
+            f"\n  DERIV TOUCH BOT  v1.0  –  Supertrend Edition\n"
             f"  Loading history for {len(SYMBOLS)} symbols…\n",
             style="bold cyan",
         )),
@@ -7890,6 +6569,10 @@ def main():
     # Load existing ML model
     _ml_load()
 
+    # Restore live ML-confidence / signal-score performance dashboards from Neon
+    # so a restart no longer wipes them (previously in-memory only).
+    _ml_stats_load_all()
+
     # ── Sync ml_total_trades with the real DB row count so the "retrain in N"
     # counter starts from the correct baseline instead of 0 after a restart.
     # ml_trained_on is loaded from the pickle (e.g. 100) but ml_total_trades
@@ -7897,15 +6580,9 @@ def main():
     # Also cap ml_trained_on to the real DB count: bootstrap models are trained
     # on historical candle simulations, which is a much larger number than real
     # trades. Without this cap the counter can stay stuck at 50 forever.
-    # NOTE: excludes barrier='backtest' rows — those are synthetic trades that
-    # backtest.py inserts purely to help train the ML model; they must never
-    # count toward the user-visible "real trades placed" progress counter.
     global ml_total_trades, ml_trained_on  # must declare global here — in main(), not module scope
     try:
-        _db_cnt_rows = _db_fetch(
-            "SELECT COUNT(*) FROM trades WHERE win IN (0,1) "
-            "AND (barrier IS NULL OR barrier != 'backtest')"
-        )
+        _db_cnt_rows = _db_fetch("SELECT COUNT(*) FROM touch_trades WHERE win IN (0,1)")
         _db_count = int(_db_cnt_rows[0][0]) if _db_cnt_rows and _db_cnt_rows[0][0] else 0
         with ml_lock:
             ml_total_trades = max(ml_total_trades, _db_count)
@@ -7916,12 +6593,6 @@ def main():
                 logger.info(f"Capped ml_trained_on to real DB count {ml_total_trades}")
         logger.info(f"ml_total_trades initialised to {ml_total_trades} from DB "
                     f"(ml_trained_on={ml_trained_on})")
-        # ── Train once on boot straight from whatever is already in the DB
-        # (e.g. a backtest seed) instead of waiting for the next live trade.
-        # _ml_maybe_retrain() has its own gating (untrained, or trained_on is
-        # stale by >= ML_RETRAIN_EVERY) so it's safe to always call here —
-        # one-time background thread, same cost as any other retrain.
-        _ml_maybe_retrain(ml_total_trades)
     except Exception as _e:
         logger.warning(f"Failed to init ml_total_trades from DB: {_e}")
 
@@ -7934,9 +6605,9 @@ def main():
     # succeed, so any subsequent _send_tg call is guaranteed a live loop.
     _tg_ready.wait(timeout=30)
 
-    # ML bootstrap skipped — avoids CPU spike across 21 symbols at startup.
-    # The model trains automatically once ML_MIN_TRADES real trades are settled.
-    logger.info("ML bootstrap skipped — accumulating real trades for first model.")
+    # ML bootstrap from candle history is DISABLED — watch-only mode until
+    # ML_MIN_TRADES (100) real touch_trades are recorded, then trains automatically.
+    # threading.Thread(target=_ml_bootstrap_from_history, daemon=True, name="MLBootstrap").start()
 
     # ── Indicator computation executor: serialises heavy pandas work across
     # all 15 symbols so they don't all spike CPU simultaneously at candle-close.
@@ -7957,7 +6628,6 @@ def main():
     _watch_thread(_pending_trade_timeout_loop,  name="PendingTimeout")
     _watch_thread(_stale_contract_watchdog,     name="StaleWatchdog")
     _watch_thread(_midnight_breakdown_loop,     name="MidnightBreakdown")
-    _watch_thread(_rejected_signal_backfill_loop, name="RejectionBackfill")
     _watch_thread(_pinned_dashboard_loop,       name="PinnedDashboard")
     _watch_thread(_session_change_monitor_loop, name="SessionMonitor")
     # Guard thread: makes sure ML retrains even if DB-writer path is delayed
@@ -7980,7 +6650,7 @@ def main():
     else:
         console.print(
             "[yellow]Non-TTY detected: Rich dashboard disabled.\n"
-            "Watch sniper.log or Telegram for status.[/yellow]"
+            "Watch touch.log or Telegram for status.[/yellow]"
         )
         try:
             while True:
