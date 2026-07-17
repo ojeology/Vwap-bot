@@ -15,6 +15,14 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+import warnings as _warnings_module
+# Suppress repeated pandas/numpy RuntimeWarnings from ATR/ADX edge-case divisions
+# (NaN and Inf are handled explicitly before any ML feature matrix is built)
+_warnings_module.filterwarnings("ignore", message="Mean of empty slice",       category=RuntimeWarning)
+_warnings_module.filterwarnings("ignore", message="All-NaN slice encountered", category=RuntimeWarning)
+_warnings_module.filterwarnings("ignore", message="Degrees of freedom",        category=RuntimeWarning)
+_warnings_module.filterwarnings("ignore", message="invalid value encountered", category=RuntimeWarning)
+_warnings_module.filterwarnings("ignore", message="divide by zero encountered",category=RuntimeWarning)
 
 # PostgreSQL support (optional – falls back to SQLite when neither URL is set)
 # Prefers NEON_DATABASE_URL (same convention as sniper_bot.py) so this bot's
@@ -56,6 +64,80 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes,
 )
+
+# ── Dynamic Gemini / Gemma model discovery (Google AI Studio) ────────────────
+_GEMINI_MODEL_FALLBACK  = "gemma-3-27b-it"   # last-resort hardcoded fallback
+_GEMINI_MODEL_CACHE_TTL = 4 * 3600           # re-discover every 4 hours
+_gemini_model_cache: dict = {}               # {"model": str, "expires": float}
+
+try:
+    from google import genai as _genai
+    _GEMINI_KEY    = os.environ.get("GEMINI_API_KEY", "")
+    _GEMINI_CLIENT = _genai.Client(api_key=_GEMINI_KEY) if _GEMINI_KEY else None
+except Exception as _gem_err:
+    _GEMINI_CLIENT = None
+
+
+def _discover_gemini_model(force: bool = False) -> str:
+    """Query Google AI to list available models; pick best Gemma → best Flash → fallback.
+    Thread-safe. Cached for _GEMINI_MODEL_CACHE_TTL seconds to minimise API calls.
+    Never crashes — always returns a usable model string."""
+    global _gemini_model_cache
+    now = time.time()
+    if not force and _gemini_model_cache.get("expires", 0) > now:
+        return _gemini_model_cache["model"]
+
+    if _GEMINI_CLIENT is None:
+        _gemini_model_cache = {"model": _GEMINI_MODEL_FALLBACK, "expires": now + 300}
+        return _GEMINI_MODEL_FALLBACK
+
+    try:
+        models_iter = _GEMINI_CLIENT.models.list()
+        available = []
+        for m in models_iter:
+            name = getattr(m, "name", "") or ""
+            # supported_actions (newer SDK) or supported_generation_methods (older)
+            methods = getattr(m, "supported_actions", None) or \
+                      getattr(m, "supported_generation_methods", None) or []
+            method_strs = " ".join(str(x) for x in methods)
+            if "generateContent" in method_strs or not methods:
+                short = name.removeprefix("models/")
+                if short:
+                    available.append(short)
+        logger.info(f"Gemini model discovery: {len(available)} generateContent models found")
+
+        # Priority 1 — best Gemma model (sort descending → largest version first)
+        gemma_models = sorted([m for m in available if "gemma" in m.lower()], reverse=True)
+        if gemma_models:
+            chosen = gemma_models[0]
+            logger.info(f"AI model selected (Gemma): {chosen}")
+            _gemini_model_cache = {"model": chosen, "expires": now + _GEMINI_MODEL_CACHE_TTL}
+            return chosen
+
+        # Priority 2 — best Gemini Flash model
+        flash_models = sorted([m for m in available if "flash" in m.lower()], reverse=True)
+        if flash_models:
+            chosen = flash_models[0]
+            logger.info(f"AI model selected (Flash fallback): {chosen}")
+            _gemini_model_cache = {"model": chosen, "expires": now + _GEMINI_MODEL_CACHE_TTL}
+            return chosen
+
+        # Priority 3 — any available model
+        if available:
+            chosen = available[0]
+            logger.info(f"AI model selected (first available): {chosen}")
+            _gemini_model_cache = {"model": chosen, "expires": now + _GEMINI_MODEL_CACHE_TTL}
+            return chosen
+
+    except Exception as e:
+        logger.warning(f"Gemini model discovery failed: {e}")
+
+    # Fallback: reuse cached entry if present, else hardcoded constant
+    cached = _gemini_model_cache.get("model")
+    if cached:
+        return cached
+    _gemini_model_cache = {"model": _GEMINI_MODEL_FALLBACK, "expires": now + 300}
+    return _GEMINI_MODEL_FALLBACK
 
 # ══════════════════════════════════════════════════════════════════════
 #  CONFIG
@@ -112,7 +194,7 @@ HEARTBEAT_INTERVAL_SEC = 3600      # richer hourly heartbeat
 # Bump this any time DURATION / SCORE_THRESHOLD / ML_CONFIDENCE_MIN /
 # ATR_BARRIER_MULT (or the underlying strategy logic) changes, so reports
 # can be compared apples-to-apples across config revisions over time.
-STRATEGY_VERSION = "V2.5"
+STRATEGY_VERSION = "V2.6"
 
 # ── Market sessions (UTC hours) ───────────────────────────────────────
 # Maps session name → (start_hour_utc, end_hour_utc).
@@ -165,12 +247,38 @@ ML_STACKING_MIN_TRADES = 200     # below this, use a single regularized GB model
 ML_FEATURE_COLS   = [
     "score", "wick_atr_ratio", "atr", "atr_ma",
     "ema_fast_slope", "ema_slow_slope", "ema_distance",
+    "bb_width",                  # V2.6: Bollinger bandwidth — regime proxy
+    # V2.7: oscillator + momentum — all stored in DB, normalised at train/predict time
+    "rsi", "stochrsi_k", "roc", "body_ratio", "bb_position", "adx",
+    # V2.9: context features — previously computed but discarded; now persisted so
+    # ML can learn from session/asset health, each Sober Book component, and MTF state.
+    "session_health", "asset_health",
+    "sober_structure_pts", "sober_trend_pts", "sober_zone_pts",
+    "sober_timing_pts", "sober_momentum_pts", "sober_candle_pts",
+    "mtf_agreement",
 ]
 # Engineered columns appended at train/predict time only (never stored) — see
-# _ml_engineer(). Ported from sniper_bot.py: cyclical time-of-day lets the
-# model learn session-dependent edge without one-hot blowing up the feature
-# space on a small dataset.
-_ML_ENGINEERED_COLS = ["hour_sin", "hour_cos", "session_ord"]
+# _ml_engineer(). Cyclical time-of-day lets the model learn session-dependent
+# edge; regime_enc and atr_expansion encode market condition without one-hot
+# blowing up the feature space on a small dataset.
+_ML_ENGINEERED_COLS = ["hour_sin", "hour_cos", "session_ord", "regime_enc", "atr_expansion"]
+
+# ── V2.6 adaptive gate & health ───────────────────────────────────────
+ML_CONFIDENCE_MIN_FLOOR = 0.55   # gate never drops below this
+ML_CONFIDENCE_MAX_CAP   = 0.70   # gate never rises above this
+ASSET_BLACKLIST_WR          = 0.30   # WR below this triggers auto-blacklist
+ASSET_BLACKLIST_MIN_TRADES  = 20     # minimum trades required to trigger
+ASSET_BLACKLIST_HOURS       = 24     # hours to stay blacklisted
+HEALTH_CACHE_TTL            = 300    # seconds between health-cache refreshes
+
+# Regime encoding (ordinal, used in ML feature vector)
+REGIME_ORDINAL = {
+    "Strong Trend": 4.0,
+    "Expansion":    3.0,
+    "Weak Trend":   2.0,
+    "Choppy":       1.0,
+    "Compression":  0.0,
+}
 
 # ── Per-class ML: separate model per volatility family ───────────────
 ML_SYMBOL_CLASSES = {
@@ -266,6 +374,22 @@ _ml_conf_live_stats: dict = {}
 # Same bucket shape as above. Lets us see whether score bands (75-84, 85-89, etc.)
 # translate into real P&L independent of the ML confidence value.
 _ml_score_live_stats: dict = {}
+
+# V2.6: Health, blacklist & feature history ───────────────────────────
+_asset_health:               dict  = {}   # symbol  → float WR (0–1) last 30 trades
+_session_health:             dict  = {}   # session → float WR (0–1) last 30 trades
+_blacklisted_assets:         dict  = {}   # symbol  → UTC expiry datetime
+_feature_importance_history: list  = []   # [{ts, importances}] across all retrains
+_health_last_refresh:        float = 0.0  # epoch of last health cache update
+_ml_last_retrain_tg_time:    float = 0.0  # epoch of last "retrain started" TG message
+ML_RETRAIN_COOLDOWN_SECS:    int   = 300   # minimum seconds between completed retrains
+_ml_last_retrain_time:       float = 0.0   # epoch of last completed retrain (cooldown)
+_ml_optimal_threshold:       float = 0.60  # auto-tuned decision threshold from walk-forward eval
+_ml_importance_weights:      dict  = {}   # feature_name → normalized importance (updated after retrain)
+_ml_component_weights:       dict  = {}   # sober component → ML-tuned score multiplier (0.70–1.30)
+ML_PER_SYMBOL_MIN_TRADES:    int   = 50   # min trades for a dedicated per-symbol model
+ml_models_per_symbol:        dict  = {}   # symbol → model (checked before per-class + global)
+ml_trained_per_symbol:       dict  = {}   # symbol → trade count at last per-symbol train
 
 # Tick momentum ─────────────────────────────────────────────────────────
 tick_history: dict = {}  # sym → deque(maxlen=10) of intra-candle close prices
@@ -390,6 +514,7 @@ def _get_symbol_class(symbol: str) -> str:
 
 def _ml_load():
     global ml_model, ml_trained_on, ml_models_per_class, ml_trained_per_class
+    global ml_models_per_symbol, ml_trained_per_symbol
     if os.path.exists(MODEL_PATH):
         try:
             with open(MODEL_PATH, "rb") as f:
@@ -399,6 +524,8 @@ def _ml_load():
                 ml_trained_on = payload.get("trained_on", 0)
                 ml_models_per_class  = payload.get("per_class_models",  ml_models_per_class)
                 ml_trained_per_class = payload.get("per_class_trained", ml_trained_per_class)
+                ml_models_per_symbol  = payload.get("per_symbol_models",  ml_models_per_symbol)
+                ml_trained_per_symbol = payload.get("per_symbol_trained", ml_trained_per_symbol)
             else:
                 # Legacy: bare model object saved without wrapper dict
                 ml_model = payload
@@ -417,37 +544,89 @@ def _ml_save():
                 "trained_on":         ml_trained_on,
                 "per_class_models":   ml_models_per_class,
                 "per_class_trained":  ml_trained_per_class,
+                "per_symbol_models":  ml_models_per_symbol,
+                "per_symbol_trained": ml_trained_per_symbol,
             }, f)
     except Exception as e:
         logger.error(f"Failed to save ML model: {e}")
 
 
-def _ml_engineer(raw_vals: list, timestamp: str, session: str) -> list:
-    """Extend the raw DB feature vector with cyclical time-of-day + ordinal
-    market-session position, computed at train/predict time (not stored),
-    so the model can pick up session-dependent edge without a one-hot
-    exploding the feature space on a small dataset. Ported from sniper_bot.py."""
+def _ml_engineer(raw_vals: list, timestamp: str, session: str, regime: str = "Choppy") -> list:
+    """Extend the raw DB feature vector with engineered features computed at
+    train/predict time (never stored in DB):
+      hour_sin / hour_cos — cyclical time-of-day (session edge without one-hot)
+      session_ord         — ordinal market-session position
+      regime_enc          — ordinal regime encoding (V2.6)
+      atr_expansion       — ATR / ATR_MA ratio (V2.6)
+    """
     hour = 12.0
     if timestamp:
         try:
             hour = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00")).hour
         except (ValueError, TypeError):
             pass
-    hour_sin = math.sin(2 * math.pi * hour / 24.0)
-    hour_cos = math.cos(2 * math.pi * hour / 24.0)
+    hour_sin    = math.sin(2 * math.pi * hour / 24.0)
+    hour_cos    = math.cos(2 * math.pi * hour / 24.0)
     session_ord = float(_ML_SESSION_ORDER.get(session, -1))
-    return list(raw_vals) + [hour_sin, hour_cos, session_ord]
+    regime_enc  = REGIME_ORDINAL.get(regime, 1.0)
+    # ATR expansion: raw_vals[2]=atr, raw_vals[3]=atr_ma (ML_FEATURE_COLS order)
+    try:
+        def _safe_float(v, default=0.0):
+            if v is None:
+                return default
+            try:
+                f = float(v)
+                return default if not np.isfinite(f) else f
+            except (TypeError, ValueError):
+                return default
+        atr_v         = _safe_float(raw_vals[2] if len(raw_vals) > 2 else None, 0.0)
+        atr_ma_v      = _safe_float(raw_vals[3] if len(raw_vals) > 3 else None, 0.0)
+        atr_expansion = atr_v / max(atr_ma_v, 1e-9) if atr_ma_v > 0 else 1.0
+        if not np.isfinite(atr_expansion):
+            atr_expansion = 1.0
+    except (IndexError, TypeError, ValueError):
+        atr_expansion = 1.0
+    # Replace any NaN in raw_vals with 0 before appending engineered features
+    clean_raw = [0.0 if (v is None or (isinstance(v, float) and not np.isfinite(v))) else v
+                 for v in raw_vals]
+    return clean_raw + [hour_sin, hour_cos, session_ord, regime_enc, atr_expansion]
 
 
 def _ml_build_matrix(rows: list, n_raw: int) -> tuple:
-    """rows: (symbol, *raw_feature_vals, timestamp, session, win). Returns (X, y)
-    with engineered columns appended."""
+    """rows: (symbol, *raw_feature_vals, timestamp, session, regime, win).
+    V2.6: parses regime for _ml_engineer; cleans NaN/inf before returning.
+    V2.8: replaces inf with NaN first, then fills column-wise with medians
+    instead of zero — avoids systematic bias from clipping and suppresses
+    pandas/numpy RuntimeWarnings from ATR/ADX edge-case divisions."""
     X, y = [], []
     for r in rows:
-        raw = [float(r[1 + i]) if r[1 + i] is not None else 0.0 for i in range(n_raw)]
-        ts, sess, win = r[1 + n_raw], r[2 + n_raw], r[3 + n_raw]
-        X.append(_ml_engineer(raw, ts, sess))
+        raw = []
+        for i in range(n_raw):
+            v = r[1 + i]
+            if v is None:
+                raw.append(np.nan)
+            else:
+                try:
+                    fv = float(v)
+                    raw.append(np.nan if not np.isfinite(fv) else fv)
+                except (ValueError, TypeError):
+                    raw.append(np.nan)
+        ts         = r[1 + n_raw]
+        sess       = r[2 + n_raw]
+        regime_str = str(r[3 + n_raw]) if r[3 + n_raw] else "Choppy"
+        win        = r[4 + n_raw]
+        X.append(_ml_engineer(raw, ts, sess, regime_str))
         y.append(win)
+    if X:
+        X_arr = np.array(X, dtype=float)
+        # Replace ±inf with NaN so they participate in median computation
+        X_arr = np.where(np.isinf(X_arr), np.nan, X_arr)
+        # Fill NaN column-wise with column medians (neutral, data-driven value)
+        col_medians = np.nanmedian(X_arr, axis=0)
+        col_medians = np.nan_to_num(col_medians, nan=0.0)
+        nan_mask = np.isnan(X_arr)
+        X_arr[nan_mask] = np.take(col_medians, np.where(nan_mask)[1])
+        X = X_arr.tolist()
     return X, y
 
 
@@ -490,8 +669,14 @@ def _make_gb_clf(random_state: int = 42) -> GradientBoostingClassifier:
 
 def _walk_forward_eval(build_fn, X: list, y: list, weights) -> Optional[dict]:
     """Time-ordered (no shuffling) holdout: train on the first 80% chronologically,
-    score on the last 20% never seen in training — an honest read on whether the
-    model generalizes forward in time, not just fits the past."""
+    score on the last 20% never seen in training.
+    V2.8: ROC-AUC, PR-AUC, MCC, Balanced Accuracy, ECE calibration error, and
+    auto-searched optimal profit threshold (replaces fixed 60% heuristic)."""
+    from sklearn.metrics import (
+        f1_score, recall_score, roc_auc_score, brier_score_loss, confusion_matrix,
+        average_precision_score, matthews_corrcoef, balanced_accuracy_score,
+    )
+    import warnings as _w
     n = len(X)
     split = int(n * 0.8)
     if split < 10 or (n - split) < 5:
@@ -501,26 +686,86 @@ def _walk_forward_eval(build_fn, X: list, y: list, weights) -> Optional[dict]:
     if len(set(ytr)) < 2 or len(set(yte)) < 2:
         return None
     try:
-        m = build_fn()
-        if weights is not None:
-            try:
-                m.fit(Xtr, ytr, sample_weight=weights[:split])
-            except TypeError:
-                m.fit(Xtr, ytr)   # CalibratedClassifierCV/Stacking doesn't take sample_weight cleanly
-        else:
-            m.fit(Xtr, ytr)
-        proba = m.predict_proba(Xte)[:, list(m.classes_).index(1)] if 1 in m.classes_ else [0.0] * len(yte)
-        preds = [1 if p >= 0.5 else 0 for p in proba]
-        acc = sum(1 for p, t in zip(preds, yte) if p == t) / len(yte)
+        with _w.catch_warnings():
+            _w.simplefilter("ignore")
+            Xtr_arr = np.nan_to_num(np.array(Xtr, dtype=float), nan=0.0, posinf=10.0, neginf=-10.0)
+            Xte_arr = np.nan_to_num(np.array(Xte, dtype=float), nan=0.0, posinf=10.0, neginf=-10.0)
+            m = build_fn()
+            if weights is not None:
+                try:
+                    m.fit(Xtr_arr, ytr, sample_weight=weights[:split])
+                except TypeError:
+                    m.fit(Xtr_arr, ytr)
+            else:
+                m.fit(Xtr_arr, ytr)
+
+        classes = list(m.classes_)
+        win_idx = classes.index(1) if 1 in classes else len(classes) - 1
+        proba   = m.predict_proba(Xte_arr)[:, win_idx]
+        yte_arr = np.array(yte, dtype=int)
+
+        # ── Auto-search optimal threshold: maximise expected profit ────────
+        # Sweep thresholds 0.40–0.90; for each, count net wins (TP − FP).
+        # Requires at least 3 trades to be meaningful.
+        best_thresh, best_ep = 0.60, -999.0
+        for thresh in np.arange(0.40, 0.91, 0.01):
+            preds_t = (proba >= thresh).astype(int)
+            taken   = int(preds_t.sum())
+            if taken < 3:
+                continue
+            tp_t = int(((preds_t == 1) & (yte_arr == 1)).sum())
+            fp_t = int(((preds_t == 1) & (yte_arr == 0)).sum())
+            ep   = tp_t - fp_t   # net wins = expected profit at equal stakes
+            if ep > best_ep or (ep == best_ep and thresh < best_thresh):
+                best_ep, best_thresh = ep, float(thresh)
+
+        preds      = (proba >= best_thresh).astype(int).tolist()
+        acc        = sum(1 for p, t in zip(preds, yte) if p == t) / len(yte)
         said_trade = [i for i, p in enumerate(preds) if p == 1]
-        precision = (
-            sum(1 for i in said_trade if yte[i] == 1) / len(said_trade)
-            if said_trade else 0.0
-        )
-        baseline_wr = sum(yte) / len(yte)
+        precision  = (sum(1 for i in said_trade if yte[i] == 1) / len(said_trade)
+                      if said_trade else 0.0)
+        recall      = recall_score(yte, preds, zero_division=0)
+        f1          = f1_score(yte, preds, zero_division=0)
+        baseline_wr = float(sum(yte) / len(yte))
+
+        try:
+            roc_auc = roc_auc_score(yte, proba)
+        except ValueError:
+            roc_auc = 0.5
+        try:
+            pr_auc = average_precision_score(yte, proba)
+        except ValueError:
+            pr_auc = float("nan")
+        brier = brier_score_loss(yte, proba)
+        try:
+            mcc = float(matthews_corrcoef(yte, preds))
+        except Exception:
+            mcc = 0.0
+        try:
+            bal_acc = float(balanced_accuracy_score(yte, preds))
+        except Exception:
+            bal_acc = float("nan")
+
+        # Expected Calibration Error — 10-bin uniform
+        try:
+            from sklearn.calibration import calibration_curve
+            frac_pos, mean_pred = calibration_curve(yte, proba, n_bins=10, strategy="uniform")
+            ece = float(np.mean(np.abs(frac_pos - mean_pred)))
+        except Exception:
+            ece = float("nan")
+
+        try:
+            cm = confusion_matrix(yte, preds, labels=[0, 1])
+            tn, fp, fn, tp = int(cm[0, 0]), int(cm[0, 1]), int(cm[1, 0]), int(cm[1, 1])
+        except Exception:
+            tn = fp = fn = tp = 0
+
         return {
             "n_test": len(yte), "acc": acc, "precision": precision,
-            "baseline_wr": baseline_wr,
+            "recall": recall, "f1": f1, "roc_auc": roc_auc, "pr_auc": pr_auc,
+            "brier": brier, "ece": ece, "mcc": mcc, "bal_acc": bal_acc,
+            "baseline_wr": baseline_wr, "opt_threshold": best_thresh,
+            "tn": tn, "fp": fp, "fn": fn, "tp": tp,
         }
     except Exception as e:
         logger.error(f"walk-forward eval failed: {e}")
@@ -528,14 +773,17 @@ def _walk_forward_eval(build_fn, X: list, y: list, weights) -> Optional[dict]:
 
 
 def _ml_get_confidence(details: dict, symbol: str = "") -> float:
-    """Return ML win-probability (0.0–1.0) using the best available model for this symbol."""
+    """Return ML win-probability (0.0–1.0) using the best available model for this symbol.
+    V2.6: 8 raw features (+ bb_width); passes regime to engineer."""
     cls = _get_symbol_class(symbol) if symbol else "standard_vol"
     with ml_lock:
-        # Prefer per-class model; fall back to global model
-        model = ml_models_per_class.get(cls) or ml_model
+        # V2.9: per-symbol model checked first; per-class next; global fallback
+        model = ml_models_per_symbol.get(symbol) or ml_models_per_class.get(cls) or ml_model
     if model is None:
         return 1.0
     try:
+        now     = datetime.now(timezone.utc)
+        session = _get_session_name(now)
         raw = [
             details.get("total_score", 0),
             details.get("wick_atr_ratio", 0),
@@ -544,11 +792,29 @@ def _ml_get_confidence(details: dict, symbol: str = "") -> float:
             details.get("ema_fast_sl", 0) or 0,
             details.get("ema_slow_sl", 0) or 0,
             details.get("ema_distance", 0) or 0,
+            details.get("bb_width", 0) or 0,
+            # V2.7: oscillators normalised so all raw vals sit in ~[0,1] range
+            float(details.get("rsi") or 50.0) / 100.0,
+            float(details.get("stochrsi_k") or 50.0) / 100.0,
+            float(details.get("roc") or 0.0),
+            float(details.get("body_ratio") or 0.0),
+            float(details.get("bb_position") or 0.5),
+            float(details.get("adx") or 0.0) / 100.0,
+            # V2.9: context features — normalised to match DB storage convention
+            float(details.get("session_health") or _get_session_health(session)),
+            float(details.get("asset_health")   or _get_asset_health(symbol)),
+            float(details.get("sober_structure_pts") or 0.0) / 25.0,
+            float(details.get("sober_trend_pts")     or 0.0) / 20.0,
+            float(details.get("sober_zone_pts")      or 0.0) / 20.0,
+            float(details.get("sober_timing_pts")    or 0.0) / 15.0,
+            float(details.get("sober_momentum_pts")  or 0.0) / 10.0,
+            float(details.get("sober_candle_pts")    or 0.0) / 10.0,
+            float(details.get("mtf_agreement")       or 0.0) / 2.0,
         ]
-        now     = datetime.now(timezone.utc)
-        session = _get_session_name(now)
-        feats   = [_ml_engineer(raw, now.isoformat(), session)]
-        proba = model.predict_proba(feats)[0]
+        regime  = details.get("regime", "Choppy")
+        feats   = [_ml_engineer(raw, now.isoformat(), session, regime)]
+        feats   = np.nan_to_num(np.array(feats, dtype=float), nan=0.0, posinf=10.0, neginf=-10.0).tolist()
+        proba   = model.predict_proba(feats)[0]
         classes = list(model.classes_)
         win_idx = classes.index(1) if 1 in classes else len(classes) - 1
         return float(proba[win_idx])
@@ -559,15 +825,40 @@ def _ml_get_confidence(details: dict, symbol: str = "") -> float:
 
 def _ml_should_trade(details: dict, symbol: str = "", min_conf: float = None) -> bool:
     """Filter trade by ML confidence. Stores 'ml_confidence' in details for display.
-    Pass min_conf to override the global gate (e.g. higher bar for second entries)."""
+    V2.6: Uses adaptive gate based on regime + health.
+    V2.9: Captures session/asset health into details BEFORE ML inference so the model
+    sees the same values that get written to the DB training row."""
+    # Capture health at decision time — must precede _ml_get_confidence so the
+    # model sees real health values during inference AND they persist in the DB row.
+    _now_dt  = datetime.now(timezone.utc)
+    _session = _get_session_name(_now_dt)
+    details.setdefault("session_health", _get_session_health(_session))
+    details.setdefault("asset_health",   _get_asset_health(symbol))
     conf = _ml_get_confidence(details, symbol)
     details["ml_confidence"] = conf
     cls = _get_symbol_class(symbol) if symbol else "standard_vol"
     with ml_lock:
-        has_model = (ml_models_per_class.get(cls) or ml_model) is not None
+        has_model = (ml_models_per_symbol.get(symbol) or
+                     ml_models_per_class.get(cls) or ml_model) is not None
     if not has_model:
         return True   # observe-only until first model
-    gate = min_conf if min_conf is not None else ML_CONFIDENCE_MIN
+    if min_conf is not None:
+        gate = min_conf   # explicit override (e.g. second-entry higher bar)
+    else:
+        now     = datetime.now(timezone.utc)
+        session = _get_session_name(now)
+        regime  = details.get("regime", "Choppy")
+        gate    = _adaptive_ml_gate(symbol, session, regime)
+    details["ml_gate_used"] = gate
+    # Send explanation only for very high (≥90%) or very low (<45%) confidence
+    if conf >= 0.90 or conf < 0.45:
+        try:
+            now     = datetime.now(timezone.utc)
+            session = _get_session_name(now)
+            expl    = _ml_confidence_explanation(details, conf, symbol, session)
+            _send_tg(f"🤖 <b>ML Confidence Note</b> — <code>{symbol}</code>\n{expl}")
+        except Exception:
+            pass
     return conf >= gate
 
 
@@ -610,6 +901,239 @@ def _ml_progress_bar(pct: float, width: int = 12) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  V2.6 — MARKET REGIME DETECTION
+# ══════════════════════════════════════════════════════════════════════
+def _compute_market_regime(ind: dict) -> str:
+    """Classify market into one of 5 regimes using ADX, ATR expansion, BB width.
+    Strong Trend / Expansion / Weak Trend / Choppy / Compression."""
+    try:
+        adx      = float(ind.get("adx") or 0)
+        atr      = float(ind.get("atr") or 1)
+        atr_ma   = float(ind.get("atr_ma") or 1)
+        bb_u     = float(ind.get("bb_upper") or 0)
+        bb_l     = float(ind.get("bb_lower") or 0)
+        bb_m     = float(ind.get("bb_mid") or 1)
+        atr_exp  = atr / max(atr_ma, 1e-9)
+        bb_w     = (bb_u - bb_l) / max(bb_m, 1e-9) if bb_m > 0 else 0.0
+        if   adx >= 35 and atr_exp >= 1.10:                         return "Strong Trend"
+        elif atr_exp >= 1.15:                                        return "Expansion"
+        elif adx >= 22 and atr_exp >= 0.95:                         return "Weak Trend"
+        elif atr_exp <= 0.88 or (0 < bb_w <= 0.008):               return "Compression"
+        else:                                                        return "Choppy"
+    except Exception:
+        return "Choppy"
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  V2.6 — ASSET & SESSION HEALTH
+# ══════════════════════════════════════════════════════════════════════
+def _refresh_health_caches():
+    """Query DB for rolling WR per asset (last 30 trades) and per session (last 30).
+    Stores results in module-level _asset_health and _session_health dicts."""
+    global _asset_health, _session_health, _health_last_refresh
+    try:
+        # ── Per-asset: newest 600 confirmed rows, take first 30 per symbol ──
+        rows = _db_fetch(
+            "SELECT symbol, win FROM touch_trades WHERE win IN (0,1) ORDER BY id DESC LIMIT 600"
+        )
+        a_wins, a_total = {}, {}
+        for sym, win in rows:
+            if a_total.get(sym, 0) >= 30:
+                continue
+            a_wins[sym]  = a_wins.get(sym, 0) + (1 if win == 1 else 0)
+            a_total[sym] = a_total.get(sym, 0) + 1
+        _asset_health = {sym: a_wins.get(sym, 0) / max(a_total[sym], 1) for sym in a_total}
+        # ── Per-session: newest 300 confirmed rows, take first 30 per session ──
+        rows2 = _db_fetch(
+            "SELECT market_session, win FROM touch_trades WHERE win IN (0,1) "
+            "AND market_session IS NOT NULL ORDER BY id DESC LIMIT 300"
+        )
+        s_wins, s_total = {}, {}
+        for sess, win in rows2:
+            if s_total.get(sess, 0) >= 30:
+                continue
+            s_wins[sess]  = s_wins.get(sess, 0) + (1 if win == 1 else 0)
+            s_total[sess] = s_total.get(sess, 0) + 1
+        _session_health = {s: s_wins.get(s, 0) / max(s_total[s], 1) for s in s_total}
+        _health_last_refresh = time.time()
+        logger.debug(f"Health cache refreshed: {len(_asset_health)} assets, {len(_session_health)} sessions")
+    except Exception as e:
+        logger.error(f"_refresh_health_caches: {e}")
+
+
+def _maybe_refresh_health():
+    """Spawn a background refresh if the health cache is older than HEALTH_CACHE_TTL."""
+    if time.time() - _health_last_refresh > HEALTH_CACHE_TTL:
+        threading.Thread(target=_refresh_health_caches, daemon=True, name="HealthRefresh").start()
+
+
+def _get_asset_health(symbol: str) -> float:
+    """Return rolling WR for this symbol (0–1). 0.65 = neutral when no data."""
+    _maybe_refresh_health()
+    return _asset_health.get(symbol, 0.65)
+
+
+def _get_session_health(session: str) -> float:
+    """Return rolling WR for this session (0–1). 0.65 = neutral when no data."""
+    return _session_health.get(session, 0.65)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  V2.6 — AUTO BLACKLIST
+# ══════════════════════════════════════════════════════════════════════
+def _is_blacklisted(symbol: str) -> bool:
+    """Return True if the asset is currently blacklisted and the ban hasn't expired."""
+    expiry = _blacklisted_assets.get(symbol)
+    if expiry is None:
+        return False
+    if datetime.now(timezone.utc) >= expiry:
+        _blacklisted_assets.pop(symbol, None)
+        return False
+    return True
+
+
+def _check_and_update_blacklist(symbol: str):
+    """Blacklist an asset for ASSET_BLACKLIST_HOURS if its last-20-trade WR < threshold."""
+    try:
+        rows = _db_fetch(
+            "SELECT win FROM touch_trades WHERE symbol=? AND win IN (0,1) ORDER BY id DESC LIMIT 20",
+            (symbol,)
+        )
+        if len(rows) < ASSET_BLACKLIST_MIN_TRADES:
+            return
+        wr = sum(1 for (w,) in rows if w == 1) / len(rows)
+        if wr < ASSET_BLACKLIST_WR and not _is_blacklisted(symbol):
+            expiry = datetime.now(timezone.utc) + timedelta(hours=ASSET_BLACKLIST_HOURS)
+            _blacklisted_assets[symbol] = expiry
+            logger.warning(f"AUTO-BLACKLIST: {symbol} WR={wr:.0%} in last 20 trades → paused {ASSET_BLACKLIST_HOURS}h")
+            _send_tg(
+                f"⛔ <b>AUTO-BLACKLIST</b> — <code>{symbol}</code>\n"
+                f"Last {ASSET_BLACKLIST_MIN_TRADES} trades WR: <b>{wr:.0%}</b> "
+                f"(below {ASSET_BLACKLIST_WR:.0%} threshold)\n"
+                f"Asset paused for <b>{ASSET_BLACKLIST_HOURS} hours</b>."
+            )
+    except Exception as e:
+        logger.error(f"_check_and_update_blacklist {symbol}: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  V2.6 — ADAPTIVE ML GATE
+# ══════════════════════════════════════════════════════════════════════
+def _adaptive_ml_gate(symbol: str, session: str, regime: str) -> float:
+    """Return the ML confidence gate for this trade, adjusted between
+    ML_CONFIDENCE_MIN_FLOOR (0.55) and ML_CONFIDENCE_MAX_CAP (0.70)
+    based on regime, asset health, and session health.
+    V2.8: base threshold is auto-tuned from walk-forward optimal-profit search
+    (instead of fixed 60%); respects user ML_CONFIDENCE_MIN if set higher."""
+    gate = max(ML_CONFIDENCE_MIN, _ml_optimal_threshold)  # auto-tuned base
+    asset_h   = _get_asset_health(symbol)
+    session_h = _get_session_health(session)
+    # Regime
+    if   regime == "Strong Trend":  gate -= 0.03
+    elif regime == "Expansion":     gate -= 0.01
+    elif regime == "Choppy":        gate += 0.03
+    elif regime == "Compression":   gate += 0.05
+    # Asset health
+    if   asset_h < 0.40:  gate += 0.05
+    elif asset_h > 0.70:  gate -= 0.02
+    # Session health
+    if   session_h < 0.40:  gate += 0.05
+    elif session_h > 0.70:  gate -= 0.02
+    return round(max(ML_CONFIDENCE_MIN_FLOOR, min(ML_CONFIDENCE_MAX_CAP, gate)), 3)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  V2.6 — CONFIDENCE EXPLANATION
+# ══════════════════════════════════════════════════════════════════════
+def _ml_confidence_explanation(details: dict, conf: float, symbol: str, session: str) -> str:
+    """Return bullet-point reasons for this confidence reading (shown for extreme values)."""
+    regime    = details.get("regime", "Choppy")
+    adx       = float(details.get("ema_slow_sl") or details.get("adx") or 0)
+    score     = int(details.get("total_score") or 0)
+    wick      = float(details.get("wick_atr_ratio") or 0)
+    atr       = float(details.get("atr") or 1)
+    atr_ma    = float(details.get("atr_ma") or 1)
+    atr_exp   = atr / max(atr_ma, 1e-9)
+    asset_h   = _get_asset_health(symbol)
+    session_h = _get_session_health(session)
+    pos, neg  = [], []
+    if regime in ("Strong Trend", "Expansion"):  pos.append(f"✅ {regime}")
+    if adx >= 30:                                 pos.append(f"✅ ADX {adx:.0f} (strong trend)")
+    if score >= 85:                               pos.append(f"✅ Score {score}/100")
+    if wick >= 1.5:                               pos.append(f"✅ Wick {wick:.1f}×ATR")
+    if atr_exp >= 1.1:                            pos.append(f"✅ ATR expanding {atr_exp:.2f}×")
+    if asset_h >= 0.70:                           pos.append(f"✅ {symbol} health {asset_h:.0%} WR")
+    if session_h >= 0.70:                         pos.append(f"✅ {session} health {session_h:.0%} WR")
+    if regime in ("Choppy", "Compression"):       neg.append(f"⚠️ {regime} regime")
+    if adx < 15:                                  neg.append(f"⚠️ ADX {adx:.0f} (weak trend)")
+    if score < 80:                                neg.append(f"⚠️ Score {score}/100 (borderline)")
+    if atr_exp <= 0.88:                           neg.append(f"⚠️ ATR contracting {atr_exp:.2f}×")
+    if asset_h < 0.40:                            neg.append(f"⚠️ {symbol} health {asset_h:.0%} WR")
+    if session_h < 0.40:                          neg.append(f"⚠️ {session} health {session_h:.0%} WR")
+    bullets = (pos + neg)[:6] or ["Neutral conditions"]
+    label   = "🚀 High confidence" if conf >= 0.90 else "⚠️ Low confidence"
+    return f"{label} ({conf*100:.0f}%)\n" + "\n".join(bullets)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  V2.6 — HEALTH DASHBOARD TEXT
+# ══════════════════════════════════════════════════════════════════════
+def _health_text() -> str:
+    _maybe_refresh_health()
+    now_utc = datetime.now(timezone.utc)
+    bl_live = {sym: exp for sym, exp in _blacklisted_assets.items() if exp > now_utc}
+    lines   = ["🏥 <b>BOT HEALTH DASHBOARD</b>", "━━━━━━━━━━━━━━━━━━━━"]
+    # Blacklisted
+    if bl_live:
+        lines.append("\n⛔ <b>Blacklisted Assets</b>")
+        for sym, exp in bl_live.items():
+            hrs = max(0, int((exp - now_utc).total_seconds() / 3600))
+            lines.append(f"  <code>{sym}</code> — {hrs}h remaining")
+    # Asset health
+    lines.append("\n📊 <b>Asset Health</b>  (last 30 trades per asset)")
+    if _asset_health:
+        for sym in sorted(_asset_health, key=lambda s: _asset_health[s], reverse=True):
+            h   = _asset_health[sym]
+            bar = "🟢" if h >= 0.60 else ("🟡" if h >= 0.45 else "🔴")
+            bl  = " ⛔" if sym in bl_live else ""
+            lines.append(f"  {bar} <code>{sym:<10}</code>  {h:.0%}{bl}")
+    else:
+        lines.append("  — no data yet (need trades per asset) —")
+    # Session health
+    lines.append("\n🕐 <b>Session Health</b>  (last 30 trades per session)")
+    if _session_health:
+        for sess in sorted(_session_health, key=lambda s: _session_health[s], reverse=True):
+            h   = _session_health[sess]
+            bar = "🟢" if h >= 0.60 else ("🟡" if h >= 0.45 else "🔴")
+            lines.append(f"  {bar} {sess:<20}  {h:.0%}")
+    else:
+        lines.append("  — no data yet —")
+    # Current regimes
+    lines.append("\n🌡 <b>Current Market Regimes</b>")
+    with _lock:
+        regime_map = {sym: (indicators.get(sym) or {}).get("regime", "?") for sym in SYMBOLS}
+    groups: dict = {}
+    for sym, reg in regime_map.items():
+        groups.setdefault(reg, []).append(sym)
+    icons = {"Strong Trend": "🚀", "Expansion": "📈", "Weak Trend": "📊",
+             "Choppy": "🔀", "Compression": "🔵", "?": "❓"}
+    for reg in ["Strong Trend", "Expansion", "Weak Trend", "Choppy", "Compression", "?"]:
+        syms = groups.get(reg)
+        if syms:
+            lines.append(f"  {icons.get(reg,'')} <b>{reg}</b>: {', '.join(syms)}")
+    # Feature importance history summary
+    if _feature_importance_history:
+        last = _feature_importance_history[-1]
+        lines += ["", "<b>Last ML Feature Importance</b>  " + last.get("ts", "")]
+        for col, pct in sorted(last.get("importances", {}).items(), key=lambda x: x[1], reverse=True)[:5]:
+            lines.append(f"  {col}: {pct:.0%}")
+    lines += ["━━━━━━━━━━━━━━━━━━━━",
+              f"<i>Adaptive gate: {ML_CONFIDENCE_MIN_FLOOR:.0%}–{ML_CONFIDENCE_MAX_CAP:.0%}  "
+              f"·  Blacklist threshold: {ASSET_BLACKLIST_WR:.0%} WR / {ASSET_BLACKLIST_MIN_TRADES} trades</i>"]
+    return "\n".join(lines)
+
+
 def _ml_train():
     """Train / retrain the ML model (global + per-class). Global model is a
     stacked ensemble (GB+RF+ExtraTrees -> calibrated LogReg) once enough real
@@ -617,16 +1141,24 @@ def _ml_train():
     models stay RandomForest — those datasets are smaller and RF is cheap and
     robust there. Sets ml_training_active; clears in finally."""
     global ml_model, ml_trained_on, ml_training_active, ml_models_per_class, ml_trained_per_class
+    global _ml_last_retrain_tg_time, _feature_importance_history
+    global _ml_last_retrain_time, _ml_optimal_threshold
+    global _ml_importance_weights, _ml_component_weights
+    global ml_models_per_symbol, ml_trained_per_symbol
     try:
         n_raw = len(ML_FEATURE_COLS)
         try:
-            # Use _db_fetch so training works with both SQLite and PostgreSQL.
-            # timestamp + market_session are needed for the engineered features
-            # (_ml_engineer); ORDER BY id keeps rows chronological for both the
-            # recency weighting and the walk-forward split.
+            # timestamp + market_session + regime needed for engineered features.
+            # COALESCE(regime,'Choppy') handles rows inserted before V2.6.
+            # ORDER BY id keeps rows chronological for recency weighting + walk-forward.
+            if USE_PG:
+                regime_col = "COALESCE(regime, 'Choppy')"
+            else:
+                regime_col = "COALESCE(regime, 'Choppy')"
             rows_sym = _db_fetch(
-                f"SELECT symbol, {', '.join(ML_FEATURE_COLS)}, timestamp, market_session, win "
-                f"FROM touch_trades WHERE win IN (0, 1) ORDER BY id"   # exclude VOID rows (win=-1)
+                f"SELECT symbol, {', '.join(ML_FEATURE_COLS)}, timestamp, market_session, "
+                f"{regime_col}, win "
+                f"FROM touch_trades WHERE win IN (0, 1) ORDER BY id"
             )
         except Exception as e:
             logger.error(f"ML training query failed: {e}")
@@ -634,11 +1166,15 @@ def _ml_train():
             return
 
         total = len(rows_sym)
-        _send_tg(
-            f"🤖 <b>ML RETRAINING</b> — started\n"
-            f"Training on <b>{total}</b> real trades (global + 3 class models)…\n"
-            f"<code>[{_ml_progress_bar(0.0)}]   0%</code>"
-        )
+        # ── Spam guard: only send "started" TG message if ≥120s since last one ──
+        now_ts = time.time()
+        if now_ts - _ml_last_retrain_tg_time >= 120:
+            _send_tg(
+                f"🤖 <b>ML RETRAINING</b> — started\n"
+                f"Training on <b>{total}</b> real trades (global + 3 class models)…\n"
+                f"<code>[{_ml_progress_bar(0.0)}]   0%</code>"
+            )
+            _ml_last_retrain_tg_time = now_ts
 
         if total < ML_MIN_TRADES:
             _send_tg(
@@ -656,11 +1192,17 @@ def _ml_train():
             _send_tg("🤖 <b>ML RETRAINING</b> — skipped\nNeed both wins AND losses in history.")
             return
 
-        # ── Adaptive sample weights: newer trades matter more ───────────────
-        # Exponential decay: row 0 is oldest, row -1 is newest. Half-life = 100 trades.
-        half_life = 100.0
-        weights = np.exp(np.linspace(-total / half_life, 0.0, total))
-        use_stack = total >= ML_STACKING_MIN_TRADES
+        # ── Sample weights: recency decay × class balance ───────────────────
+        # Exponential decay weights (newer = more important) multiplied by
+        # sklearn balanced class weights so wins/losses contribute equally
+        # regardless of real-world class imbalance in the training set.
+        from sklearn.utils.class_weight import compute_sample_weight
+        half_life  = 100.0
+        recency_w  = np.exp(np.linspace(-total / half_life, 0.0, total))
+        balance_w  = compute_sample_weight("balanced", y)
+        weights    = recency_w * balance_w
+        weights   /= weights.mean()   # normalise to mean ≈ 1 for numerical stability
+        use_stack  = total >= ML_STACKING_MIN_TRADES
 
         # ── Walk-forward validation: chronological holdout, never random ────
         # Random splits leak future information into training (lookahead bias) —
@@ -672,30 +1214,92 @@ def _ml_train():
             (_make_stacking_clf if use_stack else _make_gb_clf), X, y, weights,
         )
         if eval_res:
+            opt_t = eval_res.get("opt_threshold", 0.60)
+            _ml_optimal_threshold = opt_t   # persist auto-tuned threshold
+            ece_val = eval_res.get("ece", float("nan"))
+            ece_str = f"{ece_val:.3f}" if not math.isnan(ece_val) else "n/a"
+            pr_auc  = eval_res.get("pr_auc", float("nan"))
+            pr_str  = f"{pr_auc:.3f}" if not math.isnan(pr_auc) else "n/a"
+            bal_acc = eval_res.get("bal_acc", float("nan"))
+            bal_str = f"{bal_acc*100:.1f}%" if not math.isnan(bal_acc) else "n/a"
             wf_line = (
-                f"Walk-forward (last {eval_res['n_test']} trades, unseen by model):\n"
-                f"  Accuracy: {eval_res['acc']*100:.0f}%  ·  "
-                f"Precision on 'trade' calls: {eval_res['precision']*100:.0f}%\n"
-                f"  vs. raw win-rate baseline: {eval_res['baseline_wr']*100:.0f}%"
+                f"Walk-forward ({eval_res['n_test']} held-out trades, unseen):\n"
+                f"  Acc {eval_res['acc']*100:.0f}%  ·  Prec {eval_res['precision']*100:.0f}%  "
+                f"·  Recall {eval_res['recall']*100:.0f}%  ·  F1 {eval_res['f1']*100:.0f}%\n"
+                f"  ROC-AUC {eval_res['roc_auc']:.3f}  ·  PR-AUC {pr_str}  "
+                f"·  Brier {eval_res['brier']:.3f}  ·  ECE {ece_str}\n"
+                f"  MCC {eval_res['mcc']:.3f}  ·  Bal-Acc {bal_str}  "
+                f"·  Baseline WR {eval_res['baseline_wr']*100:.0f}%\n"
+                f"  Optimal threshold: {opt_t:.2f}  ·  "
+                f"CM → TP={eval_res['tp']} TN={eval_res['tn']} FP={eval_res['fp']} FN={eval_res['fn']}"
             )
 
         try:
+            # ── NaN / inf guard: clean the matrix before fitting to avoid ──────
+            # pandas RuntimeWarnings that can bubble up from ATR/ADX divisions
+            import warnings as _warnings
+            X_arr = np.nan_to_num(np.array(X, dtype=float), nan=0.0, posinf=10.0, neginf=-10.0)
+            X     = X_arr.tolist()
+
             # ── Global model: stacked ensemble once data supports it, else a
             #    single regularized GradientBoosting to avoid over-fitting noise ──
             if use_stack:
-                clf = _make_stacking_clf()
-                clf.fit(X, y)   # CalibratedClassifierCV/Stacking don't take sample_weight cleanly
+                with _warnings.catch_warnings():
+                    _warnings.simplefilter("ignore")
+                    clf = _make_stacking_clf()
+                    clf.fit(X, y)
                 arch_label = "Stacked (GB+RF+ExtraTrees → LogReg) + isotonic calibration"
                 imp_line = "n/a (stacked ensemble)"
             else:
-                clf = _make_gb_clf()
-                clf.fit(X, y, sample_weight=weights)
+                with _warnings.catch_warnings():
+                    _warnings.simplefilter("ignore")
+                    clf = _make_gb_clf()
+                    clf.fit(X, y, sample_weight=weights)
                 arch_label = f"GradientBoosting (single model — stacking unlocks at {ML_STACKING_MIN_TRADES} trades)"
                 imp = sorted(
                     zip(all_feature_cols, clf.feature_importances_),
                     key=lambda x: x[1], reverse=True,
                 )
                 imp_line = "  ".join([f"{n} {v*100:.0f}%" for n, v in imp[:3]])
+                # ── Feature importance history ─────────────────────────────
+                _feature_importance_history.append({
+                    "ts":          datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                    "total":       total,
+                    "importances": {n: round(v, 4) for n, v in zip(all_feature_cols, clf.feature_importances_)},
+                })
+                if len(_feature_importance_history) > 50:
+                    _feature_importance_history.pop(0)
+
+                # ── Feature importance → Sober Book component weights (V2.9) ───
+                # Derive per-component score multipliers from what the GB model
+                # found actually predictive. Each Sober Book component is mapped
+                # to its most diagnostic ML features; the average importance of
+                # those features sets the multiplier (range 0.70–1.30) so scoring
+                # adapts to what historically predicts wins without wild swings.
+                _ml_importance_weights = {
+                    n: round(float(v), 4)
+                    for n, v in zip(all_feature_cols, clf.feature_importances_)
+                }
+                _COMP_FEAT_MAP = {
+                    "sober_structure_pts": ["score", "body_ratio"],
+                    "sober_trend_pts":     ["ema_fast_slope", "ema_slow_slope",
+                                            "ema_distance", "adx"],
+                    "sober_zone_pts":      ["wick_atr_ratio", "bb_position"],
+                    "sober_timing_pts":    ["rsi", "stochrsi_k", "atr_expansion"],
+                    "sober_momentum_pts":  ["roc"],
+                    "sober_candle_pts":    ["body_ratio", "bb_width"],
+                }
+                _baseline_imp = 1.0 / max(len(all_feature_cols), 1)
+                _ml_component_weights = {}
+                for _comp, _feats in _COMP_FEAT_MAP.items():
+                    _avg = float(np.mean([
+                        _ml_importance_weights.get(f, 0.0) for f in _feats
+                    ]))
+                    _mult = _avg / max(_baseline_imp, 1e-9)
+                    _ml_component_weights[_comp] = round(
+                        max(0.70, min(1.30, _mult)), 3
+                    )
+                logger.info(f"ML component weights: {_ml_component_weights}")
 
             with ml_lock:
                 ml_model = clf
@@ -730,6 +1334,44 @@ def _ml_train():
                 ml_models_per_class.update(new_cls_models)
                 ml_trained_per_class.update(new_cls_trained)
 
+            # ── Per-symbol models (V2.9) ──────────────────────────────────────
+            # One dedicated RandomForest per symbol when ≥ML_PER_SYMBOL_MIN_TRADES
+            # exists for that symbol. Checked before per-class and global models in
+            # _ml_get_confidence / _ml_should_trade — most specific model wins.
+            all_syms_in_data = sorted({r[0] for r in rows_sym})
+            new_sym_models  = {}
+            new_sym_trained = {}
+            sym_lines = []
+            for _sym in all_syms_in_data:
+                sym_rows = [r for r in rows_sym if r[0] == _sym]
+                n_s = len(sym_rows)
+                if n_s < ML_PER_SYMBOL_MIN_TRADES:
+                    sym_lines.append(f"  {_sym}: {n_s}/{ML_PER_SYMBOL_MIN_TRADES} ⏳")
+                    continue
+                Xs, ys = _ml_build_matrix(sym_rows, n_raw)
+                if len(set(ys)) < 2:
+                    sym_lines.append(f"  {_sym}: needs both outcomes — skipped")
+                    continue
+                w_rec_s = np.exp(np.linspace(-n_s / half_life, 0.0, n_s))
+                w_bal_s = compute_sample_weight("balanced", ys)
+                w_s     = w_rec_s * w_bal_s
+                w_s    /= w_s.mean()
+                clf_s   = RandomForestClassifier(
+                    n_estimators=120, max_depth=6, min_samples_leaf=3,
+                    random_state=42, class_weight="balanced", n_jobs=1,
+                )
+                clf_s.fit(Xs, ys, sample_weight=w_s)
+                new_sym_models[_sym]  = clf_s
+                new_sym_trained[_sym] = n_s
+                wr_s = sum(ys) / n_s * 100
+                sym_lines.append(f"  {_sym}: {n_s} trades  {wr_s:.0f}%WR ✅")
+
+            with ml_lock:
+                ml_models_per_symbol.update(new_sym_models)
+                ml_trained_per_symbol.update(new_sym_trained)
+
+            sym_summary = "\n".join(sym_lines) if sym_lines else "  (need 50+ trades per symbol)"
+
             _ml_save()
             _send_tg(
                 f"🤖 <b>ML RETRAINING COMPLETE</b> ✅\n"
@@ -737,7 +1379,8 @@ def _ml_train():
                 f"Global: <b>{total}</b> trades  |  Gate ≥<b>{ML_CONFIDENCE_MIN*100:.0f}%</b>\n"
                 f"Architecture: {arch_label}\n"
                 f"Top features: {imp_line}\n"
-                f"Per-class:\n" + "\n".join(cls_lines) + f"\n\n{wf_line}"
+                f"Per-class:\n" + "\n".join(cls_lines) +
+                f"\nPer-symbol:\n{sym_summary}\n\n{wf_line}"
             )
             _ml_export_csv(total)
         except Exception as e:
@@ -747,6 +1390,7 @@ def _ml_train():
     finally:
         with ml_lock:
             ml_training_active = False
+        _ml_last_retrain_time = time.time()
 
 
 def _ml_maybe_retrain(total_trades: int):
@@ -758,10 +1402,14 @@ def _ml_maybe_retrain(total_trades: int):
     spawn = False
     with ml_lock:
         if not ml_training_active:
-            if ml_trained_on == 0 and total_trades >= ML_MIN_TRADES:
-                spawn = True
-            elif ml_trained_on and total_trades - ml_trained_on >= ML_RETRAIN_EVERY:
-                spawn = True
+            # Cooldown guard: don't retrain again within ML_RETRAIN_COOLDOWN_SECS
+            # of a completed retrain to avoid thrashing on back-to-back trade bursts.
+            cooldown_ok = (time.time() - _ml_last_retrain_time) >= ML_RETRAIN_COOLDOWN_SECS
+            if cooldown_ok:
+                if ml_trained_on == 0 and total_trades >= ML_MIN_TRADES:
+                    spawn = True
+                elif ml_trained_on and total_trades - ml_trained_on >= ML_RETRAIN_EVERY:
+                    spawn = True
         if spawn:
             ml_training_active = True
     if spawn:
@@ -1148,7 +1796,14 @@ _CREATE_TABLE_PG = """
 
 _INSERT_COLS = (
     "timestamp,symbol,direction,barrier,stake,payout,profit,win,score,"
-    "wick_atr_ratio,atr,atr_ma,ema_fast_slope,ema_slow_slope,ema_distance,market_session"
+    "wick_atr_ratio,atr,atr_ma,ema_fast_slope,ema_slow_slope,ema_distance,market_session,"
+    "bb_width,regime,"          # V2.6: Bollinger bandwidth + market regime
+    "rsi,stochrsi_k,roc,body_ratio,bb_position,adx,"  # V2.7: oscillators + momentum
+    # V2.9: context features — health, Sober Book breakdown, MTF agreement
+    "session_health,asset_health,"
+    "sober_structure_pts,sober_trend_pts,sober_zone_pts,"
+    "sober_timing_pts,sober_momentum_pts,sober_candle_pts,"
+    "mtf_agreement"
 )
 
 # NULL-safe filter for excluding future backtest-tagged rows from live stats.
@@ -1374,12 +2029,32 @@ def _db_writer():
         conn.autocommit = True
         cur  = conn.cursor()
         cur.execute(_CREATE_TABLE_PG)
-        # Add market_session column if missing (older PG schema)
+        # Add columns missing from older schemas (IF NOT EXISTS is idempotent)
         cur.execute("ALTER TABLE touch_trades ADD COLUMN IF NOT EXISTS market_session TEXT")
+        cur.execute("ALTER TABLE touch_trades ADD COLUMN IF NOT EXISTS bb_width REAL")
+        cur.execute("ALTER TABLE touch_trades ADD COLUMN IF NOT EXISTS regime TEXT")
+        # V2.7: oscillator + momentum columns
+        cur.execute("ALTER TABLE touch_trades ADD COLUMN IF NOT EXISTS rsi REAL")
+        cur.execute("ALTER TABLE touch_trades ADD COLUMN IF NOT EXISTS stochrsi_k REAL")
+        cur.execute("ALTER TABLE touch_trades ADD COLUMN IF NOT EXISTS roc REAL")
+        cur.execute("ALTER TABLE touch_trades ADD COLUMN IF NOT EXISTS body_ratio REAL")
+        cur.execute("ALTER TABLE touch_trades ADD COLUMN IF NOT EXISTS bb_position REAL")
+        cur.execute("ALTER TABLE touch_trades ADD COLUMN IF NOT EXISTS adx REAL")
+        # V2.9: context features for ML training
+        cur.execute("ALTER TABLE touch_trades ADD COLUMN IF NOT EXISTS session_health REAL")
+        cur.execute("ALTER TABLE touch_trades ADD COLUMN IF NOT EXISTS asset_health REAL")
+        cur.execute("ALTER TABLE touch_trades ADD COLUMN IF NOT EXISTS sober_structure_pts REAL")
+        cur.execute("ALTER TABLE touch_trades ADD COLUMN IF NOT EXISTS sober_trend_pts REAL")
+        cur.execute("ALTER TABLE touch_trades ADD COLUMN IF NOT EXISTS sober_zone_pts REAL")
+        cur.execute("ALTER TABLE touch_trades ADD COLUMN IF NOT EXISTS sober_timing_pts REAL")
+        cur.execute("ALTER TABLE touch_trades ADD COLUMN IF NOT EXISTS sober_momentum_pts REAL")
+        cur.execute("ALTER TABLE touch_trades ADD COLUMN IF NOT EXISTS sober_candle_pts REAL")
+        cur.execute("ALTER TABLE touch_trades ADD COLUMN IF NOT EXISTS mtf_agreement INTEGER")
         def _write(item):
             cur.execute(
                 f"INSERT INTO touch_trades ({_INSERT_COLS}) "
-                f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s"
+                f",%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 item,
             )
             cur.execute("SELECT COUNT(*) FROM touch_trades")
@@ -1387,10 +2062,31 @@ def _db_writer():
     else:
         conn = sqlite3.connect("touch_trades.db")
         conn.execute(_CREATE_TABLE_SQLITE)
-        try:
-            conn.execute("ALTER TABLE touch_trades ADD COLUMN market_session TEXT")
-        except sqlite3.OperationalError:
-            pass
+        for _col_sql in [
+            "ALTER TABLE touch_trades ADD COLUMN market_session TEXT",
+            "ALTER TABLE touch_trades ADD COLUMN bb_width REAL",
+            "ALTER TABLE touch_trades ADD COLUMN regime TEXT",
+            "ALTER TABLE touch_trades ADD COLUMN rsi REAL",
+            "ALTER TABLE touch_trades ADD COLUMN stochrsi_k REAL",
+            "ALTER TABLE touch_trades ADD COLUMN roc REAL",
+            "ALTER TABLE touch_trades ADD COLUMN body_ratio REAL",
+            "ALTER TABLE touch_trades ADD COLUMN bb_position REAL",
+            "ALTER TABLE touch_trades ADD COLUMN adx REAL",
+            # V2.9: context features for ML training
+            "ALTER TABLE touch_trades ADD COLUMN session_health REAL",
+            "ALTER TABLE touch_trades ADD COLUMN asset_health REAL",
+            "ALTER TABLE touch_trades ADD COLUMN sober_structure_pts REAL",
+            "ALTER TABLE touch_trades ADD COLUMN sober_trend_pts REAL",
+            "ALTER TABLE touch_trades ADD COLUMN sober_zone_pts REAL",
+            "ALTER TABLE touch_trades ADD COLUMN sober_timing_pts REAL",
+            "ALTER TABLE touch_trades ADD COLUMN sober_momentum_pts REAL",
+            "ALTER TABLE touch_trades ADD COLUMN sober_candle_pts REAL",
+            "ALTER TABLE touch_trades ADD COLUMN mtf_agreement INTEGER",
+        ]:
+            try:
+                conn.execute(_col_sql)
+            except sqlite3.OperationalError:
+                pass
         conn.commit()
 
     # ── PostgreSQL path: write immediately (autocommit) ──────────────────
@@ -1422,7 +2118,8 @@ def _db_writer():
                 for it in _batch:
                     conn.execute(
                         f"INSERT INTO touch_trades ({_INSERT_COLS}) "
-                        f"VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        f"VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?"
+                        f",?,?,?,?,?,?,?,?,?)",
                         it,
                     )
             _batch.clear()
@@ -1884,6 +2581,9 @@ def update_indicators(symbol: str) -> bool:
         band_rng = (bb_u - bb_l) if pd.notna(bb_u) and pd.notna(bb_l) and (bb_u - bb_l) > 0 else None
         last_close = df["Close"].iloc[-1]
         ind["bb_position"] = float((last_close - bb_l) / band_rng) if band_rng else None
+        # V2.6: Bollinger bandwidth (normalised band width — ML feature + regime input)
+        bb_width_raw = df["BB_WIDTH"].iloc[-1]
+        ind["bb_width"] = round(float(bb_width_raw), 6) if pd.notna(bb_width_raw) else 0.0
 
         # Candle quality: body ratio + wick sizes in ATR units
         last_open  = df["Open"].iloc[-1]
@@ -1917,6 +2617,10 @@ def update_indicators(symbol: str) -> bool:
         pat = _detect_candle_pattern(df)
         ind["candle_pattern"]      = pat["name"]
         ind["candle_pattern_bias"] = pat["bias"]
+
+        # V2.6: Market regime — summarises ADX / ATR expansion / BB width into
+        # one label.  Stored in ind so score_signal and DB writes can use it.
+        ind["regime"] = _compute_market_regime(ind)
 
         ind["ready"] = True
     return True
@@ -2416,6 +3120,35 @@ def score_signal(symbol: str, candle: dict) -> tuple:
         "candle_pattern_pts":  cc_pts,
     })
 
+    # ── Store per-component Sober Book scores for ML training (V2.9) ──────
+    # Raw (unweighted) values are persisted so the model can learn each
+    # component's individual edge independent of the total score.
+    details.update({
+        "sober_structure_pts": ms_pts,
+        "sober_trend_pts":     tr_pts,    # may be negative (ADX < 15 → -5)
+        "sober_zone_pts":      sd_pts,
+        "sober_timing_pts":    et_pts,
+        "sober_momentum_pts":  mom_pts,
+        "sober_candle_pts":    cc_pts,    # may be negative (pattern mismatch → -5)
+    })
+
+    # ── ML-learned component weight feedback (V2.9) ────────────────────────
+    # After each retrain _ml_component_weights holds multipliers derived from
+    # feature importances — upweights reliable predictors, downweights noisy
+    # ones (range 0.70–1.30). No-op until the first GB model is trained.
+    if _ml_component_weights:
+        def _wsc(raw_pts: float, key: str) -> float:
+            return raw_pts * _ml_component_weights.get(key, 1.0)
+        score = int(round(
+            _wsc(ms_pts,  "sober_structure_pts") +
+            _wsc(tr_pts,  "sober_trend_pts")     +
+            _wsc(sd_pts,  "sober_zone_pts")      +
+            _wsc(et_pts,  "sober_timing_pts")    +
+            _wsc(mom_pts, "sober_momentum_pts")  +
+            _wsc(cc_pts,  "sober_candle_pts")
+        ))
+        details["score_ml_weighted"] = True
+
     # ══════════════════════════════════════════════════════════════════
     # SOBER GATE: hard structure filter
     # ══════════════════════════════════════════════════════════════════
@@ -2453,6 +3186,8 @@ def score_signal(symbol: str, candle: dict) -> tuple:
         "adx":                    adx_val,
         "macd_hist":              ind.get("macd_hist"),
         "bb_position":            round(bb_pos, 2) if bb_pos is not None else None,
+        "bb_width":               float(ind.get("bb_width") or 0),        # V2.6: ML feature
+        "regime":                 ind.get("regime", "Choppy"),             # V2.6: regime label
         "confluence":             confluence,
         "confluence_count":       confluence_count,
         "confluence_gate_passed": confluence_count >= 2,
@@ -3104,6 +3839,20 @@ def on_contract_update(ws, msg: dict, symbol: str):
                 d.get("atr", 0), d.get("atr_ma", 0),
                 d.get("ema_fast_sl", 0), d.get("ema_slow_sl", 0), d.get("ema_distance", 0),
                 mkt_session,
+                d.get("bb_width", 0), d.get("regime", "Choppy"),
+                float(d.get("rsi") or 50.0) / 100.0, float(d.get("stochrsi_k") or 50.0) / 100.0,
+                float(d.get("roc") or 0.0), float(d.get("body_ratio") or 0.0),
+                float(d.get("bb_position") or 0.5), float(d.get("adx") or 0.0) / 100.0,
+                # V2.9: context features
+                float(d.get("session_health") or 0.5),
+                float(d.get("asset_health") or 0.5),
+                float(d.get("sober_structure_pts") or 0.0) / 25.0,
+                float(d.get("sober_trend_pts") or 0.0) / 20.0,
+                float(d.get("sober_zone_pts") or 0.0) / 20.0,
+                float(d.get("sober_timing_pts") or 0.0) / 15.0,
+                float(d.get("sober_momentum_pts") or 0.0) / 10.0,
+                float(d.get("sober_candle_pts") or 0.0) / 10.0,
+                float(d.get("mtf_agreement") or 0.0) / 2.0,
             ))
             _log(f"VOID  {symbol}  contract {cid} unresolved — excluded from win/loss stats")
             return
@@ -3255,7 +4004,7 @@ def on_contract_update(ws, msg: dict, symbol: str):
         _ml_stats_save("score", _score_bkt_snapshot[0], _score_bkt_snapshot[1])
     threading.Thread(target=_persist_ml_stats, daemon=True, name="MLStatsSave").start()
 
-    # DB write — includes market_session
+    # DB write — V2.6: session/regime; V2.7: oscillators; V2.9: context features
     db_queue.put((
         datetime.now(timezone.utc).isoformat(), symbol, info["direction"],
         info["barrier"], info["stake"], info["payout"], profit, int(win),
@@ -3263,7 +4012,24 @@ def on_contract_update(ws, msg: dict, symbol: str):
         d.get("atr", 0), d.get("atr_ma", 0),
         d.get("ema_fast_sl", 0), d.get("ema_slow_sl", 0), d.get("ema_distance", 0),
         mkt_session,
+        d.get("bb_width", 0), d.get("regime", "Choppy"),
+        float(d.get("rsi") or 50.0) / 100.0, float(d.get("stochrsi_k") or 50.0) / 100.0,
+        float(d.get("roc") or 0.0), float(d.get("body_ratio") or 0.0),
+        float(d.get("bb_position") or 0.5), float(d.get("adx") or 0.0) / 100.0,
+        # V2.9: context — health captured at signal time, Sober pts, MTF agreement
+        float(d.get("session_health") or 0.5),
+        float(d.get("asset_health") or 0.5),
+        float(d.get("sober_structure_pts") or 0.0) / 25.0,
+        float(d.get("sober_trend_pts") or 0.0) / 20.0,
+        float(d.get("sober_zone_pts") or 0.0) / 20.0,
+        float(d.get("sober_timing_pts") or 0.0) / 15.0,
+        float(d.get("sober_momentum_pts") or 0.0) / 10.0,
+        float(d.get("sober_candle_pts") or 0.0) / 10.0,
+        float(d.get("mtf_agreement") or 0.0) / 2.0,
     ))
+    # V2.6: auto-blacklist check after each settled trade (background thread)
+    threading.Thread(target=_check_and_update_blacklist, args=(symbol,),
+                     daemon=True, name="BlacklistCheck").start()
     _log_signal_features(symbol, d, mkt_session, win, profit)
 
     # Pass pre-reset stat snapshot so card always shows correct cumulative figures
@@ -3617,6 +4383,13 @@ def _on_message(ws, message: str, symbol: str):
 
                             _record_scan()
 
+                            # ── V2.6: Auto-blacklist gate ─────────────────────────
+                            if _is_blacklisted(symbol):
+                                _record_funnel_rejection("Asset blacklisted")
+                                _send_rejection(symbol, direction, score,
+                                                "Asset auto-blacklisted (poor recent WR)")
+                                return
+
                             # ── M5 + M15 multi-timeframe gates ────────────────────
                             m5_ind    = indicators_m5.get(symbol, {})
                             m5_ready  = m5_ind.get("ready", False)
@@ -3624,6 +4397,18 @@ def _on_message(ws, message: str, symbol: str):
                             m15_ind   = indicators_m15.get(symbol, {})
                             m15_ready = m15_ind.get("ready", False)
                             m15_dir   = m15_ind.get("supertrend_dir", 0)
+                            # V2.9: count agreeing timeframes (0=neither, 1=M5, 2=both)
+                            # Stored in details so it flows to the DB training row.
+                            _mtf_agree = 0
+                            if m5_ready and m5_dir != 0:
+                                if ((direction == "UP"   and m5_dir  == 1) or
+                                        (direction == "DOWN" and m5_dir  == -1)):
+                                    _mtf_agree += 1
+                            if m15_ready and m15_dir != 0:
+                                if ((direction == "UP"   and m15_dir == 1) or
+                                        (direction == "DOWN" and m15_dir == -1)):
+                                    _mtf_agree += 1
+                            details["mtf_agreement"] = _mtf_agree
                             if (m5_ready and m5_dir != 0
                                     and ((direction == "UP" and m5_dir != 1)
                                          or (direction == "DOWN" and m5_dir != -1))):
@@ -3809,6 +4594,8 @@ def _main_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🤖 ML Confidence Perf",      callback_data="ml_conf_perf")],
         [InlineKeyboardButton("📊 Full Analytics",          callback_data="analytics"),
          InlineKeyboardButton("🔍 Pattern Discovery",       callback_data="patterns")],
+        [InlineKeyboardButton("🏥 Health · Regimes",        callback_data="health"),
+         InlineKeyboardButton("📈 Feature Importance",      callback_data="feat_importance")],
         # ── Control ──────────────────────────────────────────────────────
         [InlineKeyboardButton(pause_lbl,                    callback_data="toggle_pause"),
          InlineKeyboardButton("⏭ Skip a Symbol",           callback_data="skip_menu")],
@@ -5144,12 +5931,15 @@ async def cmd_upload_csv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             raw     = await file.download_as_bytearray()
             payload = pickle.loads(bytes(raw))
             global ml_model, ml_trained_on, ml_models_per_class, ml_trained_per_class
+            global ml_models_per_symbol, ml_trained_per_symbol
             if isinstance(payload, dict):
                 with ml_lock:
-                    ml_model             = payload.get("model")
-                    ml_trained_on        = payload.get("trained_on", 0)
-                    ml_models_per_class  = payload.get("per_class_models",  ml_models_per_class)
-                    ml_trained_per_class = payload.get("per_class_trained", ml_trained_per_class)
+                    ml_model              = payload.get("model")
+                    ml_trained_on         = payload.get("trained_on", 0)
+                    ml_models_per_class   = payload.get("per_class_models",  ml_models_per_class)
+                    ml_trained_per_class  = payload.get("per_class_trained", ml_trained_per_class)
+                    ml_models_per_symbol  = payload.get("per_symbol_models",  ml_models_per_symbol)
+                    ml_trained_per_symbol = payload.get("per_symbol_trained", ml_trained_per_symbol)
             else:
                 with ml_lock:
                     ml_model      = payload
@@ -5328,6 +6118,325 @@ async def cmd_upload_csv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception(f"CSV upload error: {e}")
         await update.message.reply_text(f"❌ Processing failed: <code>{e}</code>", parse_mode="HTML")
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  GEMMA 3 AI ANALYST  (/ai command)
+# ══════════════════════════════════════════════════════════════════════
+
+def _ai_build_summary(cmd: str, arg: str = "") -> str:
+    """Query Neon/SQLite and return a plain-text data snapshot for Gemma."""
+    cmd = cmd.lower().strip()
+
+    if cmd == "today":
+        rows = _db_fetch(
+            "SELECT symbol, direction, win, profit, score, market_session, regime "
+            "FROM touch_trades WHERE DATE(timestamp)=CURRENT_DATE "
+            "AND (is_backtest IS NULL OR is_backtest=0)"
+        )
+        if not rows:
+            return "No trades recorded today yet."
+        trades = len(rows)
+        wins   = sum(1 for r in rows if r[2] == 1)
+        losses = sum(1 for r in rows if r[2] == 0)
+        pnl    = sum(float(r[3] or 0) for r in rows)
+        wr     = wins / trades * 100 if trades else 0
+        avg_sc = sum(float(r[4] or 0) for r in rows) / trades
+        sess_stats: dict = {}
+        for r in rows:
+            s = sess_stats.setdefault(r[5] or "Unknown", {"w": 0, "l": 0, "pnl": 0.0})
+            if r[2] == 1: s["w"] += 1
+            else: s["l"] += 1
+            s["pnl"] += float(r[3] or 0)
+        sess_lines = "\n".join(
+            f"  {k}: {v['w']}W / {v['l']}L  P&L=${v['pnl']:+.2f}"
+            for k, v in sorted(sess_stats.items(), key=lambda x: -x[1]["pnl"])
+        )
+        return (
+            f"TODAY'S TRADING SUMMARY\n"
+            f"Trades: {trades}  |  Wins: {wins}  |  Losses: {losses}\n"
+            f"Win Rate: {wr:.1f}%  |  Total P&L: ${pnl:+.2f}\n"
+            f"Avg Score: {avg_sc:.1f}/100\n"
+            f"By Session:\n{sess_lines}"
+        )
+
+    elif cmd == "week":
+        if USE_PG:
+            rows = _db_fetch(
+                "SELECT DATE(timestamp) as day, COUNT(*) as t, "
+                "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END) as w, SUM(profit) as pnl "
+                "FROM touch_trades WHERE timestamp >= NOW() - INTERVAL '7 days' "
+                "AND (is_backtest IS NULL OR is_backtest=0) "
+                "GROUP BY DATE(timestamp) ORDER BY day DESC"
+            )
+        else:
+            rows = _db_fetch(
+                "SELECT DATE(timestamp) as day, COUNT(*) as t, "
+                "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END) as w, SUM(profit) as pnl "
+                "FROM touch_trades WHERE timestamp >= DATE('now','-7 days') "
+                "AND (is_backtest IS NULL OR is_backtest=0) "
+                "GROUP BY DATE(timestamp) ORDER BY day DESC"
+            )
+        if not rows:
+            return "No trades in the last 7 days."
+        tt = tw = 0; tp = 0.0
+        day_lines = []
+        for r in rows:
+            t, w = int(r[1]), int(r[2] or 0)
+            p = float(r[3] or 0)
+            day_lines.append(f"  {r[0]}: {t} trades  {w/t*100:.0f}% WR  ${p:+.2f}")
+            tt += t; tw += w; tp += p
+        return (
+            f"7-DAY SUMMARY\n"
+            f"Total: {tt} trades  {tw/tt*100:.1f}% WR  ${tp:+.2f} P&L\n"
+            f"Daily breakdown:\n" + "\n".join(day_lines)
+        )
+
+    elif cmd == "symbol":
+        sym = (arg or "R_75").upper()
+        rows = _db_fetch(
+            "SELECT win, profit, score, market_session, regime, direction "
+            "FROM touch_trades WHERE symbol=? "
+            "AND (is_backtest IS NULL OR is_backtest=0) ORDER BY id DESC LIMIT 50",
+            (sym,)
+        )
+        if not rows:
+            return f"No trades found for {sym}."
+        t = len(rows); w = sum(1 for r in rows if r[0] == 1)
+        pnl = sum(float(r[1] or 0) for r in rows)
+        up  = sum(1 for r in rows if r[5] == "UP")
+        reg: dict = {}
+        for r in rows:
+            s = reg.setdefault(r[4] or "Unknown", {"w":0,"l":0})
+            if r[0]==1: s["w"]+=1
+            else: s["l"]+=1
+        reg_lines = "\n".join(
+            f"  {k}: {v['w']}W/{v['l']}L  ({v['w']/(v['w']+v['l'])*100:.0f}% WR)"
+            for k, v in reg.items()
+        )
+        return (
+            f"SYMBOL: {sym}  (last {t} trades)\n"
+            f"Win Rate: {w/t*100:.1f}%  |  P&L: ${pnl:+.2f}\n"
+            f"Direction: {up} UP / {t-up} DOWN\n"
+            f"By Regime:\n{reg_lines}"
+        )
+
+    elif cmd in ("why-loss", "whyloss"):
+        rows = _db_fetch(
+            "SELECT symbol, profit, score, market_session, regime, direction, "
+            "COALESCE(rsi,0.5)*100, COALESCE(adx,0)*100, COALESCE(bb_position,0.5) "
+            "FROM touch_trades WHERE win=0 "
+            "AND (is_backtest IS NULL OR is_backtest=0) ORDER BY id DESC LIMIT 20"
+        )
+        if not rows:
+            return "No losses found in DB."
+        avg_sc  = sum(float(r[2] or 0) for r in rows) / len(rows)
+        avg_rsi = sum(float(r[6] or 50) for r in rows) / len(rows)
+        avg_adx = sum(float(r[7] or 0)  for r in rows) / len(rows)
+        sess: dict = {}
+        for r in rows: sess[r[3] or "?"] = sess.get(r[3] or "?", 0) + 1
+        top_5 = "\n".join(
+            f"  {r[0]} {r[5]} score={r[2]} sess={r[3]} regime={r[4]} P&L=${float(r[1] or 0):+.2f}"
+            for r in rows[:5]
+        )
+        return (
+            f"RECENT LOSSES ANALYSIS (last {len(rows)})\n"
+            f"Avg score at loss: {avg_sc:.1f}/100\n"
+            f"Avg RSI at loss: {avg_rsi:.1f}  |  Avg ADX: {avg_adx:.1f}\n"
+            f"Session distribution: {dict(sorted(sess.items(), key=lambda x:-x[1]))}\n"
+            f"Last 5 losses:\n{top_5}"
+        )
+
+    elif cmd in ("best-session", "bestsession"):
+        rows = _db_fetch(
+            "SELECT market_session, COUNT(*) as t, "
+            "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END) as w, SUM(profit) as pnl "
+            "FROM touch_trades WHERE (is_backtest IS NULL OR is_backtest=0) "
+            "GROUP BY market_session ORDER BY pnl DESC"
+        )
+        if not rows:
+            return "No session data yet."
+        lines = ["SESSION PERFORMANCE"]
+        for r in rows:
+            t, w = int(r[1]), int(r[2] or 0)
+            lines.append(
+                f"  {r[0] or 'Unknown':<18}: {t:3d} trades  {w/t*100:5.1f}% WR  ${float(r[3] or 0):+.2f}"
+            )
+        return "\n".join(lines)
+
+    elif cmd == "market":
+        with _lock:
+            snap = {k: dict(v) for k, v in indicators.items()}
+        lines = ["CURRENT MARKET CONDITIONS"]
+        for sym, ind in sorted(snap.items()):
+            if not ind.get("ready"):
+                continue
+            st = "↑" if ind.get("supertrend_dir", 0)==1 else "↓" if ind.get("supertrend_dir",0)==-1 else "–"
+            lines.append(
+                f"  {sym:<12} {ind.get('regime','?'):<17} "
+                f"ADX={ind.get('adx') or 0:4.0f}  RSI={ind.get('rsi') or 0:4.0f}  "
+                f"BB={ind.get('bb_position') or 0:.2f}  ST={st}"
+            )
+        return "\n".join(lines) if len(lines) > 1 else "Indicators not ready yet."
+
+    elif cmd == "ml":
+        cnt = _db_fetch(
+            "SELECT COUNT(*) FROM touch_trades WHERE (is_backtest IS NULL OR is_backtest=0)"
+        )
+        total = int(cnt[0][0]) if cnt else 0
+        with ml_lock:
+            has_model = bool(ml_model or ml_models_per_class)
+        fi = _feature_importance_history[-1] if _feature_importance_history else {}
+        fi_lines = ""
+        if fi:
+            top = sorted(fi.get("importances", {}).items(), key=lambda x: -x[1])[:8]
+            fi_lines = "\nFeature importances (last retrain):\n" + "\n".join(
+                f"  {k:<20} {v*100:5.1f}%" for k, v in top
+            )
+        return (
+            f"ML MODEL STATUS\n"
+            f"DB trades: {total}  |  Model active: {'Yes' if has_model else 'No (<100 trades)'}\n"
+            f"Raw features (V2.7): {len(ML_FEATURE_COLS)} stored  +  "
+            f"{len(_ML_ENGINEERED_COLS)} engineered  =  "
+            f"{len(ML_FEATURE_COLS)+len(_ML_ENGINEERED_COLS)} total\n"
+            f"Features: {', '.join(ML_FEATURE_COLS)}\n"
+            f"Engineered: {', '.join(_ML_ENGINEERED_COLS)}"
+            f"{fi_lines}"
+        )
+
+    elif cmd == "improvements":
+        rows = _db_fetch(
+            "SELECT regime, market_session, "
+            "SUM(CASE WHEN win=1 THEN 1 ELSE 0 END) as w, COUNT(*) as t, AVG(profit) as ap "
+            "FROM touch_trades WHERE (is_backtest IS NULL OR is_backtest=0) "
+            "GROUP BY regime, market_session HAVING COUNT(*) >= 5 "
+            "ORDER BY (SUM(CASE WHEN win=1 THEN 1 ELSE 0 END)*1.0/COUNT(*)) ASC LIMIT 10"
+        )
+        if not rows:
+            return "Not enough data yet (need ≥5 trades per regime+session combo)."
+        lines = ["WEAKEST REGIME+SESSION COMBOS"]
+        for r in rows:
+            w, t = int(r[2] or 0), int(r[3])
+            lines.append(
+                f"  {r[0] or '?'} + {r[1] or '?'}: {t} trades  {w/t*100:.0f}% WR  avg ${float(r[4] or 0):+.2f}"
+            )
+        return "\n".join(lines)
+
+    else:
+        return (
+            f"Unknown sub-command '{cmd}'.\n"
+            f"Available: today · week · symbol <SYM> · why-loss · best-session · market · ml · improvements"
+        )
+
+
+async def _ai_ask_gemma(summary: str, question: str) -> str:
+    """Send data summary + question to Gemma 3; return plain-text analysis."""
+    if _GEMINI_CLIENT is None:
+        return "⚠️ Gemma unavailable — GEMINI_API_KEY not set or google-genai not installed."
+    prompt = (
+        "You are a professional trading analyst reviewing a Deriv One-Touch options bot "
+        "that trades synthetic indices (R_10, R_25, R_50, R_75, R_100, 1HZ10V–1HZ100V). "
+        "The bot uses Supertrend, RSI, StochRSI, ADX, Bollinger Bands, market regime detection, "
+        "and a GradientBoosting ML model.\n\n"
+        f"DATA:\n{summary}\n\n"
+        f"QUESTION: {question}\n\n"
+        "Provide a concise, actionable analysis in 4–6 sentences. "
+        "Be specific: identify what is working, what is not, and one concrete improvement."
+    )
+    try:
+        selected_model = _discover_gemini_model()
+        loop = asyncio.get_event_loop()
+        resp = await loop.run_in_executor(
+            None,
+            lambda: _GEMINI_CLIENT.models.generate_content(model=selected_model, contents=prompt)
+        )
+        return resp.text or "No response from AI model."
+    except Exception as e:
+        logger.error(f"AI model error (model={_gemini_model_cache.get('model', '?')}): {e}")
+        # Force rediscovery on next call — the model may have been removed
+        _gemini_model_cache.clear()
+        return f"⚠️ AI error: {e}"
+
+
+_AI_HELP = (
+    "🤖 <b>AI Trading Analyst — Dynamic Model Selection</b>\n\n"
+    "<code>/ai today</code>         — Today's performance analysis\n"
+    "<code>/ai week</code>          — 7-day trend & momentum\n"
+    "<code>/ai symbol R_75</code>   — Deep-dive on a symbol\n"
+    "<code>/ai why-loss</code>      — Root-cause of recent losses\n"
+    "<code>/ai best-session</code>  — Best/worst trading sessions\n"
+    "<code>/ai market</code>        — Live regime overview per symbol\n"
+    "<code>/ai ml</code>            — ML model health & features\n"
+    "<code>/ai improvements</code>  — Weakest combos to avoid\n"
+    "<code>/ai model</code>         — Show active AI model & cache status\n\n"
+    "<i>Flow: query DB → summarise data → ask AI model → return analysis\n"
+    "Model auto-discovered from Google AI on startup; re-checked every 4 hours.</i>"
+)
+
+_AI_QUESTIONS = {
+    "today":        "Explain today's performance. What drove results? What should be changed?",
+    "week":         "Analyse the 7-day trend. Is performance improving or declining? What pattern stands out?",
+    "symbol":       "Is this symbol worth trading? Any session or regime preference? Avoid or lean in?",
+    "why-loss":     "What indicator conditions appear most at loss time? What setup should the bot avoid?",
+    "whyloss":      "What indicator conditions appear most at loss time? What setup should the bot avoid?",
+    "best-session": "Which session is most profitable and why? Should any session be skipped?",
+    "bestsession":  "Which session is most profitable and why? Should any session be skipped?",
+    "market":       "Based on current regimes and indicators, which symbols look most favourable right now?",
+    "ml":           "Is the ML model healthy? Are features balanced? What would improve model accuracy?",
+    "improvements": "What are the weakest setups? Which regime+session combos should the bot reduce or skip?",
+}
+
+async def cmd_ai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """AI analyst with dynamic model selection: /ai <sub-command> [arg]"""
+    args = ctx.args or []
+    if not args:
+        await update.message.reply_text(_AI_HELP, parse_mode="HTML")
+        return
+
+    sub  = args[0].lower()
+    arg2 = args[1] if len(args) > 1 else ""
+
+    # ── /ai model — show currently selected AI model & cache status ───────────
+    if sub == "model":
+        current = _discover_gemini_model()
+        expires = _gemini_model_cache.get("expires", 0)
+        expires_in = max(0, int(expires - time.time()))
+        h, m = divmod(expires_in // 60, 60)
+        status = "✅ Client active" if _GEMINI_CLIENT else "❌ No API key (GEMINI_API_KEY not set)"
+        await update.message.reply_text(
+            f"🤖 <b>AI Model Status</b>\n\n"
+            f"Selected:  <code>{_html.escape(current)}</code>\n"
+            f"Client:    {status}\n"
+            f"Cache:     expires in {h}h {m}m\n"
+            f"Fallback:  <code>{_html.escape(_GEMINI_MODEL_FALLBACK)}</code>\n\n"
+            f"<i>Discovery runs on startup and every 4 hours.\n"
+            f"Use /ai model to force a status refresh.</i>",
+            parse_mode="HTML",
+        )
+        return
+
+    question = _AI_QUESTIONS.get(sub, f"Analyse the data and answer: {' '.join(args)}")
+    if sub == "symbol" and arg2:
+        question = f"Is {arg2.upper()} worth trading? Any session or regime preference?"
+
+    current_model = _gemini_model_cache.get("model", _GEMINI_MODEL_FALLBACK)
+    msg = await update.message.reply_text(
+        f"🤖 Querying data and thinking… (model: <code>{_html.escape(current_model)}</code>)",
+        parse_mode="HTML",
+    )
+    try:
+        loop = asyncio.get_event_loop()
+        summary  = await loop.run_in_executor(None, _ai_build_summary, sub, arg2)
+        analysis = await _ai_ask_gemma(summary, question)
+        used_model = _gemini_model_cache.get("model", current_model)
+        reply = (
+            f"📊 <b>Data summary:</b>\n"
+            f"<pre>{_html.escape(summary[:700])}</pre>\n\n"
+            f"🤖 <b>{_html.escape(used_model)} says:</b>\n{_html.escape(analysis)}"
+        )
+        await msg.edit_text(reply, parse_mode="HTML")
+    except Exception as e:
+        await msg.edit_text(f"❌ Error: <code>{_html.escape(str(e))}</code>", parse_mode="HTML")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -5522,6 +6631,23 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(_performance_analytics_text(), reply_markup=_main_kb(), parse_mode="HTML")
         elif d == "patterns":
             await q.edit_message_text(_pattern_discovery_text(), reply_markup=_main_kb(), parse_mode="HTML")
+        elif d == "health":
+            text = await asyncio.get_event_loop().run_in_executor(None, _health_text)
+            await q.edit_message_text(text, reply_markup=_main_kb(), parse_mode="HTML")
+        elif d == "feat_importance":
+            def _fi_text():
+                if not _feature_importance_history:
+                    return "🤖 <b>Feature Importance History</b>\n\nNo retrains yet. Need 100+ trades."
+                lines = ["🤖 <b>Feature Importance History</b>"]
+                for entry in _feature_importance_history[-5:][::-1]:
+                    lines.append(f"\n<b>{entry['ts']}</b>  ({entry['total']} trades)")
+                    sorted_imp = sorted(entry["importances"].items(), key=lambda x: x[1], reverse=True)
+                    for col, pct in sorted_imp[:6]:
+                        bar = "█" * int(pct * 20)
+                        lines.append(f"  {col:<20} {pct*100:5.1f}% {bar}")
+                return "\n".join(lines)
+            text = await asyncio.get_event_loop().run_in_executor(None, _fi_text)
+            await q.edit_message_text(text, reply_markup=_main_kb(), parse_mode="HTML")
         elif d == "export_csv_quick":
             await q.edit_message_text(
                 "⏳ Generating CSV export…",
@@ -6407,6 +7533,7 @@ def _start_telegram():
                 )
 
         app.add_error_handler(error_handler)
+        app.add_handler(CommandHandler("ai",      cmd_ai))
         app.add_handler(CommandHandler("start",   cmd_start))
         app.add_handler(CommandHandler("status",  cmd_status))
         app.add_handler(CommandHandler("pnl",     cmd_pnl))
