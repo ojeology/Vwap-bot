@@ -236,10 +236,32 @@ SESSION_TIMES = {
     "Late New York":  "18:00–22:00 UTC",
 }
 
+# ── V3.0 Session Profiles ─────────────────────────────────────────────────
+# Each session has its own configurable ML gate, 2nd-entry gate, TP, SL,
+# max trades, cooldown, and mode.  Persisted to JSON so no code changes
+# are ever needed — edit via /setsession command.
+SESSION_PROFILES_PATH = "touch_session_profiles.json"
+_SESSION_PROFILE_DEFAULTS: dict = {
+    "Midnight":       {"ml_gate": 0.75, "ml2_gate": 0.90, "tp":  5.0, "sl":  -8.0, "max_trades":  6, "cooldown": 20, "mode": "Normal"},
+    "Early Asian":    {"ml_gate": 0.80, "ml2_gate": 0.90, "tp":  5.0, "sl":  -8.0, "max_trades":  8, "cooldown": 20, "mode": "Normal"},
+    "Late Asian":     {"ml_gate": 0.75, "ml2_gate": 0.90, "tp":  6.0, "sl":  -8.0, "max_trades":  8, "cooldown": 20, "mode": "Normal"},
+    "London":         {"ml_gate": 0.80, "ml2_gate": 0.92, "tp":  5.0, "sl":  -8.0, "max_trades":  8, "cooldown": 20, "mode": "Normal"},
+    "Early New York": {"ml_gate": 0.85, "ml2_gate": 0.92, "tp":  4.0, "sl":  -6.0, "max_trades":  6, "cooldown": 25, "mode": "Defensive"},
+    "Late New York":  {"ml_gate": 0.70, "ml2_gate": 0.90, "tp": 10.0, "sl": -10.0, "max_trades": 10, "cooldown": 15, "mode": "Aggressive"},
+}
+SESSION_PROFILES: dict = {}   # populated at startup by _load_session_profiles()
+
+# ── V3.0 Rolling trade statistics (in-memory, rebuilt each restart) ──────
+from collections import deque as _deque
+_ROLLING_MAXLEN         = 100   # per-session / per-symbol sliding window size
+_rolling_session_deque: dict = {}   # session → deque[{win, profit, symbol}]
+_rolling_symbol_deque:  dict = {}   # symbol  → deque[{win, profit, session}]
+_prev_retrain_metrics:  dict = {}   # last walk-forward snapshot for before/after comparison
+
 # ── ML filter ────────────────────────────────────────────────────────
 MODEL_PATH        = "touch_ml_model.pkl"   # separate from sniper_bot.py's ml_model.pkl — different contract type/features
 ML_MIN_TRADES     = 100
-ML_RETRAIN_EVERY  = 50           # retrain every 50 trades (continuous rolling)
+ML_RETRAIN_EVERY  = 100          # retrain every 100 new trades (V3.0: was 50, reduced spam)
 ML_CONFIDENCE_MIN = 0.60              # require ≥60% confidence (lowered from 75%; adjustable via Telegram)
 ML_STACKING_MIN_TRADES = 200     # below this, use a single regularized GB model;
                                  # at/above it, switch to the stacked ensemble (needs
@@ -424,6 +446,121 @@ def _get_session_name(dt: Optional[datetime] = None) -> str:
 def _get_session_group(session_name: str) -> str:
     """Return the broad session group for a sub-session (e.g. Early Asian → Asian)."""
     return SESSION_GROUP.get(session_name, session_name)
+
+
+# ── V3.0 Session profile helpers ──────────────────────────────────────────
+
+def _load_session_profiles() -> None:
+    """Load per-session parameters from JSON; fall back to built-in defaults."""
+    global SESSION_PROFILES
+    import copy
+    SESSION_PROFILES = copy.deepcopy(_SESSION_PROFILE_DEFAULTS)
+    if os.path.exists(SESSION_PROFILES_PATH):
+        try:
+            with open(SESSION_PROFILES_PATH) as _f:
+                _saved = json.load(_f)
+            for _sess, _vals in _saved.items():
+                if _sess in SESSION_PROFILES:
+                    SESSION_PROFILES[_sess].update(_vals)
+            logger.info(f"Session profiles loaded from {SESSION_PROFILES_PATH}")
+        except Exception as _e:
+            logger.warning(f"Could not load session profiles: {_e}")
+
+
+def _save_session_profiles() -> None:
+    """Persist current session profiles to JSON."""
+    try:
+        with open(SESSION_PROFILES_PATH, "w") as _f:
+            json.dump(SESSION_PROFILES, _f, indent=2)
+    except Exception as _e:
+        logger.warning(f"Could not save session profiles: {_e}")
+
+
+def _get_session_profile(session: str = None) -> dict:
+    """Return the live profile dict for a session (falls back to defaults)."""
+    if session is None:
+        session = _get_session_name()
+    src = SESSION_PROFILES if SESSION_PROFILES else _SESSION_PROFILE_DEFAULTS
+    return src.get(session, _SESSION_PROFILE_DEFAULTS.get(session, {}))
+
+
+# ── V3.0 Rolling statistics helpers ───────────────────────────────────────
+
+def _rolling_push(session: str, symbol: str, win: bool, profit: float) -> None:
+    """Record a settled trade into the in-memory rolling windows."""
+    rec = {"win": win, "profit": profit, "symbol": symbol, "session": session}
+    _rolling_session_deque.setdefault(session, _deque(maxlen=_ROLLING_MAXLEN)).append(rec)
+    _rolling_symbol_deque.setdefault(symbol,  _deque(maxlen=_ROLLING_MAXLEN)).append(rec)
+
+
+def _rolling_stats_for(records, n: int = None) -> dict:
+    """WR, profit, profit-factor, avg, max-drawdown for last n records (or all)."""
+    recs = list(records)[-n:] if n else list(records)
+    if not recs:
+        return {"n": 0, "wr": None, "profit": 0.0, "pf": None, "avg": 0.0, "dd": 0.0}
+    total   = len(recs)
+    wins    = sum(1 for r in recs if r["win"])
+    pos_sum = sum(r["profit"] for r in recs if r["profit"] > 0)
+    neg_sum = abs(sum(r["profit"] for r in recs if r["profit"] < 0))
+    cum, peak, dd = [0.0], 0.0, 0.0
+    for r in recs:
+        cum.append(cum[-1] + r["profit"])
+    for v in cum[1:]:
+        if v > peak:
+            peak = v
+        dd = max(dd, peak - v)
+    return {
+        "n":      total,
+        "wr":     wins / total,
+        "profit": round(sum(r["profit"] for r in recs), 2),
+        "pf":     round(pos_sum / max(neg_sum, 0.001), 2),
+        "avg":    round(sum(r["profit"] for r in recs) / total, 2),
+        "dd":     round(dd, 2),
+    }
+
+
+def _ml_generate_recommendations(eval_res: dict) -> str:
+    """Build a suggest-only recommendations message — never auto-applied."""
+    lines = [
+        "📋 <b>Session Recommendations</b>",
+        "<i>No changes applied — manual approval only.</i>",
+    ]
+    if not eval_res:
+        lines.append("  Not enough data for recommendations.")
+        return "\n".join(lines)
+    opt_t    = eval_res.get("opt_threshold", ML_CONFIDENCE_MIN)
+    cur_gate = ML_CONFIDENCE_MIN
+    if abs(opt_t - cur_gate) >= 0.05:
+        word = "raise" if opt_t > cur_gate else "lower"
+        lines.append(
+            f"  🎯 ML Gate: current <b>{cur_gate*100:.0f}%</b> → suggested "
+            f"<b>{opt_t*100:.0f}%</b>  ({word} — walk-forward optimum)\n"
+            f"     → <code>/set ml_gate {opt_t*100:.0f}</code>"
+        )
+    for sess_name, drec in _rolling_session_deque.items():
+        stats = _rolling_stats_for(drec, n=50)
+        if stats["n"] < 20:
+            continue
+        prof   = _get_session_profile(sess_name)
+        cur_tp = prof.get("tp", DAILY_PROFIT_TARGET)
+        cur_sl = prof.get("sl", DAILY_LOSS_LIMIT)
+        if stats["wr"] and stats["wr"] > 0.75 and stats["avg"] > 0.40:
+            sug_tp = round(cur_tp * 1.15, 1)
+            lines.append(
+                f"  📈 <b>{sess_name} TP:</b> ${cur_tp:.1f} → <b>${sug_tp:.1f}</b> "
+                f"(WR {stats['wr']*100:.0f}%, avg +${stats['avg']:.2f})\n"
+                f"     → <code>/setsession \"{sess_name}\" tp {sug_tp}</code>"
+            )
+        elif stats["wr"] and stats["wr"] < 0.55 and stats["avg"] < -0.20:
+            sug_sl = round(cur_sl * 0.80, 1)
+            lines.append(
+                f"  📉 <b>{sess_name} SL:</b> ${cur_sl:.1f} → <b>${sug_sl:.1f}</b> "
+                f"(WR {stats['wr']*100:.0f}%, avg ${stats['avg']:.2f})\n"
+                f"     → <code>/setsession \"{sess_name}\" sl {sug_sl}</code>"
+            )
+    if len(lines) == 2:
+        lines.append("  ✅ All settings look appropriate for current performance.")
+    return "\n".join(lines)
 
 
 def _next_session_start(dt: Optional[datetime] = None) -> datetime:
@@ -850,6 +987,13 @@ def _ml_should_trade(details: dict, symbol: str = "", min_conf: float = None) ->
         regime  = details.get("regime", "Choppy")
         gate    = _adaptive_ml_gate(symbol, session, regime)
     details["ml_gate_used"] = gate
+    # V3.0 decision tree — record ML gate outcome in details for gate trace
+    details.setdefault("gate_trace", [])
+    details["gate_trace"].append((
+        "ML",
+        "PASS" if conf >= gate else "FAIL",
+        f"{conf*100:.1f}% vs {gate*100:.0f}% gate ({_get_session_name()} profile)",
+    ))
     # Send explanation only for very high (≥90%) or very low (<45%) confidence
     if conf >= 0.90 or conf < 0.45:
         try:
@@ -1021,15 +1165,22 @@ def _check_and_update_blacklist(symbol: str):
 #  V2.6 — ADAPTIVE ML GATE
 # ══════════════════════════════════════════════════════════════════════
 def _adaptive_ml_gate(symbol: str, session: str, regime: str) -> float:
-    """Return the ML confidence gate for this trade, adjusted between
-    ML_CONFIDENCE_MIN_FLOOR (0.55) and ML_CONFIDENCE_MAX_CAP (0.70)
-    based on regime, asset health, and session health.
-    V2.8: base threshold is auto-tuned from walk-forward optimal-profit search
-    (instead of fixed 60%); respects user ML_CONFIDENCE_MIN if set higher."""
-    gate = max(ML_CONFIDENCE_MIN, _ml_optimal_threshold)  # auto-tuned base
+    """Return the ML confidence gate for this trade.
+    V3.0: base = session profile ml_gate (per-session configurable).
+    Adaptive ±2-5% nudges for regime, asset health, session health.
+    Hard floor = max(ML_CONFIDENCE_MIN_FLOOR, global ML_CONFIDENCE_MIN, 90% of session gate).
+    No hard upper cap — the user's session profile gate is the intended ceiling.
+    The walk-forward optimum (V2.8) only RAISES the base, never lowers it below
+    the user-set gates, so manual /set ml_gate is always respected."""
+    prof         = _get_session_profile(session)
+    sess_gate    = prof.get("ml_gate", ML_CONFIDENCE_MIN)
+    # Walk-forward optimum may raise the base if the data supports a higher gate,
+    # but it never overrides ML_CONFIDENCE_MIN or the session profile gate.
+    base = max(ML_CONFIDENCE_MIN, sess_gate, _ml_optimal_threshold)
+    gate = base
     asset_h   = _get_asset_health(symbol)
     session_h = _get_session_health(session)
-    # Regime
+    # Regime nudges (small — adaptive gate should not dramatically override base)
     if   regime == "Strong Trend":  gate -= 0.03
     elif regime == "Expansion":     gate -= 0.01
     elif regime == "Choppy":        gate += 0.03
@@ -1040,7 +1191,9 @@ def _adaptive_ml_gate(symbol: str, session: str, regime: str) -> float:
     # Session health
     if   session_h < 0.40:  gate += 0.05
     elif session_h > 0.70:  gate -= 0.02
-    return round(max(ML_CONFIDENCE_MIN_FLOOR, min(ML_CONFIDENCE_MAX_CAP, gate)), 3)
+    # Floor: never drop below the highest user-configured gate
+    hard_floor = max(ML_CONFIDENCE_MIN_FLOOR, ML_CONFIDENCE_MIN, sess_gate * 0.90)
+    return round(max(hard_floor, min(0.97, gate)), 3)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1145,7 +1298,13 @@ def _ml_train():
     global _ml_last_retrain_time, _ml_optimal_threshold
     global _ml_importance_weights, _ml_component_weights
     global ml_models_per_symbol, ml_trained_per_symbol
+    global _prev_retrain_metrics
     try:
+        # BUG FIX (V3.0): stamp the cooldown immediately so concurrent or rapid-fire
+        # calls to _ml_maybe_retrain see the cooldown before the training query finishes,
+        # preventing back-to-back retrain storms after a burst of trade settlements.
+        _ml_last_retrain_time = time.time()
+        _prev_snap = dict(_prev_retrain_metrics)
         n_raw = len(ML_FEATURE_COLS)
         try:
             # timestamp + market_session + regime needed for engineered features.
@@ -1215,7 +1374,14 @@ def _ml_train():
         )
         if eval_res:
             opt_t = eval_res.get("opt_threshold", 0.60)
-            _ml_optimal_threshold = opt_t   # persist auto-tuned threshold
+            _ml_optimal_threshold = opt_t   # persist; only raises gate, never lowers below user gates
+            # Update prev-metrics store for next cycle's before/after comparison
+            _prev_retrain_metrics.update({
+                "acc":           eval_res.get("acc", 0),
+                "pr_auc":        eval_res.get("pr_auc", 0),
+                "brier":         eval_res.get("brier", 1),
+                "opt_threshold": opt_t,
+            })
             ece_val = eval_res.get("ece", float("nan"))
             ece_str = f"{ece_val:.3f}" if not math.isnan(ece_val) else "n/a"
             pr_auc  = eval_res.get("pr_auc", float("nan"))
@@ -1373,16 +1539,45 @@ def _ml_train():
             sym_summary = "\n".join(sym_lines) if sym_lines else "  (need 50+ trades per symbol)"
 
             _ml_save()
+            # V3.0: before/after comparison
+            sess_gate_now = _get_session_profile(_get_session_name()).get("ml_gate", ML_CONFIDENCE_MIN)
+            if _prev_snap and eval_res:
+                _d_acc   = (eval_res.get("acc", 0)   - _prev_snap.get("acc", 0)) * 100
+                _d_prauc = eval_res.get("pr_auc", 0) - _prev_snap.get("pr_auc", 0)
+                _d_brier = eval_res.get("brier", 1)  - _prev_snap.get("brier", 1)
+                cmp_line = (
+                    f"Δ vs prev:  Acc {_d_acc:+.0f}%  ·  "
+                    f"PR-AUC {_d_prauc:+.3f}  ·  Brier {_d_brier:+.3f}"
+                )
+            else:
+                cmp_line = "Δ vs prev:  first model (no baseline)"
+
             _send_tg(
                 f"🤖 <b>ML RETRAINING COMPLETE</b> ✅\n"
                 f"<code>[{_ml_progress_bar(1.0)}] 100%</code>\n"
-                f"Global: <b>{total}</b> trades  |  Gate ≥<b>{ML_CONFIDENCE_MIN*100:.0f}%</b>\n"
+                f"Global: <b>{total}</b> trades  |  "
+                f"Gate ≥<b>{ML_CONFIDENCE_MIN*100:.0f}%</b> global  "
+                f"| <b>{sess_gate_now*100:.0f}%</b> {_get_session_name()}\n"
                 f"Architecture: {arch_label}\n"
                 f"Top features: {imp_line}\n"
                 f"Per-class:\n" + "\n".join(cls_lines) +
-                f"\nPer-symbol:\n{sym_summary}\n\n{wf_line}"
+                f"\nPer-symbol:\n{sym_summary}\n\n"
+                f"{wf_line}\n{cmp_line}"
             )
             _ml_export_csv(total)
+
+            # V3.0: suggest-only recommendations — never auto-applied
+            try:
+                rec_msg = _ml_generate_recommendations(eval_res)
+                _send_tg(rec_msg)
+            except Exception as _re:
+                logger.warning(f"ML recommendation engine error: {_re}")
+
+            # V3.0: Gate Optimizer — replay all signals and report best thresholds
+            try:
+                _send_tg(_gate_optimizer_text())
+            except Exception as _ge:
+                logger.warning(f"Gate optimizer error: {_ge}")
         except Exception as e:
             logger.error(f"ML training failed: {e}")
             _send_tg(f"🤖 <b>ML RETRAINING FAILED</b>\n<code>{e}</code>")
@@ -1390,7 +1585,9 @@ def _ml_train():
     finally:
         with ml_lock:
             ml_training_active = False
-        _ml_last_retrain_time = time.time()
+        # _ml_last_retrain_time was already stamped at the start of the try block
+        # to block concurrent triggers.  Refresh here to measure from completion so
+        # the cooldown period runs from when the model was actually ready, not queued.
 
 
 def _ml_maybe_retrain(total_trades: int):
@@ -3317,13 +3514,15 @@ def _process_closed_candle(symbol: str, closed: dict, ws) -> None:
                     "lock_price": float(closed["close"]),
                     "lock_time": now,
                 }
-            if not already_locked:
+            # V3.0 spam fix: suppress LOCKED notification while the symbol is in
+            # cooldown — the trade will be rejected immediately anyway, so the
+            # alert adds noise without useful information.
+            if not already_locked and cooldown_left == 0:
                 _send_tg(
                     f"🔒 <b>LOCKED</b> — {symbol}\n"
                     f"Score <b>{score}/100</b> {direction}  |  "
                     f"Entry {details.get('entry_quality',0)}/30 "
-                    f"(ext {details.get('extension_atr',0):.2f}×ATR)  |  "
-                    f"{('cooldown ' + str(cooldown_left) + 'm' if cooldown_left else 'armed')}"
+                    f"(ext {details.get('extension_atr',0):.2f}×ATR)  |  armed"
                 )
         else:
             with _lock:
@@ -3412,16 +3611,26 @@ def _send_tg_wait(text: str, reply_markup=None, parse_mode: str = "HTML", timeou
             logger.debug(f"send_tg_wait timeout/error: {e}")
 
 
-def _send_rejection(symbol: str, direction: str, score: int, reason: str):
-    """Send a concise trade-rejected card to Telegram and write to log."""
+def _send_rejection(symbol: str, direction: str, score: int, reason: str,
+                    details: dict = None):
+    """Send a concise trade-rejected card to Telegram and write to log.
+    V3.0: optional `details` dict adds the decision-gate chain to the message."""
     _log(f"❌ {symbol} {direction} rejected — {reason}")
-    # Escape defensively — `reason` is free-form text (e.g. "conf 65% < 75% gate")
-    # and a raw "<"/">" breaks Telegram's HTML parser, silently dropping the alert.
     safe_reason = _html.escape(reason)
+    # V3.0 decision tree debug — show PASS/FAIL chain when details carry gate_trace
+    chain_str = ""
+    if details:
+        gt = details.get("gate_trace", [])
+        if gt:
+            rows = []
+            for g_name, g_status, g_note in gt:
+                icon = "✅" if g_status == "PASS" else "❌"
+                rows.append(f"  {icon} <b>{_html.escape(g_name)}</b>  <i>{_html.escape(g_note)}</i>")
+            chain_str = "\n" + "\n".join(rows)
     _send_tg(
         f"🚫 <b>REJECTED</b> — <code>{symbol}</code> {direction}\n"
         f"Score: <b>{score}/100</b>\n"
-        f"Reason: <i>{safe_reason}</i>"
+        f"Reason: <i>{safe_reason}</i>{chain_str}"
     )
 
 
@@ -3886,6 +4095,9 @@ def on_contract_update(ws, msg: dict, symbol: str):
         stats["pnl"] += profit
         if win: stats["wins"]   += 1
         else:   stats["losses"] += 1
+
+        # V3.0: update rolling windows (session + symbol) for recommendations engine
+        _rolling_push(mkt_session, symbol, win, profit)
 
         # Per-market-session stats (reset at midnight UTC)
         today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -4601,9 +4813,6 @@ def _main_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("⏭ Skip a Symbol",           callback_data="skip_menu")],
         [InlineKeyboardButton("⚙ Settings & Config",       callback_data="settings"),
          InlineKeyboardButton("🧪 Fire Test Trade",         callback_data="test_menu")],
-        # ── Payout quick adjust ────────────────────────────────────────────
-        [InlineKeyboardButton("➖ Lower Payout",           callback_data="payout_down"),
-         InlineKeyboardButton("➕ Raise Payout",          callback_data="payout_up")],
         # ── Tools ────────────────────────────────────────────────────────
         [InlineKeyboardButton("🔄 Refresh Dashboard",       callback_data="refresh"),
          InlineKeyboardButton("📦 Backup · Restore",        callback_data="backup")],
@@ -5448,6 +5657,236 @@ def _score_sparklines_text() -> str:
     return "\n".join(lines)
 
 
+def _gate_optimizer_text() -> str:
+    """
+    Replay every row in signal_features (ml_confidence, session, win, profit) and sweep
+    gate thresholds 55–90% in 5% steps.  Shows current-vs-recommended comparison,
+    a profit stability bar chart, and recommendation confidence stars.
+    Pure read — never changes any live setting.
+    """
+    try:
+        rows = _db_fetch(
+            "SELECT session, ml_confidence, win, profit "
+            "FROM signal_features "
+            "WHERE ml_confidence IS NOT NULL AND win IS NOT NULL "
+            "ORDER BY id"
+        )
+    except Exception as e:
+        return f"🎯 <b>Gate Optimizer</b>\n\n❌ DB query failed: <code>{e}</code>"
+
+    if not rows:
+        return (
+            "🎯 <b>Gate Optimizer</b>\n\n"
+            "⚠ No signal data yet — trades logged after the next retrain will appear here."
+        )
+
+    GATES = [round(g / 100, 2) for g in range(55, 95, 5)]   # 0.55 … 0.90
+    BAR_WIDTH = 8   # max █ blocks in stability chart
+
+    def _sweep(subset):
+        """Return list of (gate, profit, n, wr) + best_gate, best_profit, best_n."""
+        best_profit, best_gate, best_n = float("-inf"), None, 0
+        results = []
+        for g in GATES:
+            filtered = [(w, p) for (c, w, p) in subset if c >= g]
+            n = len(filtered)
+            if n == 0:
+                results.append((g, 0.0, 0, 0.0))
+                continue
+            profit = sum(p for _, p in filtered)
+            wr     = sum(w for w, _ in filtered) / n * 100
+            results.append((g, profit, n, wr))
+            if profit > best_profit:
+                best_profit, best_gate, best_n = profit, g, n
+        return results, best_gate, best_profit, best_n
+
+    def _lookup(results, gate):
+        """Return the result row for a specific gate value, or None."""
+        return next((r for r in results if r[0] == gate), None)
+
+    def _stability(results, best_gate):
+        """
+        Build a bar chart for the 3 gates centred on best_gate (±1 step each side)
+        and return (chart_lines, stability_label, stability_note).
+        Stability is defined by how much profit varies in that ±10pp window.
+        """
+        idx = next((i for i, r in enumerate(results) if r[0] == best_gate), None)
+        if idx is None:
+            return [], "Unknown", ""
+        # window: up to 2 steps either side so user sees context
+        window = results[max(0, idx - 2): idx + 3]
+        profits  = [r[1] for r in window if r[2] > 0]
+        if len(profits) < 2:
+            return [], "Insufficient data", ""
+        p_max   = max(profits)
+        p_range = p_max - min(profits)
+        # Relative spread vs best profit
+        spread_pct = p_range / max(abs(p_max), 1e-9)
+        if spread_pct < 0.05:
+            stab_label, stab_note = "Very Stable", "Differences are tiny — any gate in this range is fine."
+        elif spread_pct < 0.15:
+            stab_label, stab_note = "Stable",      "Small variation — recommendation is reliable."
+        elif spread_pct < 0.35:
+            stab_label, stab_note = "Moderate",    "Some variation — collect more data before committing."
+        else:
+            stab_label, stab_note = "Volatile",    "Large swings — wait for more signals before acting."
+
+        chart = []
+        for (g, profit, n, wr) in window:
+            if n == 0:
+                bar = "·" * BAR_WIDTH
+            else:
+                filled = max(1, round(profit / p_max * BAR_WIDTH)) if profit > 0 else 0
+                bar    = "█" * filled + "░" * (BAR_WIDTH - filled)
+            star = " ⭐" if g == best_gate else ""
+            chart.append(f"  <code>{g*100:.0f}%  {bar}{star}</code>")
+        return chart, stab_label, stab_note
+
+    def _rec_confidence(n: int):
+        """Return (stars, label, inline_note) based on signal count."""
+        if n >= 100: return "★★★★★", "Very High", ""
+        if n >= 75:  return "★★★★☆", "High",      ""
+        if n >= 50:  return "★★★☆☆", "Moderate",  ""
+        if n >= 25:  return "★★☆☆☆", "Low",       " <i>(limited data)</i>"
+        return       "★☆☆☆☆", "Very Low",  " <i>(Not enough data yet)</i>"
+
+    def _session_block(sess_name, sess_data, cur_gate_val):
+        """Return the formatted lines for one session."""
+        s_results, s_best, s_profit, s_n = _sweep(sess_data)
+        emoji      = SESSION_EMOJIS.get(sess_name, "")
+        prof       = _get_session_profile(sess_name)
+        cur_s_gate = prof.get("ml_gate", cur_gate_val)
+        n_total    = len(sess_data)
+        stars, conf_label, conf_note = _rec_confidence(n_total)
+
+        blk = [f"\n{emoji} <b>{sess_name}</b>"]
+        blk.append(f"  {stars} {conf_label}  ·  {n_total} signals analyzed{conf_note}")
+
+        if s_best is None or n_total < 10:
+            blk.append("  ★☆☆☆☆ Very Low  — need 10+ signals for any estimate")
+            return blk
+
+        # ── Current gate stats ───────────────────────────────────────────
+        cur_row  = _lookup(s_results, cur_s_gate)
+        best_row = _lookup(s_results, s_best)
+        if cur_row:
+            c_sign = "+" if cur_row[1] >= 0 else ""
+            blk.append(
+                f"\n  <b>Current ({cur_s_gate*100:.0f}%)</b>\n"
+                f"  Profit: <b>{c_sign}${cur_row[1]:.2f}</b>  "
+                f"Trades: {cur_row[2]}  WR: {cur_row[3]:.0f}%"
+            )
+
+        # ── Recommended gate stats ────────────────────────────────────────
+        if best_row and s_best != cur_s_gate:
+            b_sign = "+" if best_row[1] >= 0 else ""
+            blk.append(
+                f"\n  <b>Recommended ({s_best*100:.0f}%)</b>\n"
+                f"  Profit: <b>{b_sign}${best_row[1]:.2f}</b>  "
+                f"Trades: {best_row[2]}  WR: {best_row[3]:.0f}%"
+            )
+            # ── Difference ────────────────────────────────────────────────
+            if cur_row:
+                d_profit = best_row[1] - cur_row[1]
+                d_wr     = best_row[3] - cur_row[3]
+                d_trades = best_row[2] - cur_row[2]
+                blk.append(
+                    f"\n  <b>Difference</b>\n"
+                    f"  {'+' if d_profit >= 0 else ''}${d_profit:.2f} profit  "
+                    f"  {'+' if d_wr >= 0 else ''}{d_wr:.0f}% WR  "
+                    f"  {'+' if d_trades >= 0 else ''}{d_trades} trades"
+                )
+            diff_s = (s_best - cur_s_gate) * 100
+            blk.append(
+                f"\n  💡 <i>/setsession \"{sess_name}\" ml_gate {s_best*100:.0f}  "
+                f"({diff_s:+.0f}pp)</i>"
+            )
+        else:
+            blk.append(f"\n  ✅ <i>Current gate already optimal for this session.</i>")
+
+        # ── Stability chart ───────────────────────────────────────────────
+        chart_lines, stab_label, stab_note = _stability(s_results, s_best)
+        if chart_lines:
+            blk.append(f"\n  <b>Recommendation Stability</b>")
+            blk.extend(chart_lines)
+            blk.append(f"  <i>{stab_label} — {stab_note}</i>")
+
+        return blk
+
+    # ── Global sweep ──────────────────────────────────────────────────────
+    with ml_lock:
+        cur_gate = ML_CONFIDENCE_MIN
+
+    global_rows = [(float(r[1] or 0), int(r[2] or 0), float(r[3] or 0)) for r in rows]
+    g_results, g_best_gate, g_best_profit, g_best_n = _sweep(global_rows)
+
+    lines = [
+        f"🎯 <b>Gate Optimizer</b>  ({len(rows)} signals replayed)",
+        "",
+        "<b>── Global ──</b>",
+    ]
+
+    g_cur_row  = _lookup(g_results, cur_gate)
+    g_best_row = _lookup(g_results, g_best_gate)
+
+    if g_cur_row:
+        c_sign = "+" if g_cur_row[1] >= 0 else ""
+        lines.append(
+            f"\n  <b>Current ({cur_gate*100:.0f}%)</b>\n"
+            f"  Profit: <b>{c_sign}${g_cur_row[1]:.2f}</b>  "
+            f"Trades: {g_cur_row[2]}  WR: {g_cur_row[3]:.0f}%"
+        )
+
+    if g_best_row and g_best_gate != cur_gate:
+        b_sign = "+" if g_best_row[1] >= 0 else ""
+        lines.append(
+            f"\n  <b>Recommended ({g_best_gate*100:.0f}%)</b>\n"
+            f"  Profit: <b>{b_sign}${g_best_row[1]:.2f}</b>  "
+            f"Trades: {g_best_row[2]}  WR: {g_best_row[3]:.0f}%"
+        )
+        if g_cur_row:
+            gd_p = g_best_row[1] - g_cur_row[1]
+            gd_w = g_best_row[3] - g_cur_row[3]
+            gd_t = g_best_row[2] - g_cur_row[2]
+            lines.append(
+                f"\n  <b>Difference</b>\n"
+                f"  {'+' if gd_p >= 0 else ''}${gd_p:.2f} profit  "
+                f"  {'+' if gd_w >= 0 else ''}{gd_w:.0f}% WR  "
+                f"  {'+' if gd_t >= 0 else ''}{gd_t} trades"
+            )
+        diff = (g_best_gate - cur_gate) * 100
+        lines.append(
+            f"\n  💡 <i>Suggestion: /set ml_gate {g_best_gate*100:.0f}  "
+            f"({diff:+.0f}pp — never auto-applied)</i>"
+        )
+    elif g_best_gate == cur_gate:
+        lines.append(f"\n  ✅ <i>Current global gate ({cur_gate*100:.0f}%) is already optimal.</i>")
+
+    # Global stability chart
+    g_chart, g_stab, g_stab_note = _stability(g_results, g_best_gate)
+    if g_chart:
+        lines.append(f"\n  <b>Recommendation Stability</b>")
+        lines.extend(g_chart)
+        lines.append(f"  <i>{g_stab} — {g_stab_note}</i>")
+
+    # ── Per-session blocks ────────────────────────────────────────────────
+    sessions = {}
+    for r in rows:
+        sess = r[0] or "Unknown"
+        sessions.setdefault(sess, []).append(
+            (float(r[1] or 0), int(r[2] or 0), float(r[3] or 0))
+        )
+
+    if sessions:
+        lines.append("\n<b>── Per Session · Recommendation Confidence ──</b>")
+        # Most-confident sessions first
+        for sess_name in sorted(sessions.keys(), key=lambda s: len(sessions[s]), reverse=True):
+            lines.extend(_session_block(sess_name, sessions[sess_name], cur_gate))
+
+    lines += ["", "<i>Suggestions only — no settings were changed.</i>"]
+    return "\n".join(lines)
+
+
 def _settings_text():
     se_status = "✅ ENABLED" if ALLOW_SECOND_ENTRY else "❌ OFF"
     return (
@@ -5517,6 +5956,18 @@ def _settings_adj_kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton("🏠 Menu",     callback_data="main_menu"),
     ])
     return InlineKeyboardMarkup(rows)
+
+
+def _settings_menu_kb() -> InlineKeyboardMarkup:
+    """Top-level Settings submenu — replaces direct jump to adj keyboard."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚙ Adjust Live Parameters",  callback_data="settings_adj")],
+        [InlineKeyboardButton("🔍 Debug State",             callback_data="debug_state"),
+         InlineKeyboardButton("📊 Profiles & Stats",        callback_data="profile_stats")],
+        [InlineKeyboardButton("📋 Session Profiles",        callback_data="setsession_list")],
+        [InlineKeyboardButton("🎯 Gate Optimizer",          callback_data="gate_optimizer")],
+        [InlineKeyboardButton("🏠 Back to Menu",            callback_data="main_menu")],
+    ])
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -5785,6 +6236,214 @@ async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _bot_ready:
         await update.message.reply_text(_NOT_READY_MSG, parse_mode="HTML"); return
     await update.message.reply_text(_live_session_report_text(), reply_markup=_main_kb(), parse_mode="HTML")
+
+
+# ── V3.0 Commands ─────────────────────────────────────────────────────────
+
+async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Full state dump: /debug"""
+    if not _bot_ready:
+        await update.message.reply_text(_NOT_READY_MSG, parse_mode="HTML"); return
+    import html as _h
+    now_dt   = datetime.now(timezone.utc)
+    session  = _get_session_name(now_dt)
+    prof     = _get_session_profile(session)
+    regime   = "—"
+    with _lock:
+        _pnl, _wc, _lc, _cl, _dt, _paused = (
+            total_pnl, win_count, loss_count, consecutive_losses, daily_trades, paused
+        )
+    with ml_lock:
+        _gate_global  = ML_CONFIDENCE_MIN
+        _gate_session = prof.get("ml_gate", ML_CONFIDENCE_MIN)
+        _gate_2nd     = SECOND_ENTRY_ML_MIN
+        _opt_t        = _ml_optimal_threshold
+        _trained      = ml_trained_on
+        _total_ml     = ml_total_trades
+        _training     = ml_training_active
+        _model_ready  = ml_model is not None
+    _until_cd = max(0, int((ML_RETRAIN_EVERY - max(0, _total_ml - _trained))))
+
+    lines = [
+        f"🔍 <b>DEBUG STATE</b>  {now_dt.strftime('%H:%M:%S UTC')}",
+        "",
+        f"<b>Session</b>       {session}  [{prof.get('mode','Normal')}]",
+        f"<b>Regime</b>        {regime}",
+        "",
+        f"<b>ML Gate</b>       Global {_gate_global*100:.0f}%  |  Session {_gate_session*100:.0f}%",
+        f"<b>2nd Entry</b>     {_gate_2nd*100:.0f}%",
+        f"<b>Opt Threshold</b> {_opt_t*100:.0f}% (walk-forward)",
+        f"<b>Model</b>         {'✅ ready' if _model_ready else '⏳ not trained yet'}  "
+        f"(trained on {_trained}, current {_total_ml})",
+        f"<b>Next retrain</b>  in ~{_until_cd} new trades  "
+        f"({'training now' if _training else 'idle'})",
+        "",
+        f"<b>Session TP</b>    ${prof.get('tp', DAILY_PROFIT_TARGET):.1f}",
+        f"<b>Session SL</b>    ${prof.get('sl', DAILY_LOSS_LIMIT):.1f}",
+        f"<b>Max Trades</b>    {prof.get('max_trades','unlimited')}",
+        f"<b>Cooldown</b>      {prof.get('cooldown', COOLDOWN_MINUTES)} min",
+        "",
+        f"<b>Session P&L</b>   {'+' if _pnl>=0 else ''}${_pnl:.2f}  "
+        f"({_wc}W / {_lc}L  {_wc/max(_wc+_lc,1)*100:.0f}%WR)",
+        f"<b>Cons Losses</b>   {_cl}",
+        f"<b>Paused</b>        {'⏸ YES' if _paused else '▶ no'}",
+        "",
+        "<b>Session Profiles loaded:</b>",
+    ]
+    for sn, sp in SESSION_PROFILES.items():
+        emoji = SESSION_EMOJIS.get(sn, "")
+        lines.append(
+            f"  {emoji} <b>{sn}</b>  ML {sp['ml_gate']*100:.0f}%  "
+            f"TP ${sp['tp']}  SL ${sp['sl']}  [{sp['mode']}]"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show session and symbol profiles with rolling stats: /profile"""
+    if not _bot_ready:
+        await update.message.reply_text(_NOT_READY_MSG, parse_mode="HTML"); return
+    lines = ["📊 <b>Session Profiles + Rolling Stats</b>", ""]
+    for sn, sp in SESSION_PROFILES.items():
+        emoji  = SESSION_EMOJIS.get(sn, "")
+        drec   = _rolling_session_deque.get(sn)
+        st20   = _rolling_stats_for(drec, n=20) if drec else {"n": 0}
+        st50   = _rolling_stats_for(drec, n=50) if drec else {"n": 0}
+        st_all = _rolling_stats_for(drec)        if drec else {"n": 0}
+        def _wr(s):
+            return f"{s['wr']*100:.0f}%" if s.get("wr") is not None else "—"
+        lines.append(
+            f"{emoji} <b>{sn}</b>  [{sp['mode']}]\n"
+            f"  Gate {sp['ml_gate']*100:.0f}%  2nd {sp['ml2_gate']*100:.0f}%  "
+            f"TP ${sp['tp']}  SL ${sp['sl']}\n"
+            f"  Rolling WR:  last 20 <b>{_wr(st20)}</b>  "
+            f"last 50 <b>{_wr(st50)}</b>  lifetime <b>{_wr(st_all)}</b>  "
+            f"({st_all['n']} trades)\n"
+            f"  PF {st50.get('pf') or '—'}  avg ${st50.get('avg', 0):+.2f}"
+        )
+    lines += ["", "📈 <b>Symbol Rolling Stats</b>  (last 50 this run)", ""]
+    sorted_syms = sorted(
+        _rolling_symbol_deque.keys(),
+        key=lambda s: (_rolling_stats_for(_rolling_symbol_deque[s], 50).get("profit", 0)),
+        reverse=True,
+    )
+    for sym in sorted_syms:
+        drec = _rolling_symbol_deque[sym]
+        s50  = _rolling_stats_for(drec, 50)
+        s20  = _rolling_stats_for(drec, 20)
+        if s50["n"] == 0:
+            continue
+        lines.append(
+            f"  <code>{sym:<10}</code>  "
+            f"L20 {s20['wr']*100:.0f}%WR  "
+            f"L50 {s50['wr']*100:.0f}%WR  "
+            f"avg ${s50['avg']:+.2f}  PF {s50['pf']}"
+        )
+    if not sorted_syms:
+        lines.append("  <i>No trades recorded yet this run.</i>")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_setsession(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /setsession <session_name> <param> <value>   — update a session profile.
+    /setsession list                             — show all session profiles.
+
+    Params: ml_gate  ml2_gate  tp  sl  max_trades  cooldown  mode
+    Mode values: Normal  Aggressive  Defensive
+
+    Examples:
+      /setsession "Late New York" ml_gate 70
+      /setsession "Early New York" tp 8
+      /setsession "London" mode Aggressive
+    """
+    if not _bot_ready:
+        await update.message.reply_text(_NOT_READY_MSG, parse_mode="HTML"); return
+    args = ctx.args or []
+    raw  = " ".join(args).strip()
+
+    if not raw or raw.lower() == "list":
+        lines = ["📋 <b>Session Profiles</b>  (edit with /setsession)"]
+        for sn, sp in SESSION_PROFILES.items():
+            emoji = SESSION_EMOJIS.get(sn, "")
+            lines.append(
+                f"\n{emoji} <b>{sn}</b>\n"
+                f"  ml_gate={sp['ml_gate']*100:.0f}%  ml2_gate={sp['ml2_gate']*100:.0f}%\n"
+                f"  tp=${sp['tp']}  sl=${sp['sl']}\n"
+                f"  max_trades={sp['max_trades']}  cooldown={sp['cooldown']}m  mode={sp['mode']}"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        return
+
+    # Parse: handle quoted session name then param value
+    import shlex
+    try:
+        parts = shlex.split(raw)
+    except ValueError:
+        parts = raw.split()
+    if len(parts) < 3:
+        await update.message.reply_text(
+            "Usage: /setsession <i>session_name</i> <i>param</i> <i>value</i>\n"
+            "Example: <code>/setsession \"Late New York\" ml_gate 70</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    # Session name may be one or two words — try longest match first
+    sess_name = param = val_raw = None
+    for split_at in range(len(parts) - 1, 0, -1):
+        candidate = " ".join(parts[:split_at])
+        if candidate in SESSION_PROFILES:
+            sess_name = candidate
+            param     = parts[split_at].lower()
+            val_raw   = " ".join(parts[split_at + 1:])
+            break
+    if sess_name is None:
+        await update.message.reply_text(
+            f"❌ Session not found in: {', '.join(SESSION_PROFILES.keys())}",
+            parse_mode="HTML",
+        )
+        return
+
+    _FLOAT_PARAMS   = {"tp", "sl"}
+    _PERCENT_PARAMS = {"ml_gate", "ml2_gate"}
+    _INT_PARAMS     = {"max_trades", "cooldown"}
+    _STR_PARAMS     = {"mode"}
+
+    prof = SESSION_PROFILES[sess_name]
+    try:
+        if param in _PERCENT_PARAMS:
+            v = float(val_raw) / (100.0 if float(val_raw) > 1.0 else 1.0)
+            prof[param] = round(v, 3)
+            display = f"{prof[param]*100:.0f}%"
+        elif param in _FLOAT_PARAMS:
+            prof[param] = round(float(val_raw), 2)
+            display = f"${prof[param]}"
+        elif param in _INT_PARAMS:
+            prof[param] = int(val_raw)
+            display = str(prof[param])
+        elif param in _STR_PARAMS:
+            if val_raw not in ("Normal", "Aggressive", "Defensive"):
+                raise ValueError(f"mode must be Normal, Aggressive, or Defensive")
+            prof[param] = val_raw
+            display = val_raw
+        else:
+            await update.message.reply_text(
+                f"❌ Unknown param <code>{param}</code>. "
+                f"Valid: ml_gate ml2_gate tp sl max_trades cooldown mode",
+                parse_mode="HTML",
+            )
+            return
+    except ValueError as ve:
+        await update.message.reply_text(f"❌ Invalid value: {ve}", parse_mode="HTML")
+        return
+
+    _save_session_profiles()
+    await update.message.reply_text(
+        f"✅ <b>{sess_name}</b>  <code>{param}</code> → <b>{display}</b>\n"
+        f"<i>Saved to {SESSION_PROFILES_PATH} — takes effect immediately.</i>",
+        parse_mode="HTML",
+    )
 
 async def cmd_alltime(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _bot_ready:
@@ -6710,14 +7369,107 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 reply_markup=_main_kb(), parse_mode="HTML",
             )
             _log(f"💸 Payout band lowered to ${PROFIT_MIN:.2f}–${PROFIT_MAX:.2f}")
-        elif d == "noop" or d == "settings_adj":
-            await q.answer()   # acknowledge silently — spacer / no-op buttons
+        elif d == "noop":
+            await q.answer()   # acknowledge silently — spacer buttons
         elif d == "settings":
+            # V3.0: landing page is now a submenu, not the raw adj keyboard
+            await q.edit_message_text(
+                _settings_text(),
+                reply_markup=_settings_menu_kb(),
+                parse_mode="HTML",
+            )
+        elif d == "settings_adj":
             await q.edit_message_text(
                 _settings_text(),
                 reply_markup=_settings_adj_kb(),
                 parse_mode="HTML",
             )
+        elif d == "debug_state":
+            # Reuse cmd_debug logic but as an inline button
+            import sys as _sys2
+            _mod2 = _sys2.modules[__name__]
+            now_dt   = datetime.now(timezone.utc)
+            session  = _get_session_name(now_dt)
+            prof     = _get_session_profile(session)
+            with _lock:
+                _pnl, _wc, _lc, _cl, _dt, _paused_now = (
+                    total_pnl, win_count, loss_count,
+                    consecutive_losses, daily_trades, paused
+                )
+            with ml_lock:
+                _gate_g  = ML_CONFIDENCE_MIN
+                _gate_s  = prof.get("ml_gate", ML_CONFIDENCE_MIN)
+                _opt_t   = _ml_optimal_threshold
+                _trained = ml_trained_on
+                _total   = ml_total_trades
+                _busy    = ml_training_active
+                _ready   = ml_model is not None
+            _until = max(0, ML_RETRAIN_EVERY - max(0, _total - _trained))
+            lines = [
+                f"🔍 <b>DEBUG STATE</b>  {now_dt.strftime('%H:%M:%S UTC')}",
+                "",
+                f"<b>Session</b>       {session}  [{prof.get('mode','Normal')}]",
+                f"<b>ML Gate</b>       Global {_gate_g*100:.0f}%  |  Session {_gate_s*100:.0f}%",
+                f"<b>Opt Threshold</b> {_opt_t*100:.0f}%  (walk-forward, raises only)",
+                f"<b>Model</b>         {'✅ ready' if _ready else '⏳ not trained'}  "
+                f"(on {_trained}, now {_total}  — retrain in ~{_until} trades)",
+                f"<b>Training</b>      {'🔄 in progress' if _busy else 'idle'}",
+                "",
+                f"<b>TP / SL</b>       ${prof.get('tp', DAILY_PROFIT_TARGET):.1f}"
+                f" / ${prof.get('sl', DAILY_LOSS_LIMIT):.1f}",
+                f"<b>Cooldown</b>      {prof.get('cooldown', COOLDOWN_MINUTES)} min",
+                f"<b>Max Trades</b>    {prof.get('max_trades','unlimited')}",
+                "",
+                f"<b>Session P&L</b>   {'+'if _pnl>=0 else''}${_pnl:.2f}  "
+                f"({_wc}W / {_lc}L  {_wc/max(_wc+_lc,1)*100:.0f}%WR)",
+                f"<b>Cons Losses</b>   {_cl}  |  <b>Paused</b> {'⏸ YES' if _paused_now else 'no'}",
+            ]
+            _dkb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Settings", callback_data="settings")]])
+            await q.edit_message_text("\n".join(lines), reply_markup=_dkb, parse_mode="HTML")
+        elif d == "profile_stats":
+            # Inline version of /profile
+            lines = ["📊 <b>Profiles &amp; Rolling Stats</b>", ""]
+            for sn, sp in SESSION_PROFILES.items():
+                emoji  = SESSION_EMOJIS.get(sn, "")
+                drec   = _rolling_session_deque.get(sn)
+                st20   = _rolling_stats_for(drec, 20) if drec else {"n":0}
+                st50   = _rolling_stats_for(drec, 50) if drec else {"n":0}
+                st_all = _rolling_stats_for(drec)     if drec else {"n":0}
+                def _wr(s): return f"{s['wr']*100:.0f}%" if s.get("wr") is not None else "—"
+                lines.append(
+                    f"{emoji} <b>{sn}</b>  [{sp['mode']}]\n"
+                    f"  Gate {sp['ml_gate']*100:.0f}%  TP ${sp['tp']}  SL ${sp['sl']}\n"
+                    f"  WR: L20 <b>{_wr(st20)}</b>  L50 <b>{_wr(st50)}</b>  "
+                    f"All <b>{_wr(st_all)}</b>  ({st_all['n']} trades)"
+                )
+            _pkb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Settings", callback_data="settings")]])
+            await q.edit_message_text("\n".join(lines), reply_markup=_pkb, parse_mode="HTML")
+        elif d == "setsession_list":
+            lines = ["📋 <b>Session Profiles</b>  <i>(edit via /setsession)</i>"]
+            for sn, sp in SESSION_PROFILES.items():
+                emoji = SESSION_EMOJIS.get(sn, "")
+                lines.append(
+                    f"\n{emoji} <b>{sn}</b>\n"
+                    f"  ml_gate={sp['ml_gate']*100:.0f}%  "
+                    f"tp=${sp['tp']}  sl=${sp['sl']}  [{sp['mode']}]\n"
+                    f"  <i>/setsession \"{sn}\" ml_gate 75</i>"
+                )
+            _skb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Settings", callback_data="settings")]])
+            await q.edit_message_text("\n".join(lines), reply_markup=_skb, parse_mode="HTML")
+        elif d == "gate_optimizer":
+            await q.edit_message_text(
+                "⏳ <b>Running Gate Optimizer…</b>\n"
+                "<i>Replaying all logged signals, sweeping gates 55–90%.</i>",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Settings", callback_data="settings")
+                ]]),
+                parse_mode="HTML",
+            )
+            def _run_gate_opt():
+                return _gate_optimizer_text()
+            text = await asyncio.get_event_loop().run_in_executor(None, _run_gate_opt)
+            _gkb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Settings", callback_data="settings")]])
+            await q.message.reply_text(text, reply_markup=_gkb, parse_mode="HTML")
         elif d.startswith("adj_"):
             await _handle_adj_callback(q, d)
         elif d == "toggle_pause":
@@ -7546,7 +8298,10 @@ def _start_telegram():
         app.add_handler(CommandHandler("analytics", cmd_analytics))
         app.add_handler(CommandHandler("export",  cmd_export))
         app.add_handler(CommandHandler("backup",  cmd_backup))
-        app.add_handler(CommandHandler("set",     cmd_set))
+        app.add_handler(CommandHandler("set",        cmd_set))
+        app.add_handler(CommandHandler("debug",      cmd_debug))
+        app.add_handler(CommandHandler("profile",    cmd_profile))
+        app.add_handler(CommandHandler("setsession", cmd_setsession))
         # CSV upload: catch ALL document messages and check filename inside the
         # handler — avoids MIME-type mismatches (mobile sends text/plain,
         # desktop sends text/csv, some clients send application/octet-stream).
@@ -7667,6 +8422,9 @@ def main():
         )),
         border_style="blue", box=box.DOUBLE_EDGE,
     ))
+
+    # V3.0: load per-session profile config (JSON file or built-in defaults)
+    _load_session_profiles()
 
     # Initialise symbol state
     for sym in SYMBOLS:
