@@ -8,6 +8,8 @@
 
 import json, time, sqlite3, threading, queue, logging, asyncio, os, sys, pickle, io, csv as _csv, html as _html
 import math
+import random
+import hashlib
 import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
@@ -166,8 +168,10 @@ def _is_new_deriv_api():
 
 _deriv_options_accounts_cache = None
 
-def _deriv_rest_api_call(method, path, body=None):
-    """Make an authenticated request to the new Deriv REST API."""
+def _deriv_rest_api_call(method, path, body=None, max_retries=5):
+    """Make an authenticated request to the new Deriv REST API.
+    Retries on 429 or 5xx with exponential backoff and jitter to survive
+    Cloudflare rate-limits and transient Render startup bursts."""
     url = f"https://api.derivws.com{path}"
     headers = {
         "Accept": "application/json",
@@ -177,17 +181,43 @@ def _deriv_rest_api_call(method, path, body=None):
     data = json.dumps(body).encode("utf-8") if body is not None else None
     if data is not None:
         headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")
+
+    # Auth/account endpoints are stricter; start backoff at 30s for 429s.
+    base_delay = 30 if ("accounts" in path or "otp" in path) else 5
+
+    for attempt in range(max_retries + 1):
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:
-            err = json.loads(err_body)
-        except Exception:
-            err = {"message": err_body}
-        raise RuntimeError(f"Deriv REST API {method} {path} failed: {e.code} {err}")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")
+            try:
+                err = json.loads(err_body)
+            except Exception:
+                err = {"message": err_body}
+
+            is_rate_limit = e.code == 429
+            is_server_error = 500 <= e.code < 600
+            if attempt < max_retries and (is_rate_limit or is_server_error):
+                retry_after = 0
+                if isinstance(err, dict):
+                    retry_after = err.get("retry_after", 0)
+                delay = max(base_delay, retry_after) * (2 ** attempt) + random.uniform(0, 2)
+                if is_rate_limit:
+                    logger.warning(
+                        f"Deriv REST API rate-limited ({method} {path}); "
+                        f"waiting {delay:.1f}s before retry {attempt + 1}/{max_retries}"
+                    )
+                else:
+                    logger.warning(
+                        f"Deriv REST API server error {e.code} ({method} {path}); "
+                        f"retrying in {delay:.1f}s"
+                    )
+                time.sleep(delay)
+                continue
+
+            raise RuntimeError(f"Deriv REST API {method} {path} failed: {e.code} {err}")
 
 def _deriv_options_accounts():
     """Return the list of Options trading accounts for the authenticated user."""
@@ -197,19 +227,68 @@ def _deriv_options_accounts():
         _deriv_options_accounts_cache = r.get("data", [])
     return _deriv_options_accounts_cache
 
+def _deriv_account_cache_key():
+    """Return a stable key for the current app_id/token pair."""
+    return hashlib.sha256(f"{DERIV_APP_ID}:{DERIV_APP_TOKEN}".encode("utf-8")).hexdigest()
+
+
+def _deriv_load_cached_account_id():
+    """Load a previously resolved account ID from disk (7-day TTL)."""
+    try:
+        with open(".deriv_account_id_cache.json", "r") as f:
+            cache = json.load(f)
+        entry = cache.get(_deriv_account_cache_key())
+        if not entry:
+            return None
+        ts = datetime.fromisoformat(entry.get("ts", "1970-01-01T00:00:00+00:00"))
+        if datetime.now(timezone.utc) - ts > timedelta(days=7):
+            return None
+        return entry.get("account_id")
+    except Exception:
+        return None
+
+
+def _deriv_save_cached_account_id(account_id):
+    """Persist a resolved account ID so restarts don't hammer the accounts endpoint."""
+    try:
+        cache = {}
+        try:
+            with open(".deriv_account_id_cache.json", "r") as f:
+                cache = json.load(f)
+        except Exception:
+            pass
+        cache[_deriv_account_cache_key()] = {
+            "account_id": account_id,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        with open(".deriv_account_id_cache.json", "w") as f:
+            json.dump(cache, f)
+    except Exception as e:
+        logger.warning(f"Could not cache Deriv account ID: {e}")
+
+
 def _deriv_options_account_id():
     """Return the account ID to use for the WebSocket connection.
-    Prefer the DERIV_ACCOUNT_ID env var, otherwise pick a demo account, then any account."""
+    Prefer the DERIV_ACCOUNT_ID env var, then a cached account ID, then the
+    accounts endpoint (demo first, then any account)."""
     if DERIV_ACCOUNT_ID:
         return DERIV_ACCOUNT_ID
+    cached = _deriv_load_cached_account_id()
+    if cached:
+        logger.info("Using cached Deriv account ID; skipping accounts endpoint lookup.")
+        return cached
     accounts = _deriv_options_accounts()
     if not accounts:
         raise RuntimeError("No Options trading accounts found for this token/app_id.")
     # Prefer demo for safety when not explicitly configured.
     for a in accounts:
         if a.get("account_type") == "demo":
-            return a.get("account_id")
-    return accounts[0].get("account_id")
+            account_id = a.get("account_id")
+            _deriv_save_cached_account_id(account_id)
+            return account_id
+    account_id = accounts[0].get("account_id")
+    _deriv_save_cached_account_id(account_id)
+    return account_id
 
 def deriv_ws_url():
     """Return the WebSocket URL to use for Deriv connections."""
@@ -8621,8 +8700,11 @@ def main():
 
     # Start remaining core threads
     _watch_thread(_db_writer,                   name="DBWriter")
-    for sym in SYMBOLS:
+    for i, sym in enumerate(SYMBOLS):
         _watch_thread(_ws_thread, args=(sym,),  name=f"WS-{sym}")
+        # Stagger starts to avoid a startup burst of OTP REST requests on Render.
+        if i < len(SYMBOLS) - 1:
+            time.sleep(0.3)
     # Terminal dashboard only makes sense in a real TTY (Render/headless = skip)
     if is_tty:
         _watch_thread(_terminal_loop,           name="TermRefresh")
