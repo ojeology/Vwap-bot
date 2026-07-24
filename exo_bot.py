@@ -8607,6 +8607,17 @@ def main():
     # succeed, so any subsequent _send_tg call is guaranteed a live loop.
     _tg_ready.wait(timeout=30)
 
+    # ── Optional one-shot demo trade trigger (for testing / onboarding) ──
+    fire_sym = os.environ.get("FIRE_TEST_TRADE", "").upper()
+    if fire_sym and fire_sym in ALL_TOUCH_SYMBOLS:
+        def _launch_demo():
+            try:
+                _run_test_trade(fire_sym)
+            except Exception as e:
+                logger.error(f"FIRE_TEST_TRADE launch failed: {e}")
+        threading.Timer(10.0, _launch_demo).start()
+        _log(f"🧪 Demo trade trigger scheduled for {fire_sym} in 10s")
+
     # ML bootstrap from candle history is DISABLED — watch-only mode until
     # ML_MIN_TRADES (100) real touch_trades are recorded, then trains automatically.
     # threading.Thread(target=_ml_bootstrap_from_history, daemon=True, name="MLBootstrap").start()
