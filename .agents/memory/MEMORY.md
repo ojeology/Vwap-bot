@@ -1,0 +1,1 @@
+- [Deriv API Migration](deriv-api-migration.md) — new auth flow, `symbol`→`underlying_symbol`, and string numeric fields.

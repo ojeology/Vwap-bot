@@ -8,6 +8,8 @@
 
 import json, time, sqlite3, threading, queue, logging, asyncio, os, sys, pickle, io, csv as _csv, html as _html
 import math
+import urllib.request
+import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from collections import deque
@@ -151,6 +153,102 @@ if not DERIV_APP_TOKEN:
     print("⚠   DERIV_TOKEN not set — bot cannot authenticate to Deriv. Set the DERIV_TOKEN secret.")
 if not os.environ.get("TG_BOT_TOKEN"):
     print("⚠   TG_BOT_TOKEN not set — using hardcoded fallback. Set env var for production.")
+
+DERIV_ACCOUNT_ID = os.environ.get("DERIV_ACCOUNT_ID", "")
+DERIV_USE_NEW_API = os.environ.get("DERIV_USE_NEW_API", "").lower() in ("1", "true", "yes")
+
+def _is_new_deriv_api():
+    """Detect whether to use the new Deriv Options API (OTP-based WS) or the legacy v3 API."""
+    if DERIV_USE_NEW_API:
+        return True
+    # New API app IDs are alphanumeric; legacy app IDs are numeric.
+    return bool(DERIV_APP_ID) and not DERIV_APP_ID.isdigit()
+
+_deriv_options_accounts_cache = None
+
+def _deriv_rest_api_call(method, path, body=None):
+    """Make an authenticated request to the new Deriv REST API."""
+    url = f"https://api.derivws.com{path}"
+    headers = {
+        "Accept": "application/json",
+        "Deriv-App-ID": DERIV_APP_ID,
+        "Authorization": f"Bearer {DERIV_APP_TOKEN}",
+    }
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")
+        try:
+            err = json.loads(err_body)
+        except Exception:
+            err = {"message": err_body}
+        raise RuntimeError(f"Deriv REST API {method} {path} failed: {e.code} {err}")
+
+def _deriv_options_accounts():
+    """Return the list of Options trading accounts for the authenticated user."""
+    global _deriv_options_accounts_cache
+    if _deriv_options_accounts_cache is None:
+        r = _deriv_rest_api_call("GET", "/trading/v1/options/accounts")
+        _deriv_options_accounts_cache = r.get("data", [])
+    return _deriv_options_accounts_cache
+
+def _deriv_options_account_id():
+    """Return the account ID to use for the WebSocket connection.
+    Prefer the DERIV_ACCOUNT_ID env var, otherwise pick a demo account, then any account."""
+    if DERIV_ACCOUNT_ID:
+        return DERIV_ACCOUNT_ID
+    accounts = _deriv_options_accounts()
+    if not accounts:
+        raise RuntimeError("No Options trading accounts found for this token/app_id.")
+    # Prefer demo for safety when not explicitly configured.
+    for a in accounts:
+        if a.get("account_type") == "demo":
+            return a.get("account_id")
+    return accounts[0].get("account_id")
+
+def deriv_ws_url():
+    """Return the WebSocket URL to use for Deriv connections."""
+    if _is_new_deriv_api():
+        account_id = _deriv_options_account_id()
+        r = _deriv_rest_api_call("POST", f"/trading/v1/options/accounts/{account_id}/otp")
+        url = r.get("data", {}).get("url")
+        if not url:
+            raise RuntimeError(f"Failed to get Options WebSocket URL: {r}")
+        return url
+    return f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+
+def deriv_send_auth(ws):
+    """Send the authorize message on legacy v3 connections. New API uses OTP in URL."""
+    if not _is_new_deriv_api():
+        ws.send(json.dumps({"authorize": DERIV_APP_TOKEN}))
+
+def deriv_proposal_payload(amount, basis, contract_type, currency, duration, duration_unit, symbol, barrier):
+    """Build a proposal request payload compatible with legacy or new Deriv API."""
+    payload = {
+        "proposal": 1,
+        "amount": amount,
+        "basis": basis,
+        "contract_type": contract_type,
+        "currency": currency,
+        "duration": duration,
+        "duration_unit": duration_unit,
+        "barrier": barrier,
+    }
+    symbol_field = "underlying_symbol" if _is_new_deriv_api() else "symbol"
+    payload[symbol_field] = symbol
+    return payload
+
+def deriv_float(value, default=0.0):
+    """Parse a value that may be a number or string (new API returns strings for some fields)."""
+    try:
+        return float(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
 
 SYNTH_VOLATILITY    = ["R_100", "R_75", "R_50", "R_25", "R_10"]
 SYNTH_VOLATILITY_1S = ["1HZ100V", "1HZ90V", "1HZ75V", "1HZ50V", "1HZ30V", "1HZ25V", "1HZ15V", "1HZ10V"]
@@ -3860,17 +3958,16 @@ def request_proposal(ws, symbol: str, details: dict, direction: str, barrier_mul
     details["last_barrier_mult"] = barrier_mult if barrier_mult is not None else ATR_BARRIER_MULT
     with _lock:
         pending_signals[symbol] = details
-    ws.send(json.dumps({
-        "proposal": 1,
-        "amount": STAKE,
-        "basis": "stake",
-        "contract_type": CONTRACT_TYPE,
-        "currency": "USD",
-        "duration": DURATION,
-        "duration_unit": "m",
-        "symbol": symbol,
-        "barrier": _compute_barrier(symbol, direction, barrier_mult),
-    }))
+    ws.send(json.dumps(deriv_proposal_payload(
+        amount=STAKE,
+        basis="stake",
+        contract_type=CONTRACT_TYPE,
+        currency="USD",
+        duration=DURATION,
+        duration_unit="m",
+        symbol=symbol,
+        barrier=_compute_barrier(symbol, direction, barrier_mult),
+    )))
 
 
 def on_proposal(ws, msg: dict, symbol: str):
@@ -3886,11 +3983,8 @@ def on_proposal(ws, msg: dict, symbol: str):
         return
 
     # ── Payout quality gate ────────────────────────────────────────────
-    try:
-        offered_payout = float(prop.get("payout", 0))
-        offered_profit = round(offered_payout - STAKE, 4)
-    except (TypeError, ValueError):
-        offered_profit = 0.0
+    offered_payout = deriv_float(prop.get("payout", 0))
+    offered_profit = round(offered_payout - STAKE, 4)
 
     MAX_BARRIER_RETRIES = 2
 
@@ -3968,8 +4062,8 @@ def on_buy(ws, msg: dict, symbol: str):
             "symbol":      symbol,
             "direction":   direction,
             "barrier":     buy.get("barrier"),
-            "stake":       buy.get("buy_price", STAKE),
-            "payout":      buy.get("payout"),
+            "stake":       deriv_float(buy.get("buy_price", STAKE)),
+            "payout":      deriv_float(buy.get("payout", 0)),
             "entry_time":  datetime.now(timezone.utc),
             "entry_price": last_price.get(symbol, 0),
             "details":     details,
@@ -4025,12 +4119,12 @@ def on_contract_update(ws, msg: dict, symbol: str):
         is_void = status == "void"
 
         # Extract profit robustly
-        profit = float(contract.get("profit") or 0)
+        profit = deriv_float(contract.get("profit") or 0)
         if not is_void and profit == 0:
             if status == "won":
-                profit = float(info.get("payout", STAKE) or STAKE) - float(info.get("stake", STAKE) or STAKE)
+                profit = deriv_float(info.get("payout", STAKE) or STAKE) - deriv_float(info.get("stake", STAKE) or STAKE)
             elif status == "lost":
-                profit = -float(info.get("stake", STAKE) or STAKE)
+                profit = -deriv_float(info.get("stake", STAKE) or STAKE)
 
         win = profit > 0 or status == "won"
         d   = info.get("details", {})
@@ -4395,19 +4489,20 @@ def fetch_history(symbol: str, hard_timeout: int = 60):
     ws_obj = None
     try:
         ws_obj = websocket.WebSocket()
-        ws_obj.connect(f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}", timeout=10)
-        ws_obj.send(json.dumps({"authorize": DERIV_APP_TOKEN}))
+        ws_obj.connect(deriv_ws_url(), timeout=10)
+        deriv_send_auth(ws_obj)
         ws_obj.settimeout(8)
-        while time.time() < wall_end:
-            try:
-                r = json.loads(ws_obj.recv())
-            except Exception:
-                break
-            if r.get("msg_type") == "authorize":
-                break
-            if "error" in r:
-                _log(f"⚠  {symbol}: auth denied")
-                return
+        if not _is_new_deriv_api():
+            while time.time() < wall_end:
+                try:
+                    r = json.loads(ws_obj.recv())
+                except Exception:
+                    break
+                if r.get("msg_type") == "authorize":
+                    break
+                if "error" in r:
+                    _log(f"⚠  {symbol}: auth denied")
+                    return
         for _ in range(3):
             if time.time() >= wall_end:
                 break
@@ -4471,7 +4566,7 @@ def fetch_history(symbol: str, hard_timeout: int = 60):
 # ══════════════════════════════════════════════════════════════════════
 def _on_open(ws, symbol: str):
     ws_registry[symbol] = ws
-    ws.send(json.dumps({"authorize": DERIV_APP_TOKEN}))
+    deriv_send_auth(ws)
     threading.Timer(1.0, lambda: ws.send(json.dumps({
         "ticks_history": symbol, "subscribe": 1,
         "granularity": 60, "style": "candles", "end": "latest",
@@ -4753,7 +4848,7 @@ def _ws_thread(symbol: str):
     while True:
         try:
             ws_app = websocket.WebSocketApp(
-                f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}",
+                deriv_ws_url(),
                 on_open    = lambda ws: _on_open(ws, symbol),
                 on_message = lambda ws, msg: _on_message(ws, msg, symbol),
                 on_error   = _on_error,
@@ -6009,7 +6104,7 @@ def _run_test_trade(symbol: str):
 
     try:
         ws = websocket.WebSocket()
-        ws.connect(f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}", timeout=15)
+        ws.connect(deriv_ws_url(), timeout=15)
     except Exception as e:
         tg(f"🧪 <b>Test Trade FAILED</b>\n❌ Connection error: <code>{e}</code>")
         _test_trade_sem.release()
@@ -6031,13 +6126,16 @@ def _run_test_trade(symbol: str):
         return None
 
     try:
-        ws.send(json.dumps({"authorize": DERIV_APP_TOKEN}))
-        auth = recv_typed("authorize", timeout=10)
-        if not auth or "error" in auth:
-            err = (auth or {}).get("error", {}).get("message", "timeout")
-            tg(f"🧪 <b>Test Trade FAILED</b>\n❌ Auth error: <code>{err}</code>")
-            return
-        account = auth.get("authorize", {}).get("loginid", "?")
+        deriv_send_auth(ws)
+        if _is_new_deriv_api():
+            account = _deriv_options_account_id()
+        else:
+            auth = recv_typed("authorize", timeout=10)
+            if not auth or "error" in auth:
+                err = (auth or {}).get("error", {}).get("message", "timeout")
+                tg(f"🧪 <b>Test Trade FAILED</b>\n❌ Auth error: <code>{err}</code>")
+                return
+            account = auth.get("authorize", {}).get("loginid", "?")
 
         ws.send(json.dumps({"ticks": symbol}))
         tick_msg  = recv_typed("tick", timeout=8)
@@ -6065,13 +6163,13 @@ def _run_test_trade(symbol: str):
         MAX_BARRIER_RETRIES = 2
         cur_mult = ATR_BARRIER_MULT
         for attempt in range(MAX_BARRIER_RETRIES + 1):
-            ws.send(json.dumps({
-                "proposal": 1, "amount": STAKE, "basis": "stake",
-                "contract_type": CONTRACT_TYPE, "currency": "USD",
-                "duration": DURATION, "duration_unit": "m",
-                "symbol": symbol,
-                "barrier": _compute_barrier(symbol, direction, cur_mult),
-            }))
+            ws.send(json.dumps(deriv_proposal_payload(
+                amount=STAKE, basis="stake",
+                contract_type=CONTRACT_TYPE, currency="USD",
+                duration=DURATION, duration_unit="m",
+                symbol=symbol,
+                barrier=_compute_barrier(symbol, direction, cur_mult),
+            )))
             prop_msg = recv_typed("proposal", timeout=10)
             if not prop_msg or "error" in prop_msg:
                 err = (prop_msg or {}).get("error", {}).get("message", "timeout")
@@ -6079,12 +6177,9 @@ def _run_test_trade(symbol: str):
                 return
             prop    = prop_msg["proposal"]
             pid     = prop["id"]
-            ask     = prop.get("ask_price", STAKE)
-            payout  = prop.get("payout", 0)
-            try:
-                offered_profit = round(float(payout) - STAKE, 4)
-            except (TypeError, ValueError):
-                offered_profit = 0.0
+            ask     = deriv_float(prop.get("ask_price", STAKE))
+            payout  = deriv_float(prop.get("payout", 0))
+            offered_profit = round(payout - STAKE, 4)
 
             if PROFIT_MIN <= offered_profit <= PROFIT_MAX:
                 break  # in band — proceed to buy
@@ -6126,8 +6221,8 @@ def _run_test_trade(symbol: str):
             return
         buy       = buy_msg["buy"]
         cid       = buy["contract_id"]
-        bought_at = buy.get("buy_price", STAKE)
-        paid_out  = buy.get("payout", "?")
+        bought_at = deriv_float(buy.get("buy_price", STAKE))
+        paid_out  = deriv_float(buy.get("payout", 0))
         tg(
             f"🧪 <b>Test Trade</b>  –  ✅ Contract Bought!\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -6164,7 +6259,7 @@ def _run_test_trade(symbol: str):
                 logger.error(f"🧪 {tag} recv error: {e}")
                 break
 
-        profit = float(contract_data.get("profit", 0))
+        profit = deriv_float(contract_data.get("profit", 0))
         win    = profit > 0 or contract_data.get("status") == "won"
         emoji  = "🏆" if win else "💀"
         label  = "WIN" if win else "LOSS"
@@ -7778,8 +7873,8 @@ def _make_trades_panel() -> Panel:
         sym     = info["symbol"]
         barrier = info.get("barrier") or 0
         entry   = info.get("entry_time", now)
-        stake   = info.get("stake", STAKE)
-        payout  = info.get("payout", stake + TARGET_PROFIT)
+        stake   = deriv_float(info.get("stake", STAKE))
+        payout  = deriv_float(info.get("payout", stake + TARGET_PROFIT))
         expires = entry + timedelta(minutes=DURATION)
         price   = last_price.get(sym, 0)
         ep      = info.get("entry_price", price)
