@@ -6090,6 +6090,7 @@ def _run_test_trade(symbol: str):
     _log(f"🧪 {tag} starting one-shot test trade…")
 
     def tg(text: str):
+        logger.info(text)
         _send_tg_wait(text)
 
     tg(
