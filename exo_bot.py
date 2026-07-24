@@ -4809,6 +4809,8 @@ def _main_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🔍 Pattern Discovery",       callback_data="patterns")],
         [InlineKeyboardButton("🏥 Health · Regimes",        callback_data="health"),
          InlineKeyboardButton("📈 Feature Importance",      callback_data="feat_importance")],
+        [InlineKeyboardButton("🎯 Gate Optimizer",           callback_data="gate_optimizer"),
+         InlineKeyboardButton("🤖 ML Progress",             callback_data="ml_progress")],
         # ── Control ──────────────────────────────────────────────────────
         [InlineKeyboardButton(pause_lbl,                    callback_data="toggle_pause"),
          InlineKeyboardButton("⏭ Skip a Symbol",           callback_data="skip_menu")],
@@ -7291,9 +7293,28 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(_performance_analytics_text(), reply_markup=_main_kb(), parse_mode="HTML")
         elif d == "patterns":
             await q.edit_message_text(_pattern_discovery_text(), reply_markup=_main_kb(), parse_mode="HTML")
+        elif d == "gate_optimizer":
+            await q.edit_message_text(_gate_optimizer_text(), reply_markup=_main_kb(), parse_mode="HTML")
+        elif d == "ml_progress":
+            with ml_lock:
+                trained_on, model, training, total = ml_trained_on, ml_model, ml_training_active, ml_total_trades
+            lines = [
+                "🤖 <b>ML Training Progress</b>",
+                "━━━━━━━━━━━━━━━━━━━━",
+                "",
+                _ml_progress_text(),
+                "",
+                f"Total trades logged : <b>{total}</b>",
+                f"Min trades to train : <b>{ML_MIN_TRADES}</b>",
+                f"Retrain every       : <b>{ML_RETRAIN_EVERY} trades</b>",
+                f"Trades since retrain: <b>{max(0, total - (trained_on or 0))}</b>",
+                f"Model active        : <b>{'Yes' if model else 'No'}</b>",
+                f"Training in progress: <b>{'Yes ⏳' if training else 'No'}</b>",
+                f"Confidence gate     : <b>≥{ML_CONFIDENCE_MIN*100:.0f}%</b>",
+            ]
+            await q.edit_message_text("\n".join(lines), reply_markup=_main_kb(), parse_mode="HTML")
         elif d == "health":
-            text = await asyncio.get_event_loop().run_in_executor(None, _health_text)
-            await q.edit_message_text(text, reply_markup=_main_kb(), parse_mode="HTML")
+            await q.edit_message_text(_health_text(), reply_markup=_main_kb(), parse_mode="HTML")
         elif d == "feat_importance":
             def _fi_text():
                 if not _feature_importance_history:
