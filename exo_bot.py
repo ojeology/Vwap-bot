@@ -142,12 +142,13 @@ def _discover_gemini_model(force: bool = False) -> str:
 # ══════════════════════════════════════════════════════════════════════
 #  CONFIG
 # ══════════════════════════════════════════════════════════════════════
-DERIV_APP_TOKEN    = os.environ.get("DERIV_TOKEN",    "m8MRwwwroJy6YQw")
+DERIV_APP_TOKEN    = os.environ.get("DERIV_TOKEN",    "")
+DERIV_APP_ID       = os.environ.get("DERIV_APP_ID",   "1089")
 TELEGRAM_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN",   "8908331931:AAHg-50KK8DLcYH1d2O7i9tIhredM-TIHnI")
 TELEGRAM_CHAT_ID   = os.environ.get("TG_CHAT_ID",     "6400145232")
 
-if not os.environ.get("DERIV_TOKEN"):
-    print("⚠   DERIV_TOKEN not set — using hardcoded fallback. Set env var for production.")
+if not DERIV_APP_TOKEN:
+    print("⚠   DERIV_TOKEN not set — bot cannot authenticate to Deriv. Set the DERIV_TOKEN secret.")
 if not os.environ.get("TG_BOT_TOKEN"):
     print("⚠   TG_BOT_TOKEN not set — using hardcoded fallback. Set env var for production.")
 
@@ -4394,7 +4395,7 @@ def fetch_history(symbol: str, hard_timeout: int = 60):
     ws_obj = None
     try:
         ws_obj = websocket.WebSocket()
-        ws_obj.connect("wss://ws.derivws.com/websockets/v3?app_id=1089", timeout=10)
+        ws_obj.connect(f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}", timeout=10)
         ws_obj.send(json.dumps({"authorize": DERIV_APP_TOKEN}))
         ws_obj.settimeout(8)
         while time.time() < wall_end:
@@ -4752,7 +4753,7 @@ def _ws_thread(symbol: str):
     while True:
         try:
             ws_app = websocket.WebSocketApp(
-                "wss://ws.derivws.com/websockets/v3?app_id=1089",
+                f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}",
                 on_open    = lambda ws: _on_open(ws, symbol),
                 on_message = lambda ws, msg: _on_message(ws, msg, symbol),
                 on_error   = _on_error,
@@ -6006,7 +6007,7 @@ def _run_test_trade(symbol: str):
 
     try:
         ws = websocket.WebSocket()
-        ws.connect("wss://ws.derivws.com/websockets/v3?app_id=1089", timeout=15)
+        ws.connect(f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}", timeout=15)
     except Exception as e:
         tg(f"🧪 <b>Test Trade FAILED</b>\n❌ Connection error: <code>{e}</code>")
         _test_trade_sem.release()
