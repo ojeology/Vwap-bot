@@ -9,7 +9,6 @@ expertMode = true
 [userenv]
 
 [userenv.shared]
-FIRE_TEST_TRADE = "R_100"
 
 [workflows]
 runButton = "Project"
